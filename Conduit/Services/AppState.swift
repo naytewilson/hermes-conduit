@@ -15345,6 +15345,7 @@ enum KeychainHelper {
     private static let credentialsKey = "hermes-conduit.credentials.v1"
     private static let cloudflareAccessKey = "hermes-conduit.cloudflare-access.v1"
     private static let pushRegistrationKey = "hermes-conduit.push-registration.v1"
+    private static let roomHubCredentialKey = "hermes-conduit.room-hub-credential.v1"
     private static let service = "com.milim.conduit"
 
     static func saveConnection(_ conn: HermesConnection) {
@@ -15540,6 +15541,31 @@ enum KeychainHelper {
             account: scopedAccount(cloudflareAccessKey, dashboardID: dashboardID),
             accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         )
+    }
+
+    // MARK: Room hub credential (ANVIL Room read seam)
+
+    // The Hub bearer credential is a dashboard-scoped record — born
+    // multi-dashboard, so there is deliberately no legacy global variant.
+    // Two dashboards can point at two Hub deployments and never share the
+    // token; clearing one dashboard's record cannot reach the other's.
+
+    static func saveRoomHubCredential(_ credential: RoomHubCredential, dashboardID: UUID) {
+        guard let data = try? JSONEncoder().encode(credential) else { return }
+        save(
+            data,
+            account: scopedAccount(roomHubCredentialKey, dashboardID: dashboardID),
+            accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        )
+    }
+
+    static func loadRoomHubCredential(dashboardID: UUID) -> RoomHubCredential? {
+        guard let data = load(account: scopedAccount(roomHubCredentialKey, dashboardID: dashboardID)) else { return nil }
+        return try? JSONDecoder().decode(RoomHubCredential.self, from: data)
+    }
+
+    static func clearRoomHubCredential(dashboardID: UUID) {
+        delete(account: scopedAccount(roomHubCredentialKey, dashboardID: dashboardID))
     }
 
     private static func save(

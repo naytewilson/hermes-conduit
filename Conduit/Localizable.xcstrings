@@ -3507,6 +3507,22 @@
         }
       }
     },
+    "Could not reach the Room hub: %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not reach the Room hub: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法连接 Room Hub：%@"
+          }
+        }
+      }
+    },
     "Could not redirect the active response: %@" : {
       "localizations" : {
         "zh-Hans" : {
@@ -7857,6 +7873,22 @@
         }
       }
     },
+    "No HTTP response" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No HTTP response"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无 HTTP 响应"
+          }
+        }
+      }
+    },
     "No Matching Jobs" : {
       "localizations" : {
         "zh-Hans" : {
@@ -7893,6 +7925,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "没有项目"
+          }
+        }
+      }
+    },
+    "No Room hub credential is saved for this dashboard." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No Room hub credential is saved for this dashboard."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此仪表板尚未保存 Room Hub 凭据。"
           }
         }
       }
@@ -10243,6 +10291,22 @@
         }
       }
     },
+    "Room hub authentication is unavailable. Retry later." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room hub authentication is unavailable. Retry later."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room Hub 认证暂不可用。请稍后重试。"
+          }
+        }
+      }
+    },
     "Routing Description" : {
       "localizations" : {
         "zh-Hans" : {
@@ -12447,6 +12511,134 @@
         }
       }
     },
+    "The Room response exceeded %@ bytes." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Room response exceeded %@ bytes."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room 响应超过 %@ 字节。"
+          }
+        }
+      }
+    },
+    "The Room hub is temporarily unavailable." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Room hub is temporarily unavailable."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room Hub 暂时不可用。"
+          }
+        }
+      }
+    },
+    "The Room hub credential was rejected. Sign in again or replace the saved credential." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Room hub credential was rejected. Sign in again or replace the saved credential."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room Hub 凭据已被拒绝。请重新登录或更换已保存的凭据。"
+          }
+        }
+      }
+    },
+    "The Room hub answered HTTP %@." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Room hub answered HTTP %@."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room Hub 返回了 HTTP %@。"
+          }
+        }
+      }
+    },
+    "The Room hub answered HTTP %@ with an unreadable payload: %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Room hub answered HTTP %@ with an unreadable payload: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room Hub 返回了 HTTP %1$@ 与无法解析的内容：%2$@"
+          }
+        }
+      }
+    },
+    "The Room hub address is invalid." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Room hub address is invalid."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room Hub 地址无效。"
+          }
+        }
+      }
+    },
+    "The Room does not exist." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Room does not exist."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "该 Room 不存在。"
+          }
+        }
+      }
+    },
+    "The Room credential lacks the rooms:read scope." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The Room credential lacks the rooms:read scope."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room 凭据缺少 rooms:read 权限范围。"
+          }
+        }
+      }
+    },
     "The board selection is local to this device; creating this task will not switch Hermes' global board." : {
       "localizations" : {
         "zh-Hans" : {
@@ -12569,6 +12761,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "网关返回了无效的文件载荷。"
+          }
+        }
+      }
+    },
+    "The hub's ANVIL subject holds no room.read grant on this Room." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The hub's ANVIL subject holds no room.read grant on this Room."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 的 ANVIL 主体在此 Room 上没有 room.read 授权。"
           }
         }
       }
@@ -12965,6 +13173,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "此文件为空。"
+          }
+        }
+      }
+    },
+    "This hub does not expose the ANVIL Room projection." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This hub does not expose the ANVIL Room projection."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 Hub 未提供 ANVIL Room 投影。"
           }
         }
       }
