@@ -216,6 +216,30 @@ final class RoomCenterTests: XCTestCase {
 
     // MARK: - Control flow
 
+    func testProductionShapeIdempotencyKeyFitsFrozenContractLimit() async {
+        let productionUUID = "12345678-1234-1234-1234-123456789abc"
+        let center = RoomCenter(
+            credentialStore: credentialStore,
+            transport: hub.transport,
+            replayStore: replayStore,
+            authenticate: { _ in true },
+            clock: { Date(timeIntervalSince1970: 1_789_813_200) },
+            idempotencyKeyMint: { productionUUID },
+            operationPollMaxAttempts: 1,
+            operationPollInterval: 0
+        )
+        let intent = await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .cancel
+        )
+
+        XCTAssertEqual(intent.idempotencyKey, "conduit:\(productionUUID)")
+        XCTAssertLessThanOrEqual(intent.idempotencyKey.utf8.count, 64)
+        XCTAssertFalse(intent.idempotencyKey.contains(dashboardID.uuidString.lowercased()))
+    }
+
     func testBiometricRejectionPerformsZeroNetworkIO() async {
         biometricResults = [false]
         let center = await makeCenter()
