@@ -67,6 +67,10 @@ struct ConduitApp: App {
     @ObservedObject private var notifications = PushNotificationService.shared
     @ObservedObject private var pendingVoiceIntents = PendingVoiceIntentStore.shared
     @ObservedObject private var appLanguage = AppLanguageStore.shared
+    /// Sidebar selection is AppStorage-backed; a Room wake preselects the
+    /// Rooms tab so the next sidebar open (or the persistent column) lands
+    /// on the resynced room list. The write is navigation only.
+    @AppStorage("conduit.sidebarTab") private var sidebarTabRaw = SidebarTab.sessions.rawValue
 
     var body: some Scene {
         // Multi-scene support is enabled in the manifest so the CarPlay
@@ -120,6 +124,9 @@ struct ConduitApp: App {
                     notifications.handleFailedNotificationRoute(target)
                 }
             }
+            .task(id: notifications.pendingRoomWake) {
+                await routePendingRoomWake()
+            }
             .task(id: voiceIntentRouteKey) {
                 await resolvePendingVoiceIntent()
             }
@@ -130,6 +137,30 @@ struct ConduitApp: App {
 
     private var notificationRouteKey: String {
         "\(notifications.pendingTarget?.id ?? "none"):\(appState.isConnected):\(notifications.navigationAttempt)"
+    }
+
+    /// Room wake handling (I4): a push that names a room causes a fresh
+    /// authority re-read through RoomCenter and preselects the Rooms tab —
+    /// the entire effect a push is allowed to have. Dashboard ownership is
+    /// resolved with the same fail-closed rules as routing pushes: a wake
+    /// for another saved dashboard is dropped (never a silent switch on push
+    /// authority), and a wake for an unknown dashboard is dropped entirely.
+    @MainActor
+    private func routePendingRoomWake() async {
+        guard let wake = notifications.pendingRoomWake else { return }
+        let ownership = NotificationDashboardOwnership.resolve(
+            targetDashboardID: wake.dashboardID,
+            hasMalformedDashboardID: false,
+            activeDashboardID: appState.activeDashboardID,
+            savedDashboardIDs: appState.savedDashboardRegistry.dashboards.map(\.id)
+        )
+        guard case .route = ownership else {
+            notifications.clearPendingRoomWake(wake)
+            return
+        }
+        sidebarTabRaw = SidebarTab.rooms.rawValue
+        await RoomCenter.shared.handleWake(wake, activeDashboardID: appState.activeDashboardID)
+        notifications.clearPendingRoomWake(wake)
     }
 
     private var voiceIntentRouteKey: String {

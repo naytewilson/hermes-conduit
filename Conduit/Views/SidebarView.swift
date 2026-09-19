@@ -122,6 +122,8 @@ struct SidebarView: View {
                             CronList()
                         case .kanban:
                             KanbanView()
+                        case .rooms:
+                            RoomListView()
                         }
                     }
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
