@@ -148,12 +148,18 @@ final class RoomExecutionIndexTests: XCTestCase {
         }
     }
 
-    func testFailedExecutionOffersRetryAndResume() {
+    func testFailedExecutionOffersRetryAndResumeButCancelledDoesNot() {
         // retry/resume are valid from failed — 202 `recorded`, queued with
         // the execution authority, never "running again".
         var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 9)
         projection.state = "failed"
         XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.retry, .resume])
+
+        // A cancel request converges asynchronously. Until authority reports
+        // failed, a literal cancelled projection must not pre-empt that state
+        // transition by offering retry/resume.
+        projection.state = "cancelled"
+        XCTAssertTrue(RoomControlPolicy.candidates(for: projection).isEmpty)
     }
 
     func testTerminalSucceededOffersNothing() {
@@ -172,12 +178,13 @@ final class RoomExecutionIndexTests: XCTestCase {
         XCTAssertTrue(RoomControlPolicy.candidates(for: projection).isEmpty)
     }
 
-    func testServerAdvertisedActionsOverrideTheLocalMap() {
+    func testServerAdvertisedActionsAreFilteredToFrozenPerExecutionOps() {
         var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 4)
         projection.state = "running"
-        projection.advertisedActions = ["acknowledge"]
-        // The authority's advertisement replaces the presentation map.
-        XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.acknowledge])
+        projection.advertisedActions = ["acknowledge", "start", "pause", "future_op", "cancel"]
+        // The projection may be stale or produced by a newer authority
+        // contract. Only frozen V1 per-execution ops may become buttons.
+        XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.acknowledge, .cancel])
     }
 
     func testUnknownStateRendersNoControls() {
