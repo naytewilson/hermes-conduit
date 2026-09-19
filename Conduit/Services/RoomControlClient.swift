@@ -251,10 +251,11 @@ struct RoomControlClient {
         if let op { items.append(URLQueryItem(name: "op", value: op)) }
         if let status { items.append(URLQueryItem(name: "status", value: status.rawValue)) }
         if let limit { items.append(URLQueryItem(name: "limit", value: String(max(1, min(limit, 200))))) }
-        let query = items.isEmpty ? "" : "?" + items.map { "\($0.name)=\($0.value ?? "")" }.joined(separator: "&")
-        // Query values are caller-supplied identifiers; encode defensively.
-        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-        return try await get("/operations\(encoded)", as: ControlOperationList.self)
+        let query = items.isEmpty ? "" : "?" + items.map { item in
+            let value = item.value.map(percentEncodeQueryValue) ?? ""
+            return "\(item.name)=\(value)"
+        }.joined(separator: "&")
+        return try await get("/operations\(query)", as: ControlOperationList.self)
     }
 
     // MARK: - Request pipeline
@@ -410,6 +411,15 @@ struct RoomControlClient {
             code: code,
             requestID: nil
         )
+    }
+
+    /// Query values are encoded as RFC 3986 unreserved characters only.
+    /// In particular, '&', '=', '+', '#', and '?' may never escape a value
+    /// and become new control-plane parameters.
+    private func percentEncodeQueryValue(_ value: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
     }
 
     /// Path parameters are URL-encoded per segment so a malformed execution
