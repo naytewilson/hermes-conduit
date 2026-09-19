@@ -3,28 +3,43 @@
 //  Conduit
 //
 //  ANVIL Room control wire models — the client side of the Hub I4 mutable
-//  seam, implemented against anvil-i17-i3's published contract
-//  (cells/anvil-i17-i3/context/endpoint-contract-i4.md, v1 DRAFT):
+//  seam, implemented against the FROZEN contract
+//  (docs/contracts/HUB_CONTROL_CONTRACT_V1.md @ a552616, hub main f5e109e8):
 //
-//    POST /api/v1/executions/{execution_id}/capability-grants
-//      {action, ttl_seconds?}            → 201 CapabilityGrant (Hub-minted)
-//    POST /api/v1/executions/{execution_id}/{action}
-//      {grant_id, request_id?}           → 200 ExecutionActionAck
+//    POST /api/v1/controls/executions/{executionId}/cancel      → 200 op record (applied)
+//    POST /api/v1/controls/executions/{executionId}/acknowledge → 200 op record (applied)
+//    POST /api/v1/controls/executions/{executionId}/retry       → 202 op record (recorded)
+//    POST /api/v1/controls/executions/{executionId}/resume      → 202 op record (recorded)
+//    POST /api/v1/controls/executions/start                    → 201 op record (applied)
+//    GET  /api/v1/controls/operations/{operationId}             → 200 op record
+//    GET  /api/v1/controls/operations?executionId?&op?&status?&limit?
+//                                                        → 200 { operations: [...] }
 //
-//  Authority boundary (unchangeable): Conduit NEVER mints grants. It asks the
-//  Hub for a grant bound to (execution_id, action, principal) — the principal
-//  is derived server-side from the Hub credential — then invokes the action
-//  by grant_id reference. Every grant field is server-owned and passed
-//  through verbatim. The only client-minted value on the wire is
-//  `request_id`, an opaque idempotency token — never authority.
+//  Authority boundary (unchangeable): Conduit NEVER mints authority. The Hub
+//  instance's bound ANVIL subject holds the durable capability grant; the
+//  client presents only transport auth (Bearer + scope). There is no
+//  grant-mint endpoint and no grant_id anywhere on the wire — the entire
+//  grant-mint flow of the v1 DRAFT is deleted.
+//
+//  Idempotency: `idempotencyKey` (1–64 chars) is REQUIRED in every POST body,
+//  minted once per user gesture. Same key replays the stored result
+//  byte-identical (200 + "replayed": true); same key + different op/target →
+//  409 `idempotency_key_conflict`. Replay skips the capability check.
+//
+//  Async ops: retry/resume return 202 `recorded` — the intent is durably
+//  recorded and projected for the execution authority to consume. The client
+//  polls GET /operations/{operationId} for the recorded→applied transition;
+//  `recorded` is "authorized and queued", never "the agent is running again".
+//
+//  Field convention: Hub-owned API is camelCase.
 //
 
 import Foundation
 
-/// The mutable action vocabulary (contract §Endpoints: the six legal path
-/// verbs). `RoomControlAction` is RawRepresentable so a Hub action the client
-/// doesn't know yet still round-trips in diagnostics without breaking decode —
-/// but candidate UI actions are only ever the named statics.
+/// The mutable op vocabulary (contract §1). `RoomControlAction` is
+/// RawRepresentable so a Hub op the client doesn't know yet still round-trips
+/// in diagnostics without breaking decode — but candidate UI actions are
+/// only ever the named statics. Five ops; there is no `pause` in V1.
 struct RoomControlAction: RawRepresentable, Codable, Equatable, Hashable {
     let rawValue: String
 
@@ -40,105 +55,119 @@ struct RoomControlAction: RawRepresentable, Codable, Equatable, Hashable {
         try container.encode(rawValue)
     }
 
-    /// The contract's action family: {start, pause, resume, cancel, retry,
-    /// acknowledge}. `pause` completes the A4 sequence (pause → resume →
-    /// cancel).
     static let acknowledge = RoomControlAction(rawValue: "acknowledge")
-    static let pause = RoomControlAction(rawValue: "pause")
     static let resume = RoomControlAction(rawValue: "resume")
     static let retry = RoomControlAction(rawValue: "retry")
     static let cancel = RoomControlAction(rawValue: "cancel")
     static let start = RoomControlAction(rawValue: "start")
 
     var isDestructive: Bool { self == .cancel }
+
+    /// The op value the server records for this action (contract §3.3).
+    /// `start` records as `execution_start`; the rest record as themselves.
+    var recordOpValue: String {
+        self == .start ? "execution_start" : rawValue
+    }
+
+    /// Whether the action targets one existing execution (`start` does not —
+    /// it dispatches through the manual-run pipeline with trigger/project).
+    var targetsExecution: Bool { self != .start }
 }
 
-/// The Hub-minted capability grant (contract §Model): bound to
-/// (execution_id, action, principal), persisted server-side in
-/// `anvil.capability_grants`. Every field is authority-owned — Conduit stores
-/// and echoes `grant_id`, never constructs one. `scope_hash` is advisory only;
-/// the durable grant row is authoritative.
-struct CapabilityGrant: Codable, Equatable {
-    let grantID: String
-    let executionID: String
-    let action: RoomControlAction
-    /// `device:hub-credential:<credentialId>` — derived by the Hub from the
-    /// caller's credential; Conduit cannot choose or widen it.
-    let principal: String
-    let issuedAt: String
-    let expiresAt: String
-    let scopeHash: String?
+/// The attention kinds a public `acknowledge` call may carry (contract
+/// §2.2). `finish_execution_call` is daemon-side only — a public request with
+/// this kind returns 409 `control_precondition_failed`.
+enum AttentionKind: String, Codable, Equatable, CaseIterable {
+    case terminal
+    case idle
+    case finishExecutionCall = "finish_execution_call"
 
-    enum CodingKeys: String, CodingKey {
-        case grantID = "grant_id"
-        case executionID = "execution_id"
-        case action
-        case principal
-        case issuedAt = "issued_at"
-        case expiresAt = "expires_at"
-        case scopeHash = "scope_hash"
+    /// Kinds the UI may offer for a user-driven acknowledge.
+    static var userSelectable: [AttentionKind] { [.terminal, .idle] }
+}
+
+/// Op lifecycle state (contract §3.3, §4).
+enum ControlOperationStatus: String, Codable, Equatable {
+    case recorded
+    case applied
+}
+
+/// POST body shared by the execution-targeted ops (cancel/retry/resume):
+/// `{idempotencyKey (REQUIRED), correlationId?}`. Property names are
+/// wire-exact camelCase per the frozen contract.
+struct TargetedOperationRequest: Codable, Equatable {
+    let idempotencyKey: String
+    let correlationId: String?
+}
+
+/// POST /controls/executions/{executionId}/acknowledge body (contract §2.2):
+/// `{attentionKind, idempotencyKey, correlationId?}`.
+struct AcknowledgeAttentionRequest: Codable, Equatable {
+    let attentionKind: AttentionKind
+    let idempotencyKey: String
+    let correlationId: String?
+}
+
+/// POST /controls/executions/start body (contract §2.3): dispatches through
+/// the manual-run pipeline. `actor` defaults server-side to the calling
+/// credential ID when omitted or empty.
+struct StartApprovedExecutionRequest: Codable, Equatable {
+    let trigger: String
+    let projectSlug: String
+    let idempotencyKey: String
+    let input: AnyCodable?
+    let actor: String?
+    let expectedVersionId: String?
+    let correlationId: String?
+
+    static func == (lhs: StartApprovedExecutionRequest, rhs: StartApprovedExecutionRequest) -> Bool {
+        lhs.trigger == rhs.trigger
+            && lhs.projectSlug == rhs.projectSlug
+            && lhs.idempotencyKey == rhs.idempotencyKey
+            && lhs.input == rhs.input
+            && lhs.actor == rhs.actor
+            && lhs.expectedVersionId == rhs.expectedVersionId
+            && lhs.correlationId == rhs.correlationId
     }
 }
 
-/// `POST /api/v1/executions/{execution_id}/capability-grants` request body —
-/// the execution is the path subject; the body carries the action and an
-/// optional TTL (contract default 300s, max 3600s).
-struct ExecutionGrantRequest: Codable, Equatable {
-    let action: RoomControlAction
-    let ttlSeconds: Int?
+/// The op record (contract §3.3) — the Hub's durable, replayable account of
+/// one control op. camelCase throughout; `replayed` is present only on
+/// idempotent replay (HTTP 200). `executionId` is null for `start`.
+struct ControlOperationRecord: Codable, Equatable {
+    let operationId: String
+    let op: String
+    let status: ControlOperationStatus
+    let replayed: Bool?
+    let idempotencyKey: String
+    let executionId: String?
+    let capability: String?
+    let subject: String?
+    let correlationId: String?
+    let effect: AnyCodable?
+    let createdAt: String
+    let updatedAt: String
 
-    enum CodingKeys: String, CodingKey {
-        case action
-        case ttlSeconds = "ttl_seconds"
+    /// Whether the server reports this response as an idempotent replay of
+    /// an already-recorded op — success-adjacent, rendered distinctly.
+    var isReplay: Bool { replayed == true }
+
+    /// Whether the op is durably recorded but its effect is owned downstream
+    /// (retry/resume → 202). Not "the agent is running again".
+    var isRecorded: Bool { status == .recorded }
+
+    /// The client action this record answers, when the op value is one of
+    /// the five known ops.
+    var action: RoomControlAction? {
+        if op == "execution_start" { return .start }
+        let candidate = RoomControlAction(rawValue: op)
+        return [.acknowledge, .resume, .retry, .cancel].contains(candidate) ? candidate : nil
     }
 }
 
-/// `POST /api/v1/executions/{execution_id}/{action}` request body. The grant
-/// is referenced by server-minted id only — the client never sends grant
-/// material it constructed. `request_id` is the caller's opaque per-intent
-/// idempotency token, stable across retries of one intent.
-struct ExecutionActionRequest: Codable, Equatable {
-    let grantID: String
-    let requestID: String?
-
-    enum CodingKeys: String, CodingKey {
-        case grantID = "grant_id"
-        case requestID = "request_id"
-    }
-}
-
-/// The mutable endpoint's acknowledgement (contract §Endpoints). `state` is
-/// the authority's execution-state vocabulary kept as a raw string — Conduit
-/// never maps it into its own state machine. `duplicate: true` means the same
-/// (execution, action, grant) was already committed — the returned
-/// `room_seq`/`event_id` are the ORIGINAL commit. `retry` additionally returns
-/// `retry_execution_id` naming the new attempt. Optional fields tolerate
-/// absence: the authoritative record of the action is the Room timeline the
-/// client re-reads after success.
-struct ExecutionActionAck: Codable, Equatable {
-    let executionID: String
-    let state: String?
-    let substate: String?
-    let roomSeq: Int?
-    let eventID: String?
-    let duplicate: Bool?
-    let retryExecutionID: String?
-
-    enum CodingKeys: String, CodingKey {
-        case executionID = "execution_id"
-        case state
-        case substate
-        case roomSeq = "room_seq"
-        case eventID = "event_id"
-        case duplicate
-        case retryExecutionID = "retry_execution_id"
-    }
-
-    /// Whether the server reports this request as a deduped replay of an
-    /// already-committed intent — success-adjacent, rendered distinctly.
-    var isDuplicateReplay: Bool {
-        duplicate == true
-    }
+/// GET /controls/operations?… response (contract §3.2).
+struct ControlOperationList: Codable, Equatable {
+    let operations: [ControlOperationRecord]
 }
 
 // MARK: - Execution derivation from the Room timeline
@@ -150,14 +179,14 @@ struct ExecutionActionAck: Codable, Equatable {
 /// this projection true.
 struct RoomExecutionProjection: Equatable, Identifiable {
     let executionID: String
-    /// Latest reported state verb (queued/running/paused/tool_wait/…), raw.
+    /// Latest reported state verb (queued/running/failed/…), raw.
     var state: String?
     /// Latest transition's room_seq — the position in the authority log.
     var lastSeq: Int
     var lastTransitionAt: String?
-    /// The granting principal on the most recent control action, when the
-    /// authority recorded one (`actor` in the contract's transition payload).
-    var principal: String?
+    /// The bound subject on the most recent control op, when the authority
+    /// recorded one (the op record's `subject`).
+    var subject: String?
     var taskRef: String?
     var correlationID: String?
     /// Actions the authority advertised as valid on the latest transition,
@@ -174,17 +203,16 @@ struct RoomExecutionProjection: Equatable, Identifiable {
 }
 
 /// Folds committed room events into per-execution projections. Tolerant by
-/// contract: the transition payload per i3's contract is
-/// `{execution_id, from_state, to_state, substate, reason, actor, grant_id}`,
-/// so extraction reads those spellings first and ignores events that carry
-/// no execution identity. Pure — no I/O — so the fold is exhaustively
-/// testable.
+/// contract: the transition payload is
+/// `{execution_id, from_state, to_state, substate, reason, actor}`, so
+/// extraction reads those spellings first and ignores events that carry no
+/// execution identity. Pure — no I/O — so the fold is exhaustively testable.
 enum RoomExecutionIndex {
     /// Payload keys consulted for each field, in priority order.
     private static let executionIDKeys = ["execution_id", "executionId"]
     private static let stateKeys = ["to_state", "state", "status", "to"]
-    /// The contract's transition payload names the principal `actor`.
-    private static let principalKeys = ["actor", "granting_principal", "principal", "requested_by"]
+    /// The transition payload names the actor `actor`.
+    private static let principalKeys = ["actor", "granting_principal", "principal", "requested_by", "subject"]
     private static let actionListKeys = ["available_actions", "allowed_actions", "actions"]
 
     /// Folds `events` (expected ascending room_seq, but order-tolerant: the
@@ -206,8 +234,8 @@ enum RoomExecutionIndex {
             if let state = firstString(in: event.payload, keys: stateKeys), !state.isEmpty {
                 projection.state = state
             }
-            if let principal = firstString(in: event.payload, keys: principalKeys), !principal.isEmpty {
-                projection.principal = principal
+            if let subject = firstString(in: event.payload, keys: principalKeys), !subject.isEmpty {
+                projection.subject = subject
             }
             if let at = event.occurredAt ?? Optional(event.createdAt) {
                 projection.lastTransitionAt = at
@@ -245,38 +273,33 @@ enum RoomExecutionIndex {
 }
 
 /// Which controls to render for a derived execution state, mirroring the
-/// contract's action-semantics table. This is a PRESENTATION policy only —
+/// frozen contract's preconditions (§2). This is a PRESENTATION policy only —
 /// authority is never inferred from a button. Every tap still runs biometric
-/// step-up → grant mint → Hub arbitration; a state the policy misjudges
-/// surfaces the Hub's denial verbatim. Server-advertised `available_actions`,
-/// when present, replace this map entirely.
+/// step-up → Hub arbitration; a state the policy misjudges surfaces the
+/// Hub's denial verbatim. Server-advertised `available_actions`, when
+/// present, replace this map entirely.
+///
+/// Notes on the frozen preconditions: cancel is valid from spawning/running;
+/// retry/resume from failed; acknowledge needs only an existing execution.
+/// `start` is NOT a per-execution action in V1 — it dispatches through the
+/// manual-run pipeline with trigger/projectSlug, so it never appears here.
 enum RoomControlPolicy {
-    /// Candidate actions for one execution, in display order. Mirrors the
-    /// contract's "valid from" column per action.
+    /// Candidate actions for one execution, in display order.
     static func candidates(for execution: RoomExecutionProjection) -> [RoomControlAction] {
         if let advertised = execution.advertisedActions {
             return advertised.map { RoomControlAction(rawValue: $0) }
         }
         switch execution.state {
-        case "queued":
-            // start: begin dispatch of the bound execution.
-            return [.start, .cancel]
-        case "running":
-            return [.pause, .acknowledge, .cancel]
+        case "spawning", "running":
+            return [.acknowledge, .cancel]
         case "tool_wait", "requires_attention":
-            // resume is valid from running+tool_wait per the contract.
-            return [.acknowledge, .resume, .pause, .cancel]
-        case "paused", "parked":
-            return [.resume, .cancel]
-        case "handed_off":
-            return [.cancel]
+            return [.acknowledge, .cancel]
         case "failed", "cancelled":
-            return [.retry]
-        case "succeeded":
-            return []
+            return [.retry, .resume]
         default:
-            // Unknown/unpublished state: show nothing rather than imply
-            // authority the Hub never advertised.
+            // queued / paused / parked / handed_off / succeeded / unknown:
+            // no frozen op is valid from these states — show nothing rather
+            // than imply authority the Hub never advertised.
             return []
         }
     }

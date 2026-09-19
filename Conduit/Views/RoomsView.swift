@@ -5,12 +5,14 @@
 //  The ANVIL Rooms surface (I4): rooms list → room detail → capability-
 //  scoped execution controls. Reads go through RoomCenter → the H1
 //  projection seam; mutations go through RoomCenter.perform, which runs
-//  biometric step-up → Hub-minted grant → action → authority resync.
+//  biometric step-up → Hub op POST (frozen HUB_CONTROL_CONTRACT_V1) →
+//  authority resync.
 //
 //  This view owns no authority decisions: it renders the Room projection
 //  verbatim (stale stays visibly stale), and every control is a request the
-//  Hub can deny — `capability_denied` and `insufficient_scope` surface as
-//  different outcomes, never collapsed.
+//  Hub can deny — `control_capability_denied` and `insufficient_scope`
+//  surface as different outcomes, never collapsed. 202 `recorded` is shown
+//  as queued-with-the-authority, never as applied.
 //
 
 import SwiftUI
@@ -217,12 +219,15 @@ struct RoomDetailSheet: View {
     let room: ProjectedRoom
 
     @State private var pendingAction: PendingControl?
+    @State private var acknowledgeExecutionID: String?
     @State private var lastOutcome: RoomControlOutcome?
     @State private var showCredentialSheet = false
 
     private struct PendingControl: Equatable {
         let action: RoomControlAction
         let executionID: String
+        /// Required by the frozen contract for `.acknowledge`.
+        let attentionKind: AttentionKind?
     }
 
     private var dashboardID: UUID? { appState.activeDashboardID }
@@ -283,7 +288,29 @@ struct RoomDetailSheet: View {
             }
             Button(AppLocalization.string("Cancel"), role: .cancel) { pendingAction = nil }
         } message: {
-            Text(AppLocalization.string("The Hub checks a fresh capability grant before anything runs."))
+            Text(AppLocalization.string("Biometric step-up authorizes this op with the Hub. The Hub instance's bound subject applies its own durable capability grant — Conduit never holds one."))
+        }
+        // Acknowledge requires an attention kind (frozen contract §2.2), so
+        // the kind is chosen first, then the main confirmation dialog runs.
+        .confirmationDialog(
+            AppLocalization.string("Acknowledge which state?"),
+            isPresented: Binding(
+                get: { acknowledgeExecutionID != nil },
+                set: { if !$0 { acknowledgeExecutionID = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let executionID = acknowledgeExecutionID {
+                ForEach(AttentionKind.userSelectable, id: \.rawValue) { kind in
+                    Button(attentionKindLabel(kind)) {
+                        acknowledgeExecutionID = nil
+                        pendingAction = PendingControl(action: .acknowledge, executionID: executionID, attentionKind: kind)
+                    }
+                }
+            }
+            Button(AppLocalization.string("Cancel"), role: .cancel) { acknowledgeExecutionID = nil }
+        } message: {
+            Text(AppLocalization.string("The Hub records which attention state you are acknowledging."))
         }
     }
 
@@ -380,7 +407,7 @@ struct RoomDetailSheet: View {
                         .background(Color.primary.opacity(0.06), in: Capsule())
                 }
                 Spacer(minLength: 4)
-                if let principal = execution.principal {
+                if let principal = execution.subject {
                     Text(verbatim: principal)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
@@ -399,7 +426,13 @@ struct RoomDetailSheet: View {
                     onTap: { action in
                         guard controlsEnabled else { return }
                         Haptics.selection()
-                        pendingAction = PendingControl(action: action, executionID: execution.executionID)
+                        if action == .acknowledge {
+                            // The frozen contract requires an attention kind
+                            // on acknowledge — pick it before confirming.
+                            acknowledgeExecutionID = execution.executionID
+                        } else {
+                            pendingAction = PendingControl(action: action, executionID: execution.executionID, attentionKind: nil)
+                        }
                     }
                 )
                 .disabled(!controlsEnabled)
@@ -441,11 +474,9 @@ struct RoomDetailSheet: View {
         private func actionTitle(_ action: RoomControlAction) -> String {
             switch action {
             case .acknowledge: return AppLocalization.string("Acknowledge")
-            case .pause: return AppLocalization.string("Pause")
             case .resume: return AppLocalization.string("Resume")
             case .retry: return AppLocalization.string("Retry")
             case .cancel: return AppLocalization.string("Cancel")
-            case .start: return AppLocalization.string("Start")
             default: return action.rawValue
             }
         }
@@ -453,11 +484,9 @@ struct RoomDetailSheet: View {
         private func actionIcon(_ action: RoomControlAction) -> String {
             switch action {
             case .acknowledge: return "checkmark.seal"
-            case .pause: return "pause.fill"
             case .resume: return "play.fill"
             case .retry: return "arrow.clockwise"
             case .cancel: return "xmark.octagon"
-            case .start: return "play.circle"
             default: return "bolt"
             }
         }
@@ -519,8 +548,8 @@ struct RoomDetailSheet: View {
                 Text(outcomeTitle(outcome))
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(outcomeColor(outcome.kind))
-                if let principal = outcome.principal {
-                    Text(verbatim: principal)
+                if let subject = outcome.subject {
+                    Text(verbatim: subject)
                         .font(.caption2.monospaced())
                         .foregroundStyle(.secondary)
                 }
@@ -540,14 +569,18 @@ struct RoomDetailSheet: View {
         switch outcome.kind {
         case .applied:
             return AppLocalization.string("Action applied")
+        case .recorded:
+            return AppLocalization.string("Recorded — queued with the execution authority")
         case .duplicateRejected:
-            return AppLocalization.string("Already applied — duplicate suppressed")
+            return AppLocalization.string("Already recorded — duplicate suppressed")
         case .capabilityDenied:
-            return AppLocalization.string("Grant denied or expired")
+            return AppLocalization.string("The Hub denied the control capability")
         case .insufficientScope:
             return AppLocalization.string("The Room credential lacks the control scope")
-        case .stateConflict:
-            return AppLocalization.string("The execution's state changed — timeline refreshed")
+        case .preconditionFailed:
+            return AppLocalization.string("No longer actionable — timeline refreshed")
+        case .idempotencyConflict:
+            return AppLocalization.string("Idempotency conflict — key bound to a different op")
         case .biometricRejected:
             return AppLocalization.string("Authorization cancelled")
         case .unconfigured:
@@ -555,9 +588,11 @@ struct RoomDetailSheet: View {
         case .unauthorized:
             return AppLocalization.string("Credential rejected")
         case .notFound:
-            return AppLocalization.string("Execution not found")
-        case .controlUnavailable:
+            return AppLocalization.string("Execution or operation not found")
+        case .controlPlaneUnavailable:
             return AppLocalization.string("This hub has no execution controls")
+        case .invalidIntent:
+            return AppLocalization.string("Invalid control request")
         case .failed:
             return AppLocalization.string("Action failed")
         }
@@ -567,20 +602,24 @@ struct RoomDetailSheet: View {
         switch kind {
         case .applied: return .green
         case .duplicateRejected: return .green
+        case .recorded: return .orange
         case .capabilityDenied: return .red
         case .insufficientScope: return .orange
-        case .stateConflict: return .orange
+        case .preconditionFailed: return .orange
+        case .idempotencyConflict: return .red
         case .biometricRejected: return .secondary
-        case .unconfigured, .unauthorized, .notFound, .controlUnavailable, .failed: return .red
+        case .unconfigured, .unauthorized, .notFound, .controlPlaneUnavailable, .invalidIntent, .failed: return .red
         }
     }
 
     private func outcomeIcon(_ kind: RoomControlOutcome.Kind) -> String {
         switch kind {
         case .applied, .duplicateRejected: return "checkmark.circle.fill"
+        case .recorded: return "clock.badge.checkmark"
         case .capabilityDenied: return "lock.shield.fill"
         case .insufficientScope: return "key.fill"
-        case .stateConflict: return "arrow.triangle.2.circlepath"
+        case .preconditionFailed: return "arrow.triangle.2.circlepath"
+        case .idempotencyConflict: return "exclamationmark.2"
         case .biometricRejected: return "faceid"
         default: return "exclamationmark.triangle.fill"
         }
@@ -588,18 +627,27 @@ struct RoomDetailSheet: View {
 
     private var confirmTitle: String {
         guard let pending = pendingAction else { return "" }
+        if pending.action == .acknowledge, let kind = pending.attentionKind {
+            return AppLocalization.string("Acknowledge \(kind.rawValue) on this execution?")
+        }
         return AppLocalization.string("Run \(pending.action.rawValue) on this execution?")
     }
 
     private func actionLabel(_ action: RoomControlAction) -> String {
         switch action {
         case .acknowledge: return AppLocalization.string("Acknowledge")
-        case .pause: return AppLocalization.string("Pause")
         case .resume: return AppLocalization.string("Resume")
         case .retry: return AppLocalization.string("Retry")
         case .cancel: return AppLocalization.string("Cancel")
-        case .start: return AppLocalization.string("Start")
         default: return action.rawValue
+        }
+    }
+
+    private func attentionKindLabel(_ kind: AttentionKind) -> String {
+        switch kind {
+        case .terminal: return AppLocalization.string("Terminal")
+        case .idle: return AppLocalization.string("Idle")
+        case .finishExecutionCall: return kind.rawValue
         }
     }
 
@@ -610,7 +658,8 @@ struct RoomDetailSheet: View {
             dashboardID: dashboardID,
             roomID: room.roomID,
             executionID: pending.executionID,
-            action: pending.action
+            action: pending.action,
+            attentionKind: pending.attentionKind
         )
         Task {
             lastOutcome = await center.perform(intent)
