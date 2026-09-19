@@ -859,6 +859,16 @@
         }
       }
     },
+    "Already recorded — duplicate suppressed" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已记录——重复请求已抑制"
+          }
+        }
+      }
+    },
     "Always allow" : {
       "localizations" : {
         "zh-Hans" : {
@@ -1669,6 +1679,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "二进制文件"
+          }
+        }
+      }
+    },
+    "Biometric step-up authorizes this op with the Hub. The Hub instance's bound subject applies its own durable capability grant — Conduit never holds one." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "生物识别升级授权此操作发送至 Hub。Hub 实例绑定的主体使用其自身的持久能力授权——Conduit 从不持有该授权。"
           }
         }
       }
@@ -5031,6 +5051,16 @@
         }
       }
     },
+    "Execution or operation not found" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未找到执行或操作"
+          }
+        }
+      }
+    },
     "Existing HTTPS domain" : {
       "localizations" : {
         "zh-Hans" : {
@@ -6145,6 +6175,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "想法（可选）"
+          }
+        }
+      }
+    },
+    "Idempotency conflict — key bound to a different op" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "幂等键冲突——该键已绑定到其他操作"
+          }
+        }
+      }
+    },
+    "Idle" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "空闲"
           }
         }
       }
@@ -8027,6 +8077,16 @@
         }
       }
     },
+    "No longer actionable — timeline refreshed" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "操作已不再适用——时间线已刷新"
+          }
+        }
+      }
+    },
     "No longer active" : {
       "localizations" : {
         "zh-Hans" : {
@@ -9769,6 +9829,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "录制 ASR"
+          }
+        }
+      }
+    },
+    "Recorded — queued with the execution authority" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已记录——已加入执行权限方队列"
           }
         }
       }
@@ -12367,6 +12437,16 @@
         }
       }
     },
+    "Terminal" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "终止"
+          }
+        }
+      }
+    },
     "Test and fix the failed connection, then reconnect" : {
       "localizations" : {
         "zh-Hans" : {
@@ -12569,6 +12649,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "网关返回了无效的文件载荷。"
+          }
+        }
+      }
+    },
+    "The Hub's control capability was denied." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 的控制能力授权被拒绝。"
+          }
+        }
+      }
+    },
+    "The idempotency key is already bound to a different operation." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "幂等键已绑定到其他操作。"
           }
         }
       }
@@ -12965,6 +13065,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "此文件为空。"
+          }
+        }
+      }
+    },
+    "This hub's control plane is not configured." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 Hub 的控制平面未配置。"
           }
         }
       }
@@ -14583,6 +14693,16 @@
         }
       }
     },
+    "Invalid control request" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无效的控制请求"
+          }
+        }
+      }
+    },
     "invalid response" : {
       "localizations" : {
         "zh-Hans" : {
@@ -15177,6 +15297,606 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "此 hub 未公开 ANVIL Room 投影。"
+          }
+        }
+      }
+    },
+    "Acknowledge" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "确认"
+          }
+        }
+      }
+    },
+    "Acknowledge %@ on this execution?" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "确认此执行上的 %@？"
+          }
+        }
+      }
+    },
+    "Acknowledge which state?" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "确认哪种状态？"
+          }
+        }
+      }
+    },
+    "Action applied" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "操作已生效"
+          }
+        }
+      }
+    },
+    "Action failed" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "操作失败"
+          }
+        }
+      }
+    },
+    "Already applied — duplicate suppressed" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已执行——重复请求已抑制"
+          }
+        }
+      }
+    },
+    "Authorization cancelled" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "授权已取消"
+          }
+        }
+      }
+    },
+    "Authorize %@ on this Room" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "授权在此 Room 上执行 %@"
+          }
+        }
+      }
+    },
+    "Closed" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已关闭"
+          }
+        }
+      }
+    },
+    "Configure Room Hub" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "配置 Room Hub"
+          }
+        }
+      }
+    },
+    "Connect a dashboard to view Rooms." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连接仪表盘以查看 Room。"
+          }
+        }
+      }
+    },
+    "Controls need a fresh sync — replay first." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "控件需要先完成一次同步——请先重放。"
+          }
+        }
+      }
+    },
+    "Correlation" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关联标识"
+          }
+        }
+      }
+    },
+    "Could not load Rooms." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法加载 Room。"
+          }
+        }
+      }
+    },
+    "Could not save to the Keychain." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法保存到钥匙串。"
+          }
+        }
+      }
+    },
+    "Credential rejected" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "凭据被拒绝"
+          }
+        }
+      }
+    },
+    "Execution controls" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "执行控制"
+          }
+        }
+      }
+    },
+    "Execution not found" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未找到执行"
+          }
+        }
+      }
+    },
+    "Freshness" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "同步状态"
+          }
+        }
+      }
+    },
+    "Grant denied or expired" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "授权许可被拒绝或已过期"
+          }
+        }
+      }
+    },
+    "Hub address and bearer token for this dashboard's ANVIL Room seam. Stored per dashboard in the Keychain." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此仪表盘的 ANVIL Room 通道所用的 Hub 地址与 bearer token。按仪表盘存储在钥匙串中。"
+          }
+        }
+      }
+    },
+    "Hub base URL" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 基础 URL"
+          }
+        }
+      }
+    },
+    "Hub bearer token" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub bearer token"
+          }
+        }
+      }
+    },
+    "Last synced" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上次同步"
+          }
+        }
+      }
+    },
+    "Latest sequence" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最新序列"
+          }
+        }
+      }
+    },
+    "Live" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "实时"
+          }
+        }
+      }
+    },
+    "No Dashboard" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无仪表盘"
+          }
+        }
+      }
+    },
+    "No actions for this state." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此状态没有可用操作。"
+          }
+        }
+      }
+    },
+    "No active participants." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "暂无活跃参与者。"
+          }
+        }
+      }
+    },
+    "No controllable execution is bound to this Room." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 Room 没有绑定的可控制执行。"
+          }
+        }
+      }
+    },
+    "Not synced yet" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "尚未同步"
+          }
+        }
+      }
+    },
+    "Participants" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "参与者"
+          }
+        }
+      }
+    },
+    "Remove saved credential" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "移除已保存的凭据"
+          }
+        }
+      }
+    },
+    "Replayed events appear here after a sync." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "同步后，重放的事件会显示在这里。"
+          }
+        }
+      }
+    },
+    "Room" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room"
+          }
+        }
+      }
+    },
+    "Room Hub" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room Hub"
+          }
+        }
+      }
+    },
+    "Room Hub…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room Hub…"
+          }
+        }
+      }
+    },
+    "Room hub is not configured" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未配置 Room hub"
+          }
+        }
+      }
+    },
+    "Room hub is not configured for this dashboard." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此仪表盘未配置 Room hub。"
+          }
+        }
+      }
+    },
+    "Rooms" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rooms"
+          }
+        }
+      }
+    },
+    "Rooms you can observe appear here." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "你可观察的 Room 会显示在这里。"
+          }
+        }
+      }
+    },
+    "Run %@ on this execution?" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "要对此执行运行 %@ 吗？"
+          }
+        }
+      }
+    },
+    "Stale" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已过时"
+          }
+        }
+      }
+    },
+    "Start" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "开始"
+          }
+        }
+      }
+    },
+    "Start execution" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启动执行"
+          }
+        }
+      }
+    },
+    "The Hub checks a fresh capability grant before anything runs." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 会在任何操作执行前校验新的能力授权。"
+          }
+        }
+      }
+    },
+    "The Room credential lacks the control scope" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room 凭据缺少控制权限范围"
+          }
+        }
+      }
+    },
+    "The Room credential lacks the control scope." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room 凭据缺少控制权限范围。"
+          }
+        }
+      }
+    },
+    "The action has no execution to act on." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "该操作没有可作用的执行。"
+          }
+        }
+      }
+    },
+    "The action is not valid for the execution's current state." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "该操作不适用于执行的当前状态。"
+          }
+        }
+      }
+    },
+    "The capability grant was denied or expired." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "能力授权被拒绝或已过期。"
+          }
+        }
+      }
+    },
+    "The execution does not exist." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "该执行不存在。"
+          }
+        }
+      }
+    },
+    "The execution or operation does not exist." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "执行或操作不存在。"
+          }
+        }
+      }
+    },
+    "The execution's state changed — timeline refreshed" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "执行状态已变更——时间线已刷新"
+          }
+        }
+      }
+    },
+    "The Hub denied the control capability" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 拒绝了控制能力授权"
+          }
+        }
+      }
+    },
+    "The Hub records which attention state you are acknowledging." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 会记录你正在确认的注意状态。"
+          }
+        }
+      }
+    },
+    "The hub token is empty." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub token 为空。"
+          }
+        }
+      }
+    },
+    "This hub does not expose execution controls." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 hub 不提供执行控制。"
+          }
+        }
+      }
+    },
+    "This hub has no execution controls" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 hub 没有执行控制"
+          }
+        }
+      }
+    },
+    "Timeline" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "时间线"
           }
         }
       }
