@@ -228,6 +228,8 @@ struct RoomDetailSheet: View {
         let executionID: String
         /// Required by the frozen contract for `.acknowledge`.
         let attentionKind: AttentionKind?
+        /// I1 correlation spine copied from the Room projection, never minted.
+        let correlationID: String?
     }
 
     private var dashboardID: UUID? { appState.activeDashboardID }
@@ -304,7 +306,13 @@ struct RoomDetailSheet: View {
                 ForEach(AttentionKind.userSelectable, id: \.rawValue) { kind in
                     Button(attentionKindLabel(kind)) {
                         acknowledgeExecutionID = nil
-                        pendingAction = PendingControl(action: .acknowledge, executionID: executionID, attentionKind: kind)
+                        let correlationID = executions.first { $0.executionID == executionID }?.correlationID
+                        pendingAction = PendingControl(
+                            action: .acknowledge,
+                            executionID: executionID,
+                            attentionKind: kind,
+                            correlationID: correlationID
+                        )
                     }
                 }
             }
@@ -431,7 +439,12 @@ struct RoomDetailSheet: View {
                             // on acknowledge — pick it before confirming.
                             acknowledgeExecutionID = execution.executionID
                         } else {
-                            pendingAction = PendingControl(action: action, executionID: execution.executionID, attentionKind: nil)
+                            pendingAction = PendingControl(
+                                action: action,
+                                executionID: execution.executionID,
+                                attentionKind: nil,
+                                correlationID: execution.correlationID
+                            )
                         }
                     }
                 )
@@ -659,7 +672,8 @@ struct RoomDetailSheet: View {
             roomID: room.roomID,
             executionID: pending.executionID,
             action: pending.action,
-            attentionKind: pending.attentionKind
+            attentionKind: pending.attentionKind,
+            correlationID: pending.correlationID
         )
         Task {
             lastOutcome = await center.perform(intent)
