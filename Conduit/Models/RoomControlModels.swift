@@ -165,6 +165,14 @@ struct ControlOperationRecord: Codable, Equatable {
     }
 }
 
+/// POST control operations and GET /controls/operations/{id} are
+/// wrapped by Hub as { "operation": ... }. Keep that envelope explicit so
+/// test fixtures cannot accidentally validate the internal operation shape
+/// instead of the public wire contract.
+struct ControlOperationResponse: Codable, Equatable {
+    let operation: ControlOperationRecord
+}
+
 /// GET /controls/operations?… response (contract §3.2).
 struct ControlOperationList: Codable, Equatable {
     let operations: [ControlOperationRecord]
