@@ -9,6 +9,10 @@ enum StreamEventParser {
         let sessionId = obj["session_id"]?.stringValue ?? ""
         let payload = obj["payload"]?.objectValue
 
+        // Per-type required-field guards below are intentional: some events
+        // carry ids/fields their consumers require and are rejected here,
+        // while others degrade to optional fields. Do not widen or narrow a
+        // single guard without checking its consumers.
         switch type {
         case "message.start":
             return .messageStart(sessionId: sessionId)
@@ -49,7 +53,7 @@ enum StreamEventParser {
             return .messageComplete(sessionId: sessionId, messageId: messageId, content: content, reasoning: reasoning)
 
         case "error":
-            return .messageError(sessionId: sessionId, message: payload?["message"]?.stringValue ?? "Hermes reported an error.")
+            return .messageError(sessionId: sessionId, message: payload?["message"]?.stringValue ?? AppLocalization.string("Hermes reported an error."))
 
         case "message.interrupted", "session.interrupted":
             return .messageInterrupted(sessionId: sessionId)
@@ -60,6 +64,20 @@ enum StreamEventParser {
 
         case "session.info":
             return .sessionInfo(sessionId: sessionId, snapshot: SessionRuntimeSnapshot(object: payload ?? [:]))
+
+        case "status.update":
+            // A status edge without a session id cannot drive any
+            // conversation-scoped state; reject it rather than letting an
+            // empty key into compaction bookkeeping.
+            guard !sessionId.isEmpty else { return nil }
+            let kindRaw = payload?["kind"]?.stringValue ?? ""
+            let kind: StatusUpdateKind
+            switch kindRaw {
+            case "compacting": kind = .compacting
+            case "compacted": kind = .compacted
+            default: kind = .other(kindRaw)
+            }
+            return .statusUpdate(sessionId: sessionId, kind: kind, text: payload?["text"]?.stringValue)
 
         case "session.title":
             let storedSessionId = payload?["session_id"]?.stringValue ?? ""
@@ -74,17 +92,23 @@ enum StreamEventParser {
 
         case "tool.start", "tool_call":
             let name = payload?["name"]?.stringValue ?? ""
+            let toolID = ["tool_id", "tool_call_id", "call_id"]
+                .compactMap { payload?[$0]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
             let input = payload?["args_text"]?.descriptiveStringValue
                 ?? payload?["context"]?.descriptiveStringValue
                 ?? payload?["input"]?.descriptiveStringValue
                 ?? payload?["arguments"]?.descriptiveStringValue
                 ?? payload?["args"]?.descriptiveStringValue
-            return .toolStart(sessionId: sessionId, toolName: name, toolInput: input)
+            return .toolStart(sessionId: sessionId, toolName: name, toolInput: input, toolID: toolID)
 
         case "tool.complete", "tool_result":
             let name = payload?["name"]?.stringValue ?? ""
+            let toolID = ["tool_id", "tool_call_id", "call_id"]
+                .compactMap { payload?[$0]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
             let output = payload?["output"]?.descriptiveStringValue ?? payload?["result"]?.descriptiveStringValue
-            return .toolComplete(sessionId: sessionId, toolName: name, toolOutput: output)
+            return .toolComplete(sessionId: sessionId, toolName: name, toolOutput: output, toolID: toolID)
 
         case "review.summary":
             guard let payload, let review = MessageNormalizer.reviewActivity(from: payload, eventSessionId: sessionId) else { return nil }
@@ -93,12 +117,14 @@ enum StreamEventParser {
         case "clarify", "clarify.request":
             guard let payload,
                   let clarify = MessageNormalizer.clarifyActivity(from: payload) else { return nil }
-            return .clarify(
-                sessionId: sessionId,
-                requestId: clarify.requestId,
-                question: clarify.question,
-                choices: clarify.choices.map { (label: $0.label, value: $0.value) }
-            )
+            return .clarify(sessionId: sessionId, activity: clarify)
+
+        case "clarify.expire":
+            let requestId = (payload?["request_id"]?.stringValue
+                ?? payload?["requestId"]?.stringValue ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !requestId.isEmpty else { return nil }
+            return .clarifyExpire(sessionId: sessionId, requestId: requestId)
 
         case "approval.request":
             guard let payload,

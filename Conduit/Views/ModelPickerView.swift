@@ -35,6 +35,7 @@ struct ModelPickerYoloDraft: Equatable {
 }
 
 struct ModelPickerView: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
     @State private var selectedModel = ""
@@ -78,7 +79,7 @@ struct ModelPickerView: View {
             .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button(editingVisibility ? "Done" : "Edit") {
+                    Button(editingVisibility ? AppLocalization.string("Done") : AppLocalization.string("Edit")) {
                         if editingVisibility {
                             appState.saveModelVisibility(visibility)
                             editingVisibility = false
@@ -106,7 +107,7 @@ struct ModelPickerView: View {
     }
 
     private var modelSection: some View {
-        ModelPickerSection(title: "Model", symbol: "cpu", tint: .conduitAccent) {
+        ModelPickerSection(title: AppLocalization.string("Model"), symbol: "cpu", tint: .conduitAccent) {
             if providers.isEmpty {
                 Text("No models are available from this gateway.")
                     .font(.footnote)
@@ -216,7 +217,7 @@ struct ModelPickerView: View {
     }
 
     private var reasoningSection: some View {
-        ModelPickerSection(title: "Reasoning", symbol: "brain.head.profile", tint: .conduitAura) {
+        ModelPickerSection(title: AppLocalization.string("Reasoning"), symbol: "brain.head.profile", tint: .conduitAura) {
             Toggle("Enabled", isOn: $reasoningEnabled)
 
             if reasoningEnabled {
@@ -235,7 +236,7 @@ struct ModelPickerView: View {
     }
 
     private var runSettingsSection: some View {
-        ModelPickerSection(title: "Run settings", symbol: "slider.horizontal.3", tint: .conduitAccent) {
+        ModelPickerSection(title: AppLocalization.string("Run settings"), symbol: "slider.horizontal.3", tint: .conduitAccent) {
             Toggle("Fast mode", isOn: $fastEnabled)
             if globalYoloFloor {
                 VStack(alignment: .leading, spacing: 4) {
@@ -283,7 +284,7 @@ struct ModelPickerView: View {
 
     private var visibilityEditor: some View {
         VStack(alignment: .leading, spacing: 14) {
-            ModelPickerSection(title: "Model visibility", symbol: "line.3.horizontal.decrease.circle", tint: .conduitAccent) {
+            ModelPickerSection(title: AppLocalization.string("Model visibility"), symbol: "line.3.horizontal.decrease.circle", tint: .conduitAccent) {
                 TextField("Search providers or models", text: $visibilityQuery)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -336,7 +337,7 @@ struct ModelPickerView: View {
                 }
                 .buttonStyle(.plain)
 
-                Button(providerHidden ? "Hidden" : "Visible") {
+                Button(providerHidden ? AppLocalization.string("Hidden") : AppLocalization.string("Visible")) {
                     toggleProviderVisibility(provider.name)
                 }
                 .font(.caption.weight(.semibold))

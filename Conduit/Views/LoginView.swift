@@ -9,8 +9,12 @@
 
 import SwiftUI
 import WebKit
+import os
 
 struct LoginView: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    private static let logger = Logger(subsystem: "com.milim.relay", category: "login")
+
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
     @State private var serverUrl = ""
@@ -23,238 +27,561 @@ struct LoginView: View {
     @State var cloudflareClientSecret = ""
     @State private var isConnecting = false
     @State private var showWebView = false
-    @State private var error: String?
+    /// The presented failure state: classified connection failures with
+    /// recovery actions, or plain validation notices. The view never renders
+    /// raw Foundation error strings directly.
+    @State private var failure: ConnectionFailurePresentation?
+    /// Non-nil presents the Connection Setup shell, pre-seeded with the
+    /// classified help destination (or `.start` from the entry point).
+    @State private var connectionSetupDestination: ConnectionHelpDestination?
+    /// Round 6: non-nil presents Repair Connection, seeded from the failed
+    /// saved-credential reconnect.
+    @State private var connectionRepairContext: ConnectionRepairContext?
+    /// Whether a repairable saved connection exists, computed once when a
+    /// failure is presented (pure reads in `body`; the takeover happens at
+    /// tap time).
+    @State private var savedRepairAvailable = false
+    /// Set only by the user's Cloudflare toggle (never by the onAppear
+    /// Keychain restore), so a returning saved-token user is not scrolled
+    /// away from the top of the form every time the login screen appears.
+    @State private var revealCloudflareSection = false
+    /// The WebKit session store used for the CURRENT browser sign-in (#148):
+    /// the registered dashboard's own identified store when one exists, or a
+    /// fresh per-presentation identity for a dashboard being added. Set at
+    /// sign-in intent (not render time), so a store is only created when the
+    /// user actually begins a browser sign-in.
+    @State private var signInWebKitStoreID: UUID?
     @FocusState private var focusedField: LoginField?
-
-    private enum LoginField {
-        case server, username, password
-        case cloudflareClientID, cloudflareClientSecret
-    }
 
     var body: some View {
         ZStack {
+            // Purely decorative: the scroll content fills the screen, so
+            // keyboard dismissal is owned by scroll-dismiss, the keyboard
+            // Done button, and moving focus between fields.
             ConduitBackdrop()
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    // Tapping the backdrop (outside any field or control) clears
-                    // focus so the keyboard dismisses and the Connect button is
-                    // reachable. The gesture lives on the background layer — not
-                    // the root — so it never competes with a text field's
-                    // first-responder touch (no two-tap-to-focus regression).
-                    focusedField = nil
-                }
 
-            VStack(spacing: 28) {
-                Spacer(minLength: 36)
-
-                VStack(spacing: 14) {
-                    Image(loginIconAssetName)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 96, height: 96)
-                        .clipShape(RoundedRectangle(cornerRadius: 25, style: .continuous))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 25, style: .continuous)
-                                .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.17 : 0.45), lineWidth: 1)
-                        }
-
-                    VStack(spacing: 6) {
-                        Text("Conduit")
-                            .font(.system(size: 38, weight: .bold, design: .rounded))
-                        Text("A focused home for your Hermes work")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+            // The login form is a responsive scroll view inside a fixed
+            // decorative layer: at compact iPhone heights with the keyboard
+            // up, the focused field (including the optional Cloudflare fields
+            // near the bottom) scrolls into view instead of hiding behind the
+            // keyboard. minHeight keeps the centered layout when the content
+            // fits and only introduces scrolling when it cannot.
+            GeometryReader { geometry in
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        loginContent
+                            .frame(minHeight: geometry.size.height)
                     }
-                }
-
-                Spacer()
-
-                VStack(alignment: .leading, spacing: 16) {
-                    Label("Connect a Hermes dashboard", systemImage: "link")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.conduitAccent)
-
-                    TextField("https://hermes.example", text: $serverUrl)
-                        .textContentType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                        .focused($focusedField, equals: .server)
-                        .padding(.horizontal, 14)
-                        .frame(height: 50)
-                        .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
-
-                    TextField("Username", text: $username)
-                        .textContentType(.username)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .submitLabel(.next)
-                        .focused($focusedField, equals: .username)
-                        .onSubmit { focusedField = .password }
-                        .padding(.horizontal, 14)
-                        .frame(height: 50)
-                        .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
-
-                    SecureField("Password", text: $password)
-                        .textContentType(.password)
-                        .submitLabel(.go)
-                        .focused($focusedField, equals: .password)
-                        .onSubmit { Task { await connect() } }
-                        .padding(.horizontal, 14)
-                        .frame(height: 50)
-                        .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        Toggle("Save credentials", isOn: $saveCredentials)
-                            .tint(.conduitAccent)
-                            .onChange(of: saveCredentials) { _, savesCredentials in
-                                if !savesCredentials { useFaceID = false }
+                    .scrollDismissesKeyboard(.interactively)
+                    .onChange(of: focusedField) { _, field in
+                        guard let field else { return }
+                        withAnimation(.easeOut(duration: 0.25)) {
+                            proxy.scrollTo(field, anchor: .center)
+                        }
+                    }
+                    .onChange(of: revealCloudflareSection) { _, requested in
+                        guard requested else { return }
+                        revealCloudflareSection = false
+                        // Defer one runloop turn: the CF fields this scroll
+                        // targets are inserted in the same transaction, and
+                        // scrolling to not-yet-installed ids would no-op.
+                        DispatchQueue.main.async {
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                proxy.scrollTo(LoginField.cloudflareClientID, anchor: .center)
                             }
-
-                        Toggle("Use Face ID", isOn: $useFaceID)
-                            .tint(.conduitAccent)
-                            .disabled(!saveCredentials || !BiometricAuth.isFaceIDAvailable)
-
-                        if !BiometricAuth.isFaceIDAvailable {
-                            Text("Face ID is not available on this device. You can still save credentials.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        } else if saveCredentials {
-                            Text(useFaceID
-                                ? "Face ID, with device passcode recovery, is required on launch."
-                                : "Saved credentials reconnect without a Face ID prompt.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
                         }
                     }
-                    .padding(.horizontal, 2)
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        Toggle("Use Cloudflare Access service token", isOn: $cloudflareEnabled)
-                            .tint(.conduitAccent)
-                        if cloudflareEnabled {
-                            TextField("Cloudflare Client ID", text: $cloudflareClientID)
-                                .textInputAutocapitalization(.never).autocorrectionDisabled()
-                                .focused($focusedField, equals: .cloudflareClientID)
-                                .padding(.horizontal, 14).frame(height: 50)
-                                .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
-                            SecureField("Cloudflare Client Secret", text: $cloudflareClientSecret)
-                                .focused($focusedField, equals: .cloudflareClientSecret)
-                                .padding(.horizontal, 14).frame(height: 50)
-                                .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
-                            Text("Used only to reach this Cloudflare-protected dashboard; the secret stays in Keychain.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    .padding(.horizontal, 2)
-                    if let error {
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.footnote)
-                            Text(error)
-                                .font(.footnote)
-                                .multilineTextAlignment(.leading)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .foregroundStyle(.red)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-
-                    Button {
-                        Task { await connect() }
-                    } label: {
-                        Label(isConnecting ? "Connecting..." : "Connect", systemImage: "arrow.right")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 50)
-                    }
-                    .foregroundStyle(.white)
-                    .disabled(serverUrl.isEmpty || username.isEmpty || password.isEmpty || isConnecting)
-                    .conduitGlassControl(cornerRadius: 18, tint: .conduitAccent, prominent: true)
                 }
-                .padding(20)
-                .conduitGlassSurface(cornerRadius: 28, tint: .conduitAccent.opacity(0.07))
-
-                Text("Your credentials stay on this device when you choose to save them.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.bottom, 16)
             }
-            .padding(.horizontal, 24)
+        }
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") { focusedField = nil }
+            }
         }
         .onAppear {
             guard serverUrl.isEmpty else { return }
             serverUrl = appState.lastDashboardURL
-            if let access = KeychainHelper.loadCloudflareAccess(for: serverUrl) {
+            if let access = appState.dashboardScopedCloudflareAccess(for: serverUrl) {
                 cloudflareEnabled = true
                 cloudflareClientID = access.clientID
                 cloudflareClientSecret = access.clientSecret
             }
         }
+        .onReceive(appState.$pendingLoginFailure) { pending in
+            // Typed handoff from AppState (rejected saved password,
+            // requireSignIn). Unlike an onAppear string read, this fires even
+            // when the login card is already mounted; @Published guarantees
+            // the current value replays to this new subscriber on mount, so
+            // both orderings are covered. Consume once.
+            guard let pending else { return }
+            failure = pending
+            savedRepairAvailable = appState.makeSavedConnectionRepairContext() != nil
+            appState.pendingLoginFailure = nil
+        }
+        .sheet(item: $connectionSetupDestination) { destination in
+            ConnectionSetupView(
+                initialDestination: destination,
+                initialDraft: ConnectionSetupDraft(existingServerURL: serverUrl, username: username, password: password),
+                // The probe may reuse this same-origin service token; the
+                // wizard re-verifies the origin itself before sending it and
+                // never displays, edits, or persists it.
+                initialCloudflareAccess: configuredCloudflareAccess,
+                initialCloudflareOriginURL: serverUrl
+            ) { result in
+                // The tested handoff mapping: clears the in-memory Cloudflare
+                // token BEFORE the new address lands whenever the origin
+                // changes, so a retained token can never be applied against
+                // a dashboard it was not entered for.
+                let handoff = LoginCloudflareHandoff.apply(
+                    result,
+                    to: serverUrl,
+                    keeping: LoginCloudflareState(
+                        isEnabled: cloudflareEnabled,
+                        clientID: cloudflareClientID,
+                        clientSecret: cloudflareClientSecret
+                    )
+                )
+                cloudflareEnabled = handoff.cloudflare.isEnabled
+                cloudflareClientID = handoff.cloudflare.clientID
+                cloudflareClientSecret = handoff.cloudflare.clientSecret
+                serverUrl = handoff.serverURL
+                username = handoff.username
+                password = handoff.password
+                failure = nil
+                focusedField = nil
+            }
+        }
+        .sheet(item: $connectionRepairContext) { context in
+            ConnectionRepairSetupSheet(context: context)
+        }
         .sheet(isPresented: $showWebView) {
             AuthWebView(
                 url: serverUrl,
                 cloudflareAccess: configuredCloudflareAccess,
-            onTicket: { ticket, baseUrl in
-                // The dashboard is solely an authentication bridge. Dismiss it
-                // before connection work begins so Conduit, not the dashboard,
-                // becomes the active surface as soon as we have a ticket.
-                showWebView = false
-                Task {
-                    // OAuth and cloud dashboard logins do not provide a
-                    // password credential that Conduit can safely reuse.
-                    KeychainHelper.clearCredentials()
-                    appState.rememberDashboardURL(baseUrl)
-                    await appState.connect(with: HermesConnection(baseUrl: baseUrl, ticket: ticket))
-                }
+                dashboardIDProvider: { [appState, url = serverUrl] in
+                    appState.resolveDashboardID(forURL: url, registerIfMissing: true)
                 },
-                onError: { message in
-                    error = message
+                websiteDataStoreIdentifier: signInWebKitStoreID,
+            onTicket: { ticket, baseUrl in
+                    // The dashboard is solely an authentication bridge. Dismiss it
+                    // before connection work begins so Conduit, not the dashboard,
+                    // becomes the active surface as soon as we have a ticket.
+                    showWebView = false
+                    Task {
+                        // OAuth and cloud dashboard logins do not provide a
+                        // password credential that Conduit can safely reuse.
+                        if let dashboardID = appState.resolveDashboardID(forURL: baseUrl, registerIfMissing: true) {
+                            KeychainHelper.clearCredentials(dashboardID: dashboardID)
+                        }
+                        appState.rememberDashboardURL(baseUrl)
+                        await appState.connect(with: HermesConnection(baseUrl: baseUrl, ticket: ticket))
+                    }
+                },
+                onError: { classifiedFailure, detail in
+                    // Fixed classified copy only — the dashboard-provided
+                    // detail is logged for diagnosis (default os privacy
+                    // redacts it in release builds) and never reaches the
+                    // login card.
+                    Self.logger.error(
+                        "Auth WebView sign-in error: \(String(describing: classifiedFailure), privacy: .public) detail: \(detail)"
+                    )
+                    failure = .presenting(classifiedFailure)
                 }
             )
         }
     }
 
+    private var loginContent: some View {
+        VStack(spacing: 28) {
+            Spacer(minLength: 36)
+
+            VStack(spacing: 14) {
+                Image(loginIconAssetName)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 96, height: 96)
+                    .clipShape(RoundedRectangle(cornerRadius: 25, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 25, style: .continuous)
+                            .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.17 : 0.45), lineWidth: 1)
+                    }
+
+                VStack(spacing: 6) {
+                    Text("Conduit")
+                        .font(.system(size: 38, weight: .bold, design: .rounded))
+                    Text("A focused home for your Hermes work")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer()
+
+            VStack(alignment: .leading, spacing: 16) {
+                Label("Connect a Hermes dashboard", systemImage: "link")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.conduitAccent)
+
+                // Connection Setup entry point (visible, secondary to
+                // Connect, never auto-opened). Round 1 opens the shell;
+                // the guided assistant fills it in later.
+                Button {
+                    connectionSetupDestination = .start
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "questionmark.circle")
+                            .font(.body)
+                            .foregroundStyle(.conduitAccent)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Need help connecting?")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.primary)
+                            Text("Set up your Hermes connection")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .conduitGlassSurface(cornerRadius: 14, tint: .conduitAura.opacity(0.06))
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("login.connection-setup")
+
+                TextField("https://hermes.example", text: $serverUrl)
+                    .textContentType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                    .accessibilityIdentifier("login.server-url")
+                    .focused($focusedField, equals: .server)
+                    .submitLabel(LoginField.server.submitKeyboardLabel(cloudflareTokenEntryEnabled: cloudflareEnabled))
+                    .onSubmit { handleSubmit(from: .server) }
+                    .padding(.horizontal, 14)
+                    .frame(height: 50)
+                    .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
+                    .id(LoginField.server)
+
+                TextField("Username", text: $username)
+                    .textContentType(.username)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .accessibilityIdentifier("login.username")
+                    .submitLabel(LoginField.username.submitKeyboardLabel(cloudflareTokenEntryEnabled: cloudflareEnabled))
+                    .focused($focusedField, equals: .username)
+                    .onSubmit { handleSubmit(from: .username) }
+                    .padding(.horizontal, 14)
+                    .frame(height: 50)
+                    .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
+                    .id(LoginField.username)
+
+                SecureField("Password", text: $password)
+                    .textContentType(.password)
+                    .accessibilityIdentifier("login.password")
+                    .submitLabel(LoginField.password.submitKeyboardLabel(cloudflareTokenEntryEnabled: cloudflareEnabled))
+                    .focused($focusedField, equals: .password)
+                    .onSubmit { handleSubmit(from: .password) }
+                    .padding(.horizontal, 14)
+                    .frame(height: 50)
+                    .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
+                    .id(LoginField.password)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle("Save credentials", isOn: $saveCredentials)
+                        .tint(.conduitAccent)
+                        .onChange(of: saveCredentials) { _, savesCredentials in
+                            if !savesCredentials { useFaceID = false }
+                        }
+
+                    Toggle("Use Face ID", isOn: $useFaceID)
+                        .tint(.conduitAccent)
+                        .disabled(!saveCredentials || !BiometricAuth.isFaceIDAvailable)
+
+                    if !BiometricAuth.isFaceIDAvailable {
+                        Text("Face ID is not available on this device. You can still save credentials.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if saveCredentials {
+                        Text(useFaceID
+                            ? AppLocalization.string("Face ID, with device passcode recovery, is required on launch.")
+                            : AppLocalization.string("Saved credentials reconnect without a Face ID prompt."))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 2)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle("Use Cloudflare Access service token", isOn: Binding(
+                        get: { cloudflareEnabled },
+                        set: { enabled in
+                            cloudflareEnabled = enabled
+                            revealCloudflareSection = enabled
+                            // Turning the section off while typing in one of
+                            // its fields unmounts them mid-focus; drop focus
+                            // explicitly so the keyboard never dangles.
+                            if !enabled,
+                               focusedField == .cloudflareClientID || focusedField == .cloudflareClientSecret {
+                                focusedField = nil
+                            }
+                        }
+                    ))
+                    .tint(.conduitAccent)
+                    // Stable XCUI handles: the localized label works too, but
+                    // identifiers decouple the UI tests from copy changes
+                    // and from Switch/CheckBox element-type ambiguity.
+                    .accessibilityIdentifier("login.cloudflare-toggle")
+                    if cloudflareEnabled {
+                        TextField("Cloudflare Client ID", text: $cloudflareClientID)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            .accessibilityIdentifier("login.cloudflare-client-id")
+                            .focused($focusedField, equals: .cloudflareClientID)
+                            .submitLabel(LoginField.cloudflareClientID.submitKeyboardLabel(cloudflareTokenEntryEnabled: cloudflareEnabled))
+                            .onSubmit { handleSubmit(from: .cloudflareClientID) }
+                            .padding(.horizontal, 14).frame(height: 50)
+                            .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
+                            .id(LoginField.cloudflareClientID)
+                        SecureField("Cloudflare Client Secret", text: $cloudflareClientSecret)
+                            .accessibilityIdentifier("login.cloudflare-client-secret")
+                            .focused($focusedField, equals: .cloudflareClientSecret)
+                            .submitLabel(LoginField.cloudflareClientSecret.submitKeyboardLabel(cloudflareTokenEntryEnabled: cloudflareEnabled))
+                            .onSubmit { handleSubmit(from: .cloudflareClientSecret) }
+                            .padding(.horizontal, 14).frame(height: 50)
+                            .conduitGlassSurface(cornerRadius: 17, tint: .conduitAura.opacity(0.06))
+                            .id(LoginField.cloudflareClientSecret)
+                        Text("Used only to reach this Cloudflare-protected dashboard; the secret stays in Keychain.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 2)
+                if let failure {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.footnote)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(failure.title)
+                                    .font(.footnote.weight(.semibold))
+                                    .multilineTextAlignment(.leading)
+                                    .accessibilityIdentifier("login.error.title")
+                                if !failure.message.isEmpty {
+                                    Text(failure.message)
+                                        .font(.footnote)
+                                        .multilineTextAlignment(.leading)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                        if failure.offersRecoveryActions {
+                            HStack(spacing: 16) {
+                                Button("Try Again") {
+                                    Task { await connect() }
+                                }
+                                .disabled(isConnecting)
+                                .accessibilityIdentifier("login.error.try-again")
+
+                                if let destination = failure.helpDestination {
+                                    Button("Troubleshoot Connection") {
+                                        connectionSetupDestination = destination
+                                    }
+                                    .accessibilityIdentifier("login.error.troubleshoot")
+                                }
+
+                                // Round 6: a failed SAVED-credential reconnect
+                                // is a failed EXISTING connection — offer the
+                                // repair flow seeded from that record. The
+                                // typed failure proves provenance (manual
+                                // login failures never set it), and entering
+                                // repair revokes any outstanding automatic
+                                // recovery authority.
+                                if savedRepairAvailable, appState.lastConnectionFailure != nil {
+                                    Button("Repair Connection") {
+                                        connectionRepairContext = appState.beginSavedConnectionRepair()
+                                    }
+                                    .accessibilityIdentifier("login.repair-connection")
+                                }
+                            }
+                            .font(.footnote.weight(.semibold))
+                        }
+                    }
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Button {
+                    Task { await connect() }
+                } label: {
+                    Label(isConnecting ? AppLocalization.string("Connecting...") : AppLocalization.string("Connect"), systemImage: "arrow.right")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 50)
+                }
+                .accessibilityIdentifier("login.connect")
+                .foregroundStyle(.white)
+                .disabled(!connectInputsArePresent || isConnecting)
+                .conduitGlassControl(cornerRadius: 18, tint: .conduitAccent, prominent: true)
+            }
+            .padding(20)
+            .conduitGlassSurface(cornerRadius: 28, tint: .conduitAccent.opacity(0.07))
+
+            Text("Your credentials stay on this device when you choose to save them.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 16)
+        }
+        .padding(.horizontal, 24)
+    }
+
+    /// Trimmed-presence check so whitespace-only input is treated the same
+    /// by the Connect button and by connect()'s guard.
+    private var connectInputsArePresent: Bool {
+        Self.hasConnectableInput(serverURL: serverUrl, username: username, password: password)
+    }
+
+    /// Static seam for the trimmed-presence rule so the validation contract
+    /// is unit-testable without hosting the view.
+    static func hasConnectableInput(serverURL: String, username: String, password: String) -> Bool {
+        !serverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Return-key behavior shared by every field: walk the focus chain
+    /// (server → username → password → Cloudflare Client ID → Client Secret)
+    /// and only submit when the focused field ends the chain. While the
+    /// Cloudflare token entry is on, the password field hands focus to the
+    /// Cloudflare Client ID instead of triggering Connect.
+    private func handleSubmit(from field: LoginField) {
+        if let destination = field.submitDestination(cloudflareTokenEntryEnabled: cloudflareEnabled) {
+            focusedField = destination
+        } else {
+            Task { await connect() }
+        }
+    }
+
+    @MainActor
     private func connect() async {
+        // The Connect button is disabled while connecting, but Try Again and
+        // the return-key chain also reach this method: never let a second
+        // auth sequence run concurrently (Hermes throttles password login).
+        guard !isConnecting else { return }
+        // A manual login attempt abandons any prior existing-connection
+        // failure context: Repair Connection is for the connection that
+        // actually failed, not for whatever the user is typing now.
+        appState.lastConnectionFailure = nil
         let cleaned = serverUrl.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty else { return }
-        guard let normalized = try? ConnectionURLPolicy.normalizedBaseURL(cleaned) else {
-            error = ConnectionURLPolicyError.insecureTransport.localizedDescription
+        guard !cleaned.isEmpty else {
+            // The return-key chain can reach submit without the Connect
+            // button ever being enabled (e.g. a whitespace-only URL).
+            // Surface the standard invalid-URL feedback instead of a silent
+            // no-op.
+            failure = .notice(title: AppLocalization.string("Enter a valid dashboard URL."))
+            focusedField = .server
+            return
+        }
+        // The return-key chain can reach submit while an earlier field was
+        // skipped (e.g. tapping straight into the Cloudflare Secret); land
+        // focus on the missing field instead of a raw remote 401. The
+        // password value itself is sent untrimmed.
+        guard !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            failure = .notice(title: AppLocalization.string("Enter your dashboard username and password."))
+            focusedField = username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .username : .password
+            return
+        }
+        // Preserve WHICH URL-policy rule failed: a malformed address and an
+        // insecure remote transport are different mistakes with different
+        // fixes, so they classify differently instead of collapsing into one
+        // insecure-transport message.
+        let normalized: String
+        do {
+            normalized = try ConnectionURLPolicy.normalizedBaseURL(cleaned)
+        } catch {
+            // Log the type-safe classification, never the raw error: its
+            // associated values can carry server-provided detail text that
+            // must not reach the unified log unredacted.
+            Self.logger.error("Login URL normalization failed: \(String(describing: ConnectionFailureClassifier.classify(error)), privacy: .public)")
+            failure = .presenting(ConnectionFailureClassifier.classify(error))
             return
         }
         serverUrl = normalized
         appState.rememberDashboardURL(serverUrl)
-        error = nil
+        failure = nil
         isConnecting = true
         defer { isConnecting = false }
 
         do {
             let access = configuredCloudflareAccess
             let client = NativeAuthClient(baseURL: serverUrl, cloudflareAccess: access)
-            let providers = try await client.authProviders()
-            guard providers.contains(where: { $0["supports_password"] as? Bool == true }) else {
+            // Provider discovery is typed: only the unauthenticated redirect
+            // is THE interactive sign-in signal. A recognizable Hermes
+            // provider answer without password support (none configured, or
+            // only OAuth providers) intentionally routes to the browser too
+            // — an explicit decision, not the old "empty list" ambiguity. An
+            // unrecognized 2xx body keeps the same browser fallback it
+            // always had.
+            let requiresBrowserSignIn: Bool
+            switch try await client.authProviderDiscovery() {
+            case .interactiveSignInRequired:
+                requiresBrowserSignIn = true
+            case .providers(let providers):
+                requiresBrowserSignIn = !HermesProviderCheck.supportsPassword(providers)
+            case .unrecognized:
+                requiresBrowserSignIn = true
+            }
+            if requiresBrowserSignIn {
                 showWebView = true
-                if let access { KeychainHelper.saveCloudflareAccess(access, origin: serverUrl) }
+                // The WebKit session for this sign-in is dashboard-owned:
+                // reuse the registered dashboard's identified store when one
+                // exists (repair / re-sign-in), otherwise isolate this new
+                // sign-in in its own per-presentation store. Never the
+                // default store — sibling-host parent-domain cookies must not
+                // cross dashboards.
+                signInWebKitStoreID = appState.resolveDashboardID(forURL: serverUrl, registerIfMissing: false) ?? UUID()
+                // The service token is bound to the dashboard it
+                // authenticates; resolve (or pre-register) that dashboard so
+                // the scoped write cannot land on another server's record.
+                if let access, let dashboardID = appState.resolveDashboardID(forURL: serverUrl, registerIfMissing: true) {
+                    KeychainHelper.saveCloudflareAccess(access, origin: serverUrl, dashboardID: dashboardID)
+                }
                 return
             }
 
-            let ticket = try await client.connect(username: username, password: password)
-            if saveCredentials {
-                KeychainHelper.saveCredentials(DashboardCredentials(
-                    baseURL: serverUrl,
-                    username: username,
-                    password: password,
-                    requiresFaceID: useFaceID
-                ))
-            } else {
-                KeychainHelper.clearCredentials()
+            let authenticatedConnection = try await client.connect(username: username, password: password)
+            let dashboardID = appState.resolveDashboardID(forURL: serverUrl, registerIfMissing: true)
+            if let dashboardID {
+                if saveCredentials {
+                    KeychainHelper.saveCredentials(DashboardCredentials(
+                        baseURL: serverUrl,
+                        username: username,
+                        password: password,
+                        requiresFaceID: useFaceID
+                    ), dashboardID: dashboardID)
+                } else {
+                    KeychainHelper.clearCredentials(dashboardID: dashboardID)
+                }
+                if let access {
+                    KeychainHelper.saveCloudflareAccess(access, origin: serverUrl, dashboardID: dashboardID)
+                } else {
+                    KeychainHelper.clearCloudflareAccess(dashboardID: dashboardID)
+                }
             }
-            if let access { KeychainHelper.saveCloudflareAccess(access, origin: serverUrl) } else { KeychainHelper.clearCloudflareAccess() }
-            await appState.connect(with: HermesConnection(baseUrl: serverUrl, ticket: ticket))
+            if let dashboardID {
+                authenticatedConnection.commitCookies(dashboardID: dashboardID)
+            }
+            await appState.connect(with: HermesConnection(baseUrl: serverUrl, ticket: authenticatedConnection.ticket))
         } catch is CancellationError {
             return
         } catch {
-            self.error = error.localizedDescription
+            Self.logger.error("Login connection failed: \(String(describing: ConnectionFailureClassifier.classify(error)), privacy: .public)")
+            failure = .presenting(ConnectionFailureClassifier.classify(error))
         }
     }
 
@@ -275,18 +602,164 @@ struct LoginView: View {
     }
 }
 
+// MARK: - Setup handoff Cloudflare state
+
+/// The login card's in-memory Cloudflare service-token fields, as a plain
+/// value so the setup-wizard handoff decision is unit-testable without
+/// hosting the view.
+struct LoginCloudflareState: Equatable {
+    var isEnabled: Bool
+    var clientID: String
+    var clientSecret: String
+}
+
+enum LoginCloudflareHandoff {
+    /// Decides the in-memory Cloudflare token state after the setup wizard
+    /// hands back a dashboard address. A retained service token is bound to
+    /// the origin it was entered for; when the handoff moves the dashboard to
+    /// a different origin (scheme, host, or effective port — path-only
+    /// changes are same-origin, per `ConnectionURLPolicy`), the token must
+    /// never be silently sent there, so the in-memory state clears. The
+    /// persisted Keychain token stays origin-scoped and is deliberately
+    /// untouched by this decision.
+    static func state(from oldServerURL: String, to newServerURL: String,
+                      keeping current: LoginCloudflareState) -> LoginCloudflareState {
+        if sameOrigin(oldServerURL, newServerURL) { return current }
+        return LoginCloudflareState(isEnabled: false, clientID: "", clientSecret: "")
+    }
+
+    static func sameOrigin(_ oldServerURL: String, _ newServerURL: String) -> Bool {
+        ConnectionURLPolicy.originMatches(
+            URL(string: oldServerURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+            expected: URL(string: newServerURL.trimmingCharacters(in: .whitespacesAndNewlines))
+        )
+    }
+
+    /// The complete login-field mapping for a wizard handoff, so the view's
+    /// completion closure stays a single tested call and a refactor cannot
+    /// silently drop the origin check while still assigning the new address.
+    static func apply(_ result: ConnectionSetupResult, to oldServerURL: String,
+                      keeping cloudflare: LoginCloudflareState)
+        -> (serverURL: String, username: String, password: String, cloudflare: LoginCloudflareState) {
+        (
+            result.serverURL,
+            result.username,
+            result.password,
+            state(from: oldServerURL, to: result.serverURL, keeping: cloudflare)
+        )
+    }
+}
+
+// MARK: - Login field focus chain
+
+/// The login form's focusable fields, in tab order. Internal (not nested in
+/// `LoginView`) so the return-key/focus-chain rules are unit-testable without
+/// hosting the view.
+enum LoginField: Hashable, CaseIterable {
+    case server, username, password
+    case cloudflareClientID, cloudflareClientSecret
+
+    /// The field the return key should move focus to, or `nil` when return on
+    /// this field submits (Connect) instead. While Cloudflare token entry is
+    /// enabled, the password field hands focus to the Cloudflare Client ID
+    /// rather than triggering Connect, so finishing the dashboard password
+    /// can never accidentally submit half-entered Cloudflare credentials.
+    func submitDestination(cloudflareTokenEntryEnabled: Bool) -> LoginField? {
+        switch self {
+        case .server: return .username
+        case .username: return .password
+        case .password: return cloudflareTokenEntryEnabled ? .cloudflareClientID : nil
+        case .cloudflareClientID: return .cloudflareClientSecret
+        case .cloudflareClientSecret: return nil
+        }
+    }
+
+    /// Whether return on this field submits (Connect) instead of advancing
+    /// focus. Exposed separately from the keyboard label so the decision
+    /// stays unit-testable (SubmitLabel is not Equatable).
+    func submits(cloudflareTokenEntryEnabled: Bool) -> Bool {
+        submitDestination(cloudflareTokenEntryEnabled: cloudflareTokenEntryEnabled) == nil
+    }
+
+    func submitKeyboardLabel(cloudflareTokenEntryEnabled: Bool) -> SubmitLabel {
+        submits(cloudflareTokenEntryEnabled: cloudflareTokenEntryEnabled) ? .go : .next
+    }
+}
+
+// MARK: - Auth WebView navigation policy
+
+/// The authentication WebView's navigation boundary, extracted so the rules
+/// are unit-testable without hosting a WKWebView.
+///
+/// Main frames follow the strict dashboard policy: allowed transport only,
+/// unpinned sign-in may traverse the legitimate Cloudflare/IdP redirect
+/// chain, and once the dashboard origin pins, top-level navigation cannot
+/// escape it. Subframes additionally accept the `about:blank` /
+/// `about:srcdoc` documents Cloudflare's Turnstile WebView requirements
+/// name. Those documents inherit the parent page's origin, so script inside
+/// them could attempt a top-level navigation — but any such attempt
+/// re-enters this policy as a MAIN frame navigation, so the allowance never
+/// moves the main-frame dashboard-origin boundary.
+enum AuthWebViewNavigationPolicy {
+    enum Decision: Equatable {
+        case allow
+        case cancel
+    }
+
+    static func decide(
+        url: URL?,
+        isMainFrame: Bool,
+        hasPinnedDashboardOrigin: Bool,
+        expectedDashboardURL: URL?
+    ) -> Decision {
+        if !isMainFrame {
+            return ConnectionURLPolicy.isAllowedWebViewSubframeTransport(url) ? .allow : .cancel
+        }
+        guard ConnectionURLPolicy.isAllowedTransport(url) else { return .cancel }
+        if !hasPinnedDashboardOrigin {
+            // Passwordless/OAuth providers legitimately use a short
+            // cross-origin redirect chain during sign-in. The ticket
+            // message remains origin-pinned below, and navigation locks
+            // to the dashboard as soon as the authenticated route loads.
+            return .allow
+        }
+        guard let expectedDashboardURL,
+              ConnectionURLPolicy.originMatches(url, expected: expectedDashboardURL) else {
+            return .cancel
+        }
+        return .allow
+    }
+}
+
 // MARK: - Auth WebView
 
 struct AuthWebView: UIViewRepresentable {
     let url: String
     let cloudflareAccess: CloudflareAccessCredentials?
+    /// Resolves the saved dashboard being signed into AT CAPTURE TIME (on
+    /// successful sign-in), so the cookie mirror is written to that
+    /// dashboard's scoped record. A closure, not a value: resolving during
+    /// view construction would register a dashboard for every render of the
+    /// login card, and the binding belongs to the commit moment. Nil
+    /// (callers without a registry context, e.g. tests) captures nothing —
+    /// no identity, no durable mirror.
+    var dashboardIDProvider: (() -> UUID?)? = nil
+    /// The dashboard-owned WebKit session store identifier for this sign-in.
+    /// Non-nil means the WebView runs inside `WKWebsiteDataStore(
+    /// forIdentifier:)` for that identity — never the shared default store —
+    /// so sign-in cookies are isolated per dashboard from the first request.
+    /// Nil (legacy/test construction) keeps the default store.
+    var websiteDataStoreIdentifier: UUID? = nil
     let onTicket: (String, String) -> Void
-    let onError: (String) -> Void
+    /// Classified failure + raw diagnostic detail. The dashboard controls the
+    /// detail text (e.g. `payload["error"]`), so it is never rendered — the
+    /// login card shows only the fixed copy for the classification.
+    let onError: (ConnectionFailure, String) -> Void
 
     func makeUIView(context: Context) -> WKWebView {
         let normalized = try? ConnectionURLPolicy.normalizedBaseURL(url)
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default()
+        config.websiteDataStore = DashboardCookiePersistence.webKitStore(for: websiteDataStoreIdentifier)
         config.userContentController.add(context.coordinator, name: "ticket")
         if let normalized,
            let script = cloudflareAccess?.fetchInjectionUserScript(expectedBaseURL: normalized),
@@ -297,15 +770,47 @@ struct AuthWebView: UIViewRepresentable {
         }
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
-        guard let normalized, let dashboardURL = URL(string: normalized) else {
-            onError(ConnectionURLPolicyError.invalidURL.localizedDescription)
+        guard let normalized else {
+            Self.reportConstructionFailure(onError, detail: AppLocalization.string("dashboard URL failed normalization in AuthWebView"))
             return webView
+        }
+        if let request = try? Self.dashboardRequest(normalizedBaseURL: normalized, cloudflareAccess: cloudflareAccess) {
+            webView.load(request)
+        } else {
+            Self.reportConstructionFailure(onError, detail: AppLocalization.string("dashboard sign-in request construction failed"))
+        }
+        return webView
+    }
+
+    /// Construction-time failures cannot synchronously mutate the owning
+    /// view's state: makeUIView runs inside SwiftUI's representable update
+    /// pass, and an immediate onError would write LoginView @State mid-render.
+    /// Report on the next main-runloop turn instead. Static with an injected
+    /// callback so the deferral contract stays unit-testable.
+    static func reportConstructionFailure(
+        _ onError: @escaping (ConnectionFailure, String) -> Void,
+        detail: String,
+        failure: ConnectionFailure = .invalidAddress
+    ) {
+        DispatchQueue.main.async {
+            onError(failure, detail)
+        }
+    }
+
+    /// The dashboard sign-in request the WebView boots with. Extracted so the
+    /// service-token header placement on the initial request stays covered by
+    /// unit tests without hosting a WKWebView.
+    static func dashboardRequest(
+        normalizedBaseURL: String,
+        cloudflareAccess: CloudflareAccessCredentials?
+    ) throws -> URLRequest {
+        guard let dashboardURL = URL(string: normalizedBaseURL) else {
+            throw ConnectionURLPolicyError.invalidURL
         }
         let loginURL = dashboardURL.appending(path: "login")
         var request = URLRequest(url: loginURL)
         request = cloudflareAccess?.applying(to: request) ?? request
-        webView.load(request)
-        return webView
+        return request
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
@@ -385,8 +890,13 @@ struct AuthWebView: UIViewRepresentable {
             let status = payload["status"] as? Int ?? 0
             guard status != 401 else { return } // The dashboard is still showing its sign-in route.
             guard let ticket = payload["ticket"] as? String, !ticket.isEmpty else {
+                // The classification is Conduit's, never the payload's: a
+                // completed dashboard sign-in that fails to mint a ticket is
+                // a session-ticket failure regardless of what the payload
+                // says. Payload text is carried as diagnostic detail only.
                 let detail = payload["error"] as? String
-                parent.onError(detail ?? "Unable to start the Hermes session\(status == 0 ? "" : " (\(status))").")
+                    ?? AppLocalization.string("Unable to start the Hermes session\(status == 0 ? "" : " (\(status))")")
+                parent.onError(.sessionTicketFailure, detail)
                 return
             }
             // Persist the HttpOnly dashboard session before dismissing this
@@ -395,10 +905,11 @@ struct AuthWebView: UIViewRepresentable {
             let webView = authenticatedWebView
             Task { @MainActor [weak self, weak webView] in
                 guard let self else { return }
-                if let webView {
+                if let webView, let dashboardID = parent.dashboardIDProvider?() {
                     await DashboardCookiePersistence.capture(
                         from: webView.configuration.websiteDataStore.httpCookieStore,
-                        for: self.expectedURL
+                        for: self.expectedURL,
+                        dashboardID: dashboardID
                     )
                 }
                 self.deliver(ticket: ticket)
@@ -418,30 +929,20 @@ struct AuthWebView: UIViewRepresentable {
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
-            guard ConnectionURLPolicy.isAllowedTransport(navigationAction.request.url) else {
-                decisionHandler(.cancel)
-                return
-            }
-            // Subframes may host an identity provider, but every top-level
-            // navigation must stay on the configured dashboard origin.
-            if let targetFrame = navigationAction.targetFrame, !targetFrame.isMainFrame {
+            // A nil targetFrame is treated as main-frame, matching the
+            // historical policy for the initial navigation.
+            let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+            switch AuthWebViewNavigationPolicy.decide(
+                url: navigationAction.request.url,
+                isMainFrame: isMainFrame,
+                hasPinnedDashboardOrigin: hasPinnedDashboardOrigin,
+                expectedDashboardURL: expectedURL
+            ) {
+            case .allow:
                 decisionHandler(.allow)
-                return
-            }
-            if !hasPinnedDashboardOrigin {
-                // Passwordless/OAuth providers legitimately use a short
-                // cross-origin redirect chain during sign-in. The ticket
-                // message remains origin-pinned below, and navigation locks
-                // to the dashboard as soon as the authenticated route loads.
-                decisionHandler(.allow)
-                return
-            }
-            guard let expectedURL,
-                  ConnectionURLPolicy.originMatches(navigationAction.request.url, expected: expectedURL) else {
+            case .cancel:
                 decisionHandler(.cancel)
-                return
             }
-            decisionHandler(.allow)
         }
     }
 }

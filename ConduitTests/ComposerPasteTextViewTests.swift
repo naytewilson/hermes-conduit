@@ -8,97 +8,110 @@ import XCTest
 
 @MainActor
 final class ComposerPasteTextViewTests: XCTestCase {
-    private var savedPasteboardItems: [[String: Any]] = []
-
-    override func setUp() {
-        super.setUp()
-        // Snapshot the system pasteboard so tearDown can restore it instead of
-        // clobbering a real clipboard (relevant when the suite runs on a device).
-        savedPasteboardItems = UIPasteboard.general.items
-    }
-
-    override func tearDown() {
-        UIPasteboard.general.items = savedPasteboardItems
-        super.tearDown()
-    }
+    // Tests that mutate UIPasteboard.general wrap their body in
+    // withClearedGeneralPasteboard so they start from a known-empty clipboard
+    // and leave nothing behind. A suite-wide setUp()/tearDown()
+    // used to round-trip UIPasteboard.general.items around every test —
+    // including the purely in-memory NSItemProvider tests below — and the
+    // .items getter is the dangerous half: it materializes whatever the
+    // simulator clipboard holds (content this app did not write), which can
+    // block indefinitely on CI simulators. XCTest logs "Test Case ... started"
+    // before setUp() returns, so the stall presents as a stuck first test
+    // rather than a hung pasteboard read. Writes and clears are safe, so
+    // isolation here uses clears only — never an unsolicited read.
 
     func testPasteboardContainsImageTrueForImagePasteboard() {
-        let view = ImagePasteTextView()
-        UIPasteboard.general.image = Self.fixtureImage()
+        withClearedGeneralPasteboard {
+            let view = ImagePasteTextView()
+            UIPasteboard.general.image = Self.fixtureImage()
 
-        XCTAssertTrue(view.pasteboardContainsImage())
+            XCTAssertTrue(view.pasteboardContainsImage())
+        }
     }
 
     func testPasteboardContainsImageFalseForTextPasteboard() {
-        let view = ImagePasteTextView()
-        UIPasteboard.general.string = "just text"
+        withClearedGeneralPasteboard {
+            let view = ImagePasteTextView()
+            UIPasteboard.general.string = "just text"
 
-        XCTAssertFalse(view.pasteboardContainsImage())
+            XCTAssertFalse(view.pasteboardContainsImage())
+        }
     }
 
     func testCanPerformActionOffersPasteForImagePasteboard() {
-        let view = ImagePasteTextView()
-        view.isEditable = true
-        UIPasteboard.general.image = Self.fixtureImage()
+        withClearedGeneralPasteboard {
+            let view = ImagePasteTextView()
+            view.isEditable = true
+            UIPasteboard.general.image = Self.fixtureImage()
 
-        // Regression: UITextView drops "Paste" for an image-only pasteboard, so
-        // the long-press edit menu only offered system items like "Autofill".
-        // canPerformAction must surface paste: so the existing paste(_:) path
-        // becomes reachable from the menu.
-        XCTAssertTrue(view.canPerformAction(#selector(UIResponder.paste(_:)), withSender: nil))
+            // Regression: UITextView drops "Paste" for an image-only pasteboard, so
+            // the long-press edit menu only offered system items like "Autofill".
+            // canPerformAction must surface paste: so the existing paste(_:) path
+            // becomes reachable from the menu.
+            XCTAssertTrue(view.canPerformAction(#selector(UIResponder.paste(_:)), withSender: nil))
+        }
     }
 
     func testShouldOfferImagePasteTrueForImagePasteboard() {
-        let view = ImagePasteTextView()
-        view.isEditable = true
-        UIPasteboard.general.image = Self.fixtureImage()
+        withClearedGeneralPasteboard {
+            let view = ImagePasteTextView()
+            view.isEditable = true
+            UIPasteboard.general.image = Self.fixtureImage()
 
-        XCTAssertTrue(view.shouldOfferImagePaste())
+            XCTAssertTrue(view.shouldOfferImagePaste())
+        }
     }
 
     func testShouldOfferImagePasteFalseWhenNotEditable() {
-        let view = ImagePasteTextView()
-        view.isEditable = false
-        UIPasteboard.general.image = Self.fixtureImage()
+        withClearedGeneralPasteboard {
+            let view = ImagePasteTextView()
+            view.isEditable = false
+            UIPasteboard.general.image = Self.fixtureImage()
 
-        // A disabled composer must not offer image paste even with an image on
-        // the pasteboard.
-        XCTAssertFalse(view.shouldOfferImagePaste())
+            // A disabled composer must not offer image paste even with an image on
+            // the pasteboard.
+            XCTAssertFalse(view.shouldOfferImagePaste())
+        }
     }
 
     func testShouldOfferImagePasteFalseForTextOnlyPasteboard() {
-        let view = ImagePasteTextView()
-        view.isEditable = true
-        UIPasteboard.general.string = "just text"
+        withClearedGeneralPasteboard {
+            let view = ImagePasteTextView()
+            view.isEditable = true
+            UIPasteboard.general.string = "just text"
 
-        // Text-only content must not be treated as an image paste.
-        XCTAssertFalse(view.shouldOfferImagePaste())
+            // Text-only content must not be treated as an image paste.
+            XCTAssertFalse(view.shouldOfferImagePaste())
+        }
     }
 
     func testPasteSelectorDeliversImageFromPasteboard() async {
         // End-to-end check of the exact path a menu tap now dispatches: the
         // legacy paste(_:) selector reads UIPasteboard.general and fires
         // onPastedImage. This is independent of the canPerformAction gate.
-        let view = ImagePasteTextView()
-        UIPasteboard.general.image = Self.fixtureImage()
+        await withClearedGeneralPasteboard {
+            let view = ImagePasteTextView()
+            UIPasteboard.general.image = Self.fixtureImage()
 
-        let callback = expectation(description: "paste(_:) delivered image")
-        view.onPastedImage = { pastedImage in
-            XCTAssertFalse(pastedImage.data.isEmpty)
-            XCTAssertEqual(pastedImage.typeIdentifier, UTType.png.identifier)
-            callback.fulfill()
+            let callback = expectation(description: "paste(_:) delivered image")
+            view.onPastedImage = { pastedImage in
+                XCTAssertFalse(pastedImage.data.isEmpty)
+                XCTAssertEqual(pastedImage.typeIdentifier, UTType.png.identifier)
+                callback.fulfill()
+            }
+            view.onPastedImageError = { message in
+                XCTFail("paste(_:) should deliver the image, got: \(message)")
+            }
+
+            view.paste(nil as Any?)
+
+            await fulfillment(of: [callback], timeout: 5.0)
         }
-        view.onPastedImageError = { message in
-            XCTFail("paste(_:) should deliver the image, got: \(message)")
-        }
-
-        view.paste(nil as Any?)
-
-        await fulfillment(of: [callback], timeout: 5.0)
     }
 
     func testProgrammaticTextApplicationDoesNotPublishAsUserEditing() {
         var value = "old"
+        var userEditCount = 0
         let view = ComposerPasteTextView(
             text: Binding(get: { value }, set: { value = $0 }),
             isFocused: .constant(false),
@@ -106,7 +119,8 @@ final class ComposerPasteTextViewTests: XCTestCase {
             enabled: true,
             onPastedImage: { _ in },
             onPastedImageError: { _ in },
-            editorIdentity: UUID()
+            editorIdentity: UUID(),
+            onUserEdit: { userEditCount += 1 }
         )
         let coordinator = ComposerPasteTextView.Coordinator(view)
         coordinator.isApplyingProgrammaticState = true
@@ -117,6 +131,208 @@ final class ComposerPasteTextViewTests: XCTestCase {
         coordinator.textViewDidChange(textView)
 
         XCTAssertEqual(value, "old")
+        XCTAssertEqual(
+            userEditCount, 0,
+            "A programmatic replacement must never claim session ownership"
+        )
+    }
+
+    /// The ownership signal for the composer-race fix: a genuine user edit
+    /// must claim ownership synchronously in the delegate callback, BEFORE
+    /// the SwiftUI binding observes the new text.
+    func testUserEditInvokesOnUserEditBeforeBindingUpdate() {
+        var value = ""
+        var events: [String] = []
+        let view = ComposerPasteTextView(
+            text: Binding(
+                get: { value },
+                set: { value = $0; events.append("binding") }
+            ),
+            isFocused: .constant(false),
+            measuredHeight: .constant(44),
+            enabled: true,
+            onPastedImage: { _ in },
+            onPastedImageError: { _ in },
+            editorIdentity: UUID(),
+            onUserEdit: { events.append("onUserEdit") }
+        )
+        let coordinator = ComposerPasteTextView.Coordinator(view)
+
+        let textView = ImagePasteTextView()
+        textView.text = "typed"
+        coordinator.textViewDidChange(textView)
+
+        XCTAssertEqual(events, ["onUserEdit", "binding"])
+        XCTAssertEqual(value, "typed")
+    }
+
+    /// Every genuine mutation claims ownership; the per-generation latch that
+    /// collapses repeated claims into one automatic-restoration cancellation
+    /// lives in AppState (testComposerUserEditLatchesUntilNextAutomaticWorkGeneration)
+    /// and must stay out of the bridge.
+    func testRepeatedUserEditsInvokeOnUserEditEachTime() {
+        var value = ""
+        var userEditCount = 0
+        let view = ComposerPasteTextView(
+            text: Binding(get: { value }, set: { value = $0 }),
+            isFocused: .constant(false),
+            measuredHeight: .constant(44),
+            enabled: true,
+            onPastedImage: { _ in },
+            onPastedImageError: { _ in },
+            editorIdentity: UUID(),
+            onUserEdit: { userEditCount += 1 }
+        )
+        let coordinator = ComposerPasteTextView.Coordinator(view)
+        let textView = ImagePasteTextView()
+
+        textView.text = "a"
+        coordinator.textViewDidChange(textView)
+        textView.text = "ab"
+        coordinator.textViewDidChange(textView)
+        textView.text = "a"
+        coordinator.textViewDidChange(textView)
+
+        XCTAssertEqual(userEditCount, 3)
+        XCTAssertEqual(value, "a")
+    }
+
+    /// The `isActive` half of the guard is load-bearing for ownership: a
+    /// delegate delivery racing `dismantleUIView`/`deactivate` must not claim.
+    func testInactiveCoordinatorDoesNotClaimOwnershipOnUserEdit() {
+        var value = ""
+        var userEditCount = 0
+        let view = ComposerPasteTextView(
+            text: Binding(get: { value }, set: { value = $0 }),
+            isFocused: .constant(false),
+            measuredHeight: .constant(44),
+            enabled: true,
+            onPastedImage: { _ in },
+            onPastedImageError: { _ in },
+            editorIdentity: UUID(),
+            onUserEdit: { userEditCount += 1 }
+        )
+        let coordinator = ComposerPasteTextView.Coordinator(view)
+        coordinator.isActive = false
+
+        let textView = ImagePasteTextView()
+        textView.text = "typed"
+        coordinator.textViewDidChange(textView)
+
+        XCTAssertEqual(userEditCount, 0)
+        XCTAssertEqual(value, "")
+    }
+
+    /// A programmatic replacement that arrives while IME composition is
+    /// active is deferred until the composition ends. When it lands, it must
+    /// do so without an ownership claim: the replacement is applied through
+    /// the programmatic machinery, and no `textViewDidChange` ownership
+    /// callback fires for it.
+    func testDeferredIMEProgrammaticReplacementDoesNotClaimOwnership() {
+        var value = ""
+        var userEditCount = 0
+        let editorIdentity = UUID()
+        let view = ComposerPasteTextView(
+            text: Binding(get: { value }, set: { value = $0 }),
+            isFocused: .constant(false),
+            measuredHeight: .constant(44),
+            enabled: true,
+            onPastedImage: { _ in },
+            onPastedImageError: { _ in },
+            editorIdentity: editorIdentity,
+            onUserEdit: { userEditCount += 1 }
+        )
+        let coordinator = ComposerPasteTextView.Coordinator(view)
+        let textView = ImagePasteTextView()
+        // Establish the editor identity first — production does this on the
+        // first updateUIView pass, before any replacement can be deferred.
+        coordinator.apply(
+            text: "",
+            programmaticRevision: 0,
+            editorIdentity: editorIdentity,
+            to: textView
+        )
+
+        // Active IME composition.
+        textView.setMarkedText("に", selectedRange: NSRange(location: 0, length: 0))
+        XCTAssertNotNil(textView.markedTextRange, "Test fixture requires marked text")
+
+        // The replacement is queued, not applied, and claims nothing.
+        coordinator.apply(
+            text: "replaced",
+            programmaticRevision: 1,
+            editorIdentity: editorIdentity,
+            to: textView
+        )
+        XCTAssertNotEqual(textView.text, "replaced")
+        XCTAssertEqual(userEditCount, 0)
+
+        // Composition ends without a user edit; the next revision-gated pass
+        // lands the deferred replacement through the programmatic path.
+        textView.setMarkedText("", selectedRange: NSRange(location: 0, length: 0))
+        coordinator.apply(
+            text: "replaced",
+            programmaticRevision: 1,
+            editorIdentity: editorIdentity,
+            to: textView
+        )
+
+        XCTAssertEqual(textView.text, "replaced")
+        XCTAssertEqual(
+            userEditCount, 0,
+            "A deferred programmatic replacement must not become a user ownership claim"
+        )
+    }
+
+    /// The production-realistic commit interleaving: the user accepts the
+    /// composition, the delegate fires ONCE for that genuine commit, and the
+    /// deferred replacement landing at the end of the same callback (through
+    /// the flag-guarded programmatic path) must not claim a second time.
+    func testCompositionCommitClaimsOnceWhileDeferredReplacementLands() {
+        var value = ""
+        var userEditCount = 0
+        let editorIdentity = UUID()
+        let view = ComposerPasteTextView(
+            text: Binding(get: { value }, set: { value = $0 }),
+            isFocused: .constant(false),
+            measuredHeight: .constant(44),
+            enabled: true,
+            onPastedImage: { _ in },
+            onPastedImageError: { _ in },
+            editorIdentity: editorIdentity,
+            onUserEdit: { userEditCount += 1 }
+        )
+        let coordinator = ComposerPasteTextView.Coordinator(view)
+        let textView = ImagePasteTextView()
+        coordinator.apply(
+            text: "",
+            programmaticRevision: 0,
+            editorIdentity: editorIdentity,
+            to: textView
+        )
+
+        // Composition active, intentional replacement queued.
+        textView.setMarkedText("に", selectedRange: NSRange(location: 0, length: 0))
+        coordinator.apply(
+            text: "replaced",
+            programmaticRevision: 1,
+            editorIdentity: editorIdentity,
+            to: textView
+        )
+        XCTAssertEqual(userEditCount, 0)
+
+        // The user accepts the composition: the marked text commits and the
+        // delegate delivers the change. The claim fires for the commit; the
+        // deferred replacement lands inside the same callback, guarded.
+        textView.setMarkedText("", selectedRange: NSRange(location: 0, length: 0))
+        coordinator.textViewDidChange(textView)
+
+        XCTAssertEqual(
+            userEditCount, 1,
+            "The genuine composition commit claims exactly once"
+        )
+        XCTAssertEqual(textView.text, "replaced")
+        XCTAssertEqual(value, "replaced")
     }
 
     func testInactiveCoordinatorDoesNotPublishFocusOrMeasuredHeightChanges() {
@@ -390,6 +606,29 @@ final class ComposerPasteTextViewTests: XCTestCase {
             ComposerBar.pastedImageErrorMessage("The image provider failed."),
             "Could not paste image: The image provider failed."
         )
+    }
+
+    /// Clears the general pasteboard, runs `body`, then clears it again.
+    /// Scoped to the tests that actually write to UIPasteboard.general so
+    /// every other test in this suite stays off the global pasteboard service
+    /// entirely. Deliberately performs NO read of `items`: materializing
+    /// existing clipboard content is what wedges CI simulators, while clears
+    /// and writes stay safe. The trailing clear also keeps image payloads from
+    /// leaking into later suites.
+    private func withClearedGeneralPasteboard(_ body: () throws -> Void) rethrows {
+        let pasteboard = UIPasteboard.general
+        pasteboard.items = []
+        defer { pasteboard.items = [] }
+        try body()
+    }
+
+    /// Async counterpart for tests that await while their mutated pasteboard
+    /// content is live (e.g. waiting on a paste callback expectation).
+    private func withClearedGeneralPasteboard(_ body: () async throws -> Void) async rethrows {
+        let pasteboard = UIPasteboard.general
+        pasteboard.items = []
+        defer { pasteboard.items = [] }
+        try await body()
     }
 
     private static func fixtureImage() -> UIImage {

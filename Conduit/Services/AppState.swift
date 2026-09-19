@@ -16,6 +16,14 @@ import WebKit
 private let sessionCatalogLog = Logger(subsystem: "com.milim.conduit", category: "SessionCatalog")
 private let titleGenerationLog = Logger(subsystem: "com.milim.conduit", category: "TitleGeneration")
 private let sessionYoloLog = Logger(subsystem: "com.milim.conduit", category: "SessionYolo")
+/// Foreground/turn-lifecycle decisions: why a refresh chose observation vs
+/// resume, and how prompt submissions were classified. Ids only — never
+/// prompt text, credentials, or message content.
+private let lifecycleLog = Logger(subsystem: "com.milim.conduit", category: "TurnLifecycle")
+/// Server-replacement speech retirement: which speech operations were live
+/// when the outgoing server's ownership was revoked. Ids and booleans only —
+/// never prompt text, credentials, or speech content.
+private let speechOwnershipLog = Logger(subsystem: "com.milim.conduit", category: "SpeechOwnership")
 
 typealias ChatResumeReconnectCancellation = @MainActor () -> Void
 typealias ChatResumeReconnectExecutor = @MainActor (ChatResumeSyncPurpose) async -> Void
@@ -30,7 +38,26 @@ struct ChatResumeLifecycleOperations {
     var connectClient: (@MainActor (HermesClient) async throws -> Void)?
     var loadCatalog: (@MainActor (HermesClient, Bool) async throws -> [SessionSummary])?
     var mintTicket: (@MainActor (String) async throws -> String)?
-    var openSession: (@MainActor (HermesClient, String) async throws -> SessionResumeResult)?
+    var openSession: (@MainActor (HermesClient, String, Bool) async throws -> SessionResumeResult)?
+    /// Profile-aware variant of `openSession`. Preferred over the 3-argument
+    /// seam when set, so tests can pin WHICH Hermes profile a resume
+    /// addresses (bot chats resume the bot's profile).
+    var openSessionWithProfile: (@MainActor (HermesClient, String, Bool, String?) async throws -> SessionResumeResult)?
+    /// Seam for the initial persisted-history fetch. Receives the session id,
+    /// profile, AND the exact query the production path builder built —
+    /// `order=latest offset=0` for the bounded tail page, the legacy one-shot
+    /// request for the re-read — so callables can observe the request shape,
+    /// not just the call order (bounded first, one-shot re-read second, at
+    /// most once).
+    var persistedTranscript: (@MainActor (
+        String,
+        String,
+        String
+    ) async -> PersistedTranscriptFetchOutcome)?
+    /// Seam for older-page backfill requests only (`offset` = the window's
+    /// next offset). Distinct from `persistedTranscript` so backfill tests
+    /// never collide with initial-hydration fixtures.
+    var loadEarlierTranscriptPage: (@MainActor (String, String, Int) async -> PersistedTranscriptFetchOutcome)?
     var branchSession: (@MainActor (
         HermesClient,
         String,
@@ -40,7 +67,23 @@ struct ChatResumeLifecycleOperations {
     ) async throws -> BranchResult)?
     var setSessionTitle: (@MainActor (HermesClient, String, String) async throws -> Void)?
     var refreshContext: (@MainActor (HermesClient, String) async -> Void)?
-    var sendPrompt: (@MainActor (HermesClient, String, String) async throws -> Void)?
+    var pendingApprovals: (@MainActor (HermesClient, String) async throws -> [ApprovalActivity])?
+    /// Profile-aware variant of `pendingApprovals`. Preferred over the 2-argument
+    /// seam when set, so tests can pin WHICH Hermes profile a pending approvals
+    /// query addresses (bot chats query under the bot's presentation profile).
+    var pendingApprovalsWithProfile: (@MainActor (HermesClient, String, String?) async throws -> [ApprovalActivity])?
+    /// Decision response seam. Tests can intercept and verify the session,
+    /// request ID, choice, and explicit presentation profile passed to the
+    /// decision RPC.
+    var respondToApproval: (@MainActor (HermesClient, String, String?, String, String?) async throws -> Bool)?
+    var sendPrompt: (@MainActor (HermesClient, String, String) async throws -> PromptSubmissionOutcome)?
+    /// Foreground transport verification. Production calls the client's
+    /// `session.list` health check; tests substitute a controllable outcome.
+    var verifyTransportHealth: (@MainActor (HermesClient) async throws -> Void)?
+    /// Foreground liveness probe against the gateway's runtime registry.
+    /// Production calls `session.active_list`; unsupported gateways throw and
+    /// the caller degrades to the resume-based refresh.
+    var probeActiveSessions: (@MainActor (HermesClient) async throws -> [LiveSessionStatus])?
     var steer: (@MainActor (HermesClient, String, String) async throws -> Void)?
     var redirect: (@MainActor (
         HermesClient,
@@ -61,12 +104,35 @@ struct ChatResumeLifecycleOperations {
     var loadBusyInputMode: (@MainActor (HermesClient) async -> Void)?
     var loadProfileDisplayPreferences: (@MainActor () async -> Void)?
     var loadSlashCommands: (@MainActor () async -> Void)?
+    var compressSession: (@MainActor (
+        HermesClient,
+        String,
+        String?
+    ) async throws -> SessionCompressResult)?
+    /// Bot Mode roster probe (`profiles.list`).
+    var botRoster: (@MainActor (HermesClient) async throws -> BotRosterSnapshot)?
+    /// Bot Mode canonical-chat registry lookup (`session.list` exact title).
+    var findBotChat: (@MainActor (HermesClient, String) async throws -> [BotChatLookupRow])?
+    /// Bot Mode canonical chat creation (`session.create`, hidden).
+    var createBotChat: (@MainActor (HermesClient, String) async throws -> (sessionId: String, storedSessionId: String?))?
+    /// Bot Mode canonical title write (`session.title`). The fourth
+    /// argument is the BOT profile being addressed — it exists so tests can
+    /// pin the addressing, and must never be forwarded to the 3-argument
+    /// `setSessionTitle` seam used by ordinary (dashboard-profile) renames.
+    var titleBotChat: (@MainActor (HermesClient, String, String, String) async throws -> Void)?
 
     init(
         connectClient: (@MainActor (HermesClient) async throws -> Void)? = nil,
         loadCatalog: (@MainActor (HermesClient, Bool) async throws -> [SessionSummary])? = nil,
         mintTicket: (@MainActor (String) async throws -> String)? = nil,
-        openSession: (@MainActor (HermesClient, String) async throws -> SessionResumeResult)? = nil,
+        openSession: (@MainActor (HermesClient, String, Bool) async throws -> SessionResumeResult)? = nil,
+        openSessionWithProfile: (@MainActor (HermesClient, String, Bool, String?) async throws -> SessionResumeResult)? = nil,
+        persistedTranscript: (@MainActor (
+            String,
+            String,
+            String
+        ) async -> PersistedTranscriptFetchOutcome)? = nil,
+        loadEarlierTranscriptPage: (@MainActor (String, String, Int) async -> PersistedTranscriptFetchOutcome)? = nil,
         branchSession: (@MainActor (
             HermesClient,
             String,
@@ -76,7 +142,12 @@ struct ChatResumeLifecycleOperations {
         ) async throws -> BranchResult)? = nil,
         setSessionTitle: (@MainActor (HermesClient, String, String) async throws -> Void)? = nil,
         refreshContext: (@MainActor (HermesClient, String) async -> Void)? = nil,
-        sendPrompt: (@MainActor (HermesClient, String, String) async throws -> Void)? = nil,
+        pendingApprovals: (@MainActor (HermesClient, String) async throws -> [ApprovalActivity])? = nil,
+        pendingApprovalsWithProfile: (@MainActor (HermesClient, String, String?) async throws -> [ApprovalActivity])? = nil,
+        respondToApproval: (@MainActor (HermesClient, String, String?, String, String?) async throws -> Bool)? = nil,
+        sendPrompt: (@MainActor (HermesClient, String, String) async throws -> PromptSubmissionOutcome)? = nil,
+        verifyTransportHealth: (@MainActor (HermesClient) async throws -> Void)? = nil,
+        probeActiveSessions: (@MainActor (HermesClient) async throws -> [LiveSessionStatus])? = nil,
         steer: (@MainActor (HermesClient, String, String) async throws -> Void)? = nil,
         redirect: (@MainActor (
             HermesClient,
@@ -96,16 +167,33 @@ struct ChatResumeLifecycleOperations {
         loadProfiles: (@MainActor () async -> Void)? = nil,
         loadBusyInputMode: (@MainActor (HermesClient) async -> Void)? = nil,
         loadProfileDisplayPreferences: (@MainActor () async -> Void)? = nil,
-        loadSlashCommands: (@MainActor () async -> Void)? = nil
+        loadSlashCommands: (@MainActor () async -> Void)? = nil,
+        compressSession: (@MainActor (
+            HermesClient,
+            String,
+            String?
+        ) async throws -> SessionCompressResult)? = nil,
+        botRoster: (@MainActor (HermesClient) async throws -> BotRosterSnapshot)? = nil,
+        findBotChat: (@MainActor (HermesClient, String) async throws -> [BotChatLookupRow])? = nil,
+        createBotChat: (@MainActor (HermesClient, String) async throws -> (sessionId: String, storedSessionId: String?))? = nil,
+        titleBotChat: (@MainActor (HermesClient, String, String, String) async throws -> Void)? = nil
     ) {
         self.connectClient = connectClient
         self.loadCatalog = loadCatalog
         self.mintTicket = mintTicket
         self.openSession = openSession
+        self.openSessionWithProfile = openSessionWithProfile
+        self.persistedTranscript = persistedTranscript
+        self.loadEarlierTranscriptPage = loadEarlierTranscriptPage
         self.branchSession = branchSession
         self.setSessionTitle = setSessionTitle
         self.refreshContext = refreshContext
+        self.pendingApprovals = pendingApprovals
+        self.pendingApprovalsWithProfile = pendingApprovalsWithProfile
+        self.respondToApproval = respondToApproval
         self.sendPrompt = sendPrompt
+        self.verifyTransportHealth = verifyTransportHealth
+        self.probeActiveSessions = probeActiveSessions
         self.steer = steer
         self.redirect = redirect
         self.interrupt = interrupt
@@ -117,14 +205,61 @@ struct ChatResumeLifecycleOperations {
         self.loadBusyInputMode = loadBusyInputMode
         self.loadProfileDisplayPreferences = loadProfileDisplayPreferences
         self.loadSlashCommands = loadSlashCommands
+        self.compressSession = compressSession
+        self.botRoster = botRoster
+        self.findBotChat = findBotChat
+        self.createBotChat = createBotChat
+        self.titleBotChat = titleBotChat
     }
 
     static let live = ChatResumeLifecycleOperations()
 }
 
+/// Raw result of fetching a session's persisted history — the dashboard
+/// messages endpoint's JSON payload exactly as returned, still to be parsed
+/// by AppState's production normalizer path.
+enum PersistedTranscriptFetchOutcome {
+    case payload([String: Any])
+    /// No usable history source: no dashboard bridge, or the gateway predates
+    /// the messages endpoint. The caller falls back to the resume RPC that
+    /// carries the transcript itself.
+    case unavailable
+    /// An unrelated history failure (network, authentication, unexpected
+    /// payload). It must surface to the caller instead of silently degrading
+    /// the resume into a fallback.
+    case failed(Error)
+}
+
+/// Parsed readiness of the persisted transcript for a resume reconciliation.
+enum PersistedTranscriptOutcome {
+    case hydrated(PersistedSessionTranscript)
+    case unavailable
+    case failed(Error)
+}
+
+struct PersistedSessionTranscript {
+    let resolvedSessionId: String?
+    let messages: [ChatMessage]
+    /// Pagination echo of the response this transcript was parsed from.
+    /// Nil (or an echo without the `order=latest` tail contract) means the
+    /// backend served a one-shot full transcript.
+    var page: PersistedTranscriptPagination.PageInfo?
+    /// Row ids positively extracted from raw rows carrying a durable
+    /// `id` / `message_id` key, populated only when this transcript came from
+    /// a validated `order=latest` page. Empty for legacy one-shot reads,
+    /// whose row identity is positional and untrustworthy.
+    var durableRowIDs: Set<String> = []
+}
+
 struct ComposerSubmissionContext: Equatable {
     let profile: String
     let sessionID: String?
+    /// The conversation's durable identity at capture time. A legitimate
+    /// runtime rebind (runtime-old → runtime-new of the SAME conversation)
+    /// keeps this value stable, so an otherwise-owned submission survives the
+    /// rebind; a navigation handoff to another conversation and back still
+    /// fails the viewport-generation fence.
+    let durableSessionID: String?
     let clientIdentity: ObjectIdentifier?
     let clientEpoch: UUID
     let viewportTransitionGeneration: UInt64
@@ -333,9 +468,35 @@ final class AppState: ObservableObject {
     @Published var isConnecting = false
     @Published var profiles: [String] = []
     @Published private(set) var sessionFilterOrder: [SessionSource] = [.chat, .discord, .telegram, .api, .webhook, .other]
+    /// Stable per-profile gateway-media resolver for settled row content.
+    /// Created lazily on first read and reused while the active profile is
+    /// unchanged, so ChatView's first body pass already has a resolver
+    /// identity (no nil → resolver invalidation sweep over the settled
+    /// transcript) and rows' Equatable gates only open on genuine profile
+    /// changes. The resolver holds this AppState weakly, so caching it here
+    /// creates no retain cycle.
+    var gatewayMediaResolver: GatewayMediaDataURLResolver {
+        if let cached = cachedGatewayMediaResolver,
+           cached.profile == activeProfile {
+            return cached.resolver
+        }
+        let resolver = GatewayMediaDataURLResolver(appState: self, profile: activeProfile)
+        cachedGatewayMediaResolver = (activeProfile, resolver)
+        return resolver
+    }
+
+    private var cachedGatewayMediaResolver: (profile: String, resolver: GatewayMediaDataURLResolver)?
+
     @Published private(set) var activeProfile: String = "default" {
         didSet { refreshActiveChatScrollSessionIdentity() }
     }
+    /// The saved multi-dashboard registry (#148). `activeDashboardID` is the
+    /// dashboard the user last chose — set at switch intent, kept on failed
+    /// switches, so a selected target never silently falls back to another
+    /// server.
+    @Published private(set) var savedDashboardRegistry: SavedDashboardRegistry
+    /// The dashboard a connection currently belongs to (the selected target).
+    var activeDashboardID: UUID? { savedDashboardRegistry.activeDashboardID }
     @Published private(set) var defaultProfileName: String
     @Published private(set) var profileAvatarURLs: [String: URL]
     @Published private(set) var isProfileSwitching = false
@@ -370,18 +531,242 @@ final class AppState: ObservableObject {
         }
     }
     @Published private(set) var activeSessionTitle = "New conversation"
+    /// Persisted-history pagination window of the active conversation.
+    /// Drives the "Load earlier messages" affordance; nil means the current
+    /// transcript is either a legacy one-shot hydration or not persisted-
+    /// history-backed at all, and no older pages exist to fetch.
+    @Published private(set) var persistedTranscriptWindow: PersistedTranscriptWindowState?
+    /// Row ids POSITIVELY known to originate from validated persisted-
+    /// transcript hydration (raw rows carrying a durable `id`/`message_id`)
+    /// for the active conversation, adopted from the latest accepted
+    /// hydration and cleared whenever a reconcile begins or fails to adopt a
+    /// transcript. Consumed only by the ambiguous-delivery verifier as
+    /// ordering anchors — never populated from visible id shape, so local
+    /// optimistic / streaming / positional ids can never masquerade as
+    /// persisted anchors.
+    private var durablePersistedRowIDs: Set<String> = []
     @Published private(set) var isChatRefreshing = false
     @Published private(set) var chatResumeBehavior: ChatResumeBehavior = .continueWhereLeftOff
+    @Published private(set) var chatReturnSurface: ChatReturnSurface = .conversation
+    /// One-shot request for MainView to present the sessions drawer as the
+    /// preferred return surface. MainView consumes the latest value once per
+    /// increment; the request is only issued for qualifying returns (cold
+    /// launch or a real background → active transition) when the preference
+    /// is `.sessions` and no explicit navigation or modal owns the surface.
+    @Published private(set) var preferredReturnSurfaceRequest: UInt64 = 0
     @Published private(set) var chatResumeRestorationRequest: ChatResumeRestorationRequest?
     @Published private(set) var chatViewportTransitionGeneration: UInt64 = 0
     /// Keeps the current transcript visible while a notification destination is
     /// being prepared, so the chat never appears to jump to an empty canvas.
     @Published private(set) var isOpeningNotificationSession = false
     @Published private(set) var isBranchingChat = false
+    /// Runtime ids of conversations with a dedicated `session.compress` RPC
+    /// in flight. Manual compression is LLM-bound and can take minutes, so
+    /// the chat shows a small "Compressing…" affordance while the ACTIVE
+    /// conversation is compressing, and a second `/compress` for the same
+    /// conversation is refused. Per-session on purpose, matching upstream
+    /// Desktop's `compressInFlightRef`: compressions of different
+    /// conversations run concurrently.
+    @Published private(set) var compressingSessionIDs: Set<String> = []
+    /// Conversations the GATEWAY reports as actively compacting
+    /// (`status.update` `kind: "compacting"`), or whose manual compression
+    /// answered `status: "pending"` — server-side compression still running
+    /// after the local RPC ended. Distinct from `compressingSessionIDs`
+    /// (local RPC in-flight): the RPC can return while the host keeps
+    /// compressing, and only the `compacted` edge (or an authoritative
+    /// reconnect, which invalidates unverified gateway state) clears it.
+    @Published private(set) var serverCompactingSessionIDs: Set<String> = []
+    /// Bounded, race-safe lifecycle bookkeeping for the claims above:
+    /// - `generation` is the conversation's terminal-compaction counter at
+    ///   claim time. A `pending` continuation may only (re-)establish its
+    ///   claim while that counter is unchanged, so a `compacted` edge that
+    ///   landed during the RPC await wins over the stale continuation.
+    /// - `expiresAt` bounds the claim to one full compression budget: a lost
+    ///   terminal edge must not keep "Compressing…" alive for the whole
+    ///   connection.
+    private struct ServerCompactionClaim {
+        let generation: Int
+        let expiresAt: Date
+    }
+    private var serverCompactionClaims: [String: ServerCompactionClaim] = [:]
+    /// Scheduled bounded-expiry tasks per claim runtime id; replaced on
+    /// refresh, cancelled when the claim clears early.
+    private var serverCompactionClaimExpiryTasks: [String: Task<Void, Never>] = [:]
+    /// Terminal-compaction generations per conversation runtime id, bumped by
+    /// every authoritative terminal signal (`compacted` edges and terminal
+    /// `session.compress` results).
+    private var serverCompactionTerminalGenerations: [String: Int] = [:]
+    /// Whether the active conversation is compressing — either a local
+    /// `session.compress` RPC is in flight or the gateway reports server-side
+    /// compaction. Alias-aware through the same session-equivalence machinery
+    /// duplicate detection uses, so a runtime rebind mid-compression
+    /// (runtime-old → runtime-new of one conversation) keeps the
+    /// "Compressing…" affordance visible.
+    var isCompressingActiveSession: Bool {
+        guard let activeSessionId else { return false }
+        return compressingSessionIDs.contains(where: { composerSessionIDsAreEquivalent($0, activeSessionId) })
+            || serverCompactingSessionIDs.contains(where: { composerSessionIDsAreEquivalent($0, activeSessionId) })
+    }
     @Published private(set) var turnState: TurnState = .idle
+    /// Whether `turnState` may have missed server-side turn edges. Set at
+    /// lifecycle boundaries where the socket can die or the gateway can change
+    /// state unobserved (scene dips, reconnects, ambiguous submissions);
+    /// cleared only when an authoritative source (the `session.active_list`
+    /// probe, a resume snapshot, or a typed prompt outcome) re-confirms the
+    /// state. A stale idle state must not route the next input as a new-turn
+    /// `prompt.submit` — Hermes would apply its busy policy to it and the
+    /// message would silently join a turn the user never saw start.
+    private(set) var turnStateIsStale = false
+    /// Newest AUTHORITATIVE live turn-lifecycle evidence. Every `setRunning`
+    /// edge (sessionBusy, message start/delta, completion, interruption,
+    /// error, registry-probe corrections, buffered-event replay), the
+    /// authoritative resume-snapshot adoption, the typed busy-submission
+    /// outcome, and a successful steer advance the revision; optimistic local
+    /// writes (the pre-send `.running`, the ambiguous-recovery stamps
+    /// themselves) never do. The ambiguous-submission recovery captures this
+    /// evidence at its registry observation. At stamp time:
+    ///
+    /// - A changed REVISION proves newer live evidence arrived while the
+    ///   recovery awaited, so the older recovery result must not overwrite
+    ///   `turnState`/`turnStateIsStale`. Plain value equality cannot prove
+    ///   that — the pre-send stamp already leaves `turnState == .running`,
+    ///   so a newer `sessionBusy(true)` is value-indistinguishable from the
+    ///   stale baseline.
+    /// - The RUNNING half answers a separate question: whether accepted-turn
+    ///   OWNERSHIP is still live. Newer busy/running evidence does not
+    ///   invalidate a positively-proven accepted submission; newer
+    ///   settled/idle/error/interruption evidence does. Stamp authority and
+    ///   accepted provenance are therefore decided independently. The
+    ///   running half is a single NEWEST-EDGE bit, not per-turn tracking: a
+    ///   settle immediately followed by a successor turn's busy edge inside
+    ///   one recovery window reads as "running". That is accepted — marker
+    ///   use stays validated at the foreground (durable-twin check) and a
+    ///   later settle flows into the bounded-debt lifecycle, so the worst
+    ///   case is a spurious-but-safe reconcile.
+    private struct TurnLifecycleEvidence {
+        var revision: UInt64
+        var running: Bool
+    }
+
+    private var turnLifecycleEvidence = TurnLifecycleEvidence(revision: 0, running: false)
+    /// Session identities with a locally-observed running turn at the last
+    /// scene transition (empty = no continuity evidence). A foreground probe
+    /// whose working/waiting row matches one of these ids continues a turn
+    /// Conduit already knows — the fast observational path. A working/waiting
+    /// row WITHOUT this evidence may be a turn another surface started while
+    /// Conduit was suspended, so liveness alone must not stand in for
+    /// transcript freshness. Captured at the transition (before
+    /// reconciliation resets any state), consumed by exactly one foreground
+    /// refresh.
+    private(set) var preSuspensionTurnRunningSessionIDs: Set<String> = []
+    /// Armed by a real `.background` transition and consumed synchronously by
+    /// the next `.active` transition: the socket can die while suspended, so
+    /// bounded persisted-history activity from another surface could have
+    /// been missed. Overlay (`.inactive`) dips keep the socket alive — live
+    /// events keep flowing — so they observe but do not arm the freshness
+    /// check.
+    private(set) var foregroundFreshnessCheckArmed = false
+    /// Whether the visible persisted transcript may be MISSING rows —
+    /// conceptually disjoint from `turnStateIsStale`, which answers "do I
+    /// know whether Hermes is currently busy?". Set only when a bounded
+    /// foreground freshness read failed transiently on a real background
+    /// return; a liveness answer (the registry probe) can never clear it.
+    /// Cleared only when an authoritative transcript source proves
+    /// convergence: an unchanged bounded verdict, an advancement merge, or a
+    /// resume/reconcile hydration (`applyChatResume`).
+    private(set) var transcriptFreshnessIsStale = false
+    /// Evidence that the in-flight turn was submitted from THIS surface:
+    /// recorded when a locally-initiated, non-busy `prompt.submit` is
+    /// accepted (or ambiguity recovery proves `.acceptedRunning`), and
+    /// validated at use against the transcript (the optimistic user row must
+    /// still be present, unpersisted, and head a fully-unpersisted suffix)
+    /// plus the local turn state. `preSubmitOrderingBaseline` freezes the
+    /// persisted ordering frontier BEFORE the send changes the transcript:
+    /// the ordering anchor that lets a later bounded tail read classify
+    /// persisted advancement as belonging to our turn (Hermes persists the
+    /// user row at turn start, so the twin of the optimistic bubble is
+    /// normally there) versus belonging to a later foreign turn. Freezing at
+    /// submit time is load-bearing: a later frontier advance never moves a
+    /// live marker's baseline, so our turn's own persisted rows still count
+    /// as boundaries against a foreign turn that starts after it. Optimistic
+    /// row ids never enter `durablePersistedRowIDs`; the two identities stay
+    /// distinct — the marker only asserts that ONE new persisted user turn
+    /// is expected while our turn is in flight.
+    private struct LocallyOwnedInFlightTurn {
+        var sessionIDs: Set<String>
+        var optimisticUserRowID: String
+        var preSubmitOrderingBaseline: PersistedOrderingBaseline
+        /// Set when a validated bounded read positively observed this turn's
+        /// persisted user boundary (the frontier advanced through it).
+        var persistedBoundaryObserved = false
+    }
+    /// Ordering debt for turns whose durable ordering is not yet proven. A
+    /// missing-boundary debt expects one or more canonical user rows after the
+    /// frontier. A zero-boundary observation obligation permits only trailing
+    /// assistant/tool rows: it covers a locally-owned turn whose boundary was
+    /// seen while live, plus busy `.queued`/`.steered` outcomes whose typed
+    /// response cannot prove whether Hermes later promoted input to a full
+    /// turn. One bounded pre-send read clears the matching shape and advances
+    /// the frontier; extra user boundaries prove new activity (authoritative
+    /// reconcile), while missing rows or an unprovable anchor recover
+    /// conservatively. Conversation-scoped: reset with transcript lifecycle
+    /// evidence and cleared by authoritative adoption.
+    private struct PendingLocalOrderingDebt {
+        var sessionIDs: Set<String>
+        var expectedUserTurnCount: Int
+        /// No exact new boundary is owed. Rows before the next expected
+        /// boundary may be a settled local tail or the current busy turn's
+        /// tail. With zero expected boundaries, an empty or non-user-only
+        /// suffix satisfies the obligation; any user boundary proves new
+        /// activity that must be adopted authoritatively.
+        var allowTrailingRowsWithoutNewUserBoundary: Bool
+    }
+    private var pendingLocalOrderingDebt: PendingLocalOrderingDebt?
+    private var locallyOwnedInFlightTurn: LocallyOwnedInFlightTurn?
+    /// Persisted ORDERING evidence — deliberately distinct from
+    /// `durablePersistedRowIDs` (provenance for rows currently represented
+    /// in the visible transcript). This is the newest durable row Conduit
+    /// has POSITIVELY observed through a validated bounded persisted-history
+    /// read or hydration, or a positive proof that the persisted transcript
+    /// is EMPTY. The visible transcript may keep an optimistic row whose
+    /// durable twin the frontier already knows about; the optimistic row is
+    /// never rewritten, the twin is never merged behind it, and the twin's
+    /// id never enters visible provenance — advancing the frontier is purely
+    /// ordering metadata for the NEXT locally-owned turn's baseline.
+    /// Conversation-scoped: reset on session/profile switch, conversation
+    /// replacement, sign-out; re-anchored by every authoritative reconcile
+    /// adoption and advancement merge, and advanced by every validated
+    /// `.unchanged` bounded read. Assignment is a RE-ANCHORING on the read's
+    /// own positive observation, not a monotonic advance: a validated read
+    /// whose page no longer contains the previous frontier row (server-side
+    /// deletion) re-anchors lower or to unknown — every use site verifies
+    /// anchors by id-presence in the page, so a stale anchor degrades to
+    /// inconclusive, never to a false verdict.
+    private struct PersistedOrderingFrontier {
+        var newestObservedDurableRowID: String?
+        var isPositivelyEmpty = false
+
+        /// Positively empty deliberately wins over an anchored id: the two
+        /// states are mutually exclusive by construction (see
+        /// `orderingFrontier(from:)`), and emptiness is the stronger claim.
+        var baseline: PersistedOrderingBaseline {
+            if isPositivelyEmpty { return .positivelyEmpty }
+            if let newestObservedDurableRowID { return .anchored(newestObservedDurableRowID) }
+            return .unknown
+        }
+    }
+    private var persistedOrderingFrontier = PersistedOrderingFrontier()
     @Published private(set) var busyInputMode: BusyInputMode = .steer
     @Published private(set) var displayPreferences = ProfileDisplayPreferences()
     @Published var streamingText = ""
+    /// Live, frequently-changing reasoning projection. Streaming reasoning
+    /// renders from here at display cadence WITHOUT mutating the settled
+    /// `messages` array — per-publish transcript mutation (O(message count)
+    /// index scan + copy-on-write copy + revision bump + scroll-target cache
+    /// walk) is what made deep agent sessions burn CPU and battery. The card
+    /// commits into `messages` exactly once per segment boundary via
+    /// `settleReasoningSegmentIntoTranscript()`.
+    @Published private(set) var liveReasoningSegment: LiveReasoningSegment?
     /// An explicit user-send request lets ChatView scroll after SwiftUI has
     /// inserted the outgoing bubble, even if the user previously browsed up.
     @Published private(set) var chatScrollRequest = 0
@@ -389,14 +774,79 @@ final class AppState: ObservableObject {
 
     /// Profile changes and network refreshes are asynchronous. Keep a final
     /// ownership boundary at the published catalog so a stale row can never
-    /// render under another workspace while a switch is in flight.
+    /// render under another workspace while a switch is in flight. Canonical
+    /// Bot Chats are projected out here (never in the identity machinery's
+    /// own catalog views): they are reachable only through the Bots roster.
     var activeProfileSessions: [SessionSummary] {
-        sessions.filter { sessionBelongsToProfile($0, profile: activeProfile) }
+        sessions.filter {
+            sessionBelongsToProfile($0, profile: activeProfile)
+                && !BotChatHygiene.isCanonicalBotChatRow($0, roster: botRoster)
+        }
     }
 
     var activeProfileCronSessions: [SessionSummary] {
         cronSessions.filter { sessionBelongsToProfile($0, profile: activeProfile) }
     }
+
+    // MARK: - Bot Mode
+
+    /// Lifecycle of the Bot Mode capability probe. `profiles.list` is the
+    /// capability call: a gateway old enough to lack the method has no
+    /// Bot Mode, and the UI degrades to "requires a newer Hermes gateway"
+    /// without blocking Sessions or anything else.
+    @Published private(set) var botModePhase: BotModePhase = .idle
+    /// The read-only roster. Hermes remains authoritative; nothing bot-related
+    /// is durably persisted client-side.
+    @Published private(set) var botRoster: [BotProfile] = []
+    @Published private(set) var isRefreshingBotRoster = false
+    /// Bumped at every server-identity boundary; responses captured under an
+    /// older epoch are dropped, so a stale async roster can never overwrite
+    /// the state of a different dashboard/profile.
+    private var botRosterEpoch = 0
+    /// Ownership token for the in-flight roster refresh: only the refresh
+    /// that captured the CURRENT token may release the single-flight flag,
+    /// so no superseded refresh can clear a newer one's claim and no
+    /// identity change can strand the flag.
+    private var botRosterRefreshToken: UUID?
+    /// The in-flight roster refresh, held so a replacement `.task` can JOIN
+    /// it instead of racing it (see `refreshBotRoster`). Unstructured on
+    /// purpose: a SwiftUI `.task(id:)` identity change cancels the VIEW
+    /// task, never this work. Class box: `Task` is a value with no identity,
+    /// and the joiner must be able to tell its (completed) flight from a
+    /// newer one's before clearing the handle.
+    private final class BotRosterRefreshFlight {
+        let task: Task<Void, Never>
+        init(task: Task<Void, Never>) { self.task = task }
+    }
+
+    private var botRosterRefreshFlight: BotRosterRefreshFlight?
+    /// Bot chats belong to the BOT's profile, not the dashboard's. Every
+    /// re-resume of an open bot chat (reconnect, refresh, preserve-current
+    /// sync) consults this in-memory registry to scope the resume RPC; it is
+    /// never persisted — a canonical Bot Chat has no client-side pointer.
+    /// Bot profile ownership per canonical-chat session id (runtime id,
+    /// stored id, and every adopted alias). Superseded runtime ids are
+    /// deliberately KEPT, never pruned on resume/compression rebinding:
+    /// late lifecycle, stream, and compaction events may still arrive
+    /// addressed to an old runtime id and must keep resolving to the right
+    /// bot profile — dropping the alias would misroute those events into
+    /// the ordinary dashboard scope. The map is runtime-only (cleared at
+    /// the server-identity boundary in `invalidateBotModeState`) and grows
+    /// by one entry per rebound id, which is bounded by how often a bot
+    /// chat's runtime id is actually rebound. If a provably-dead alias
+    /// lifecycle point ever exists upstream (e.g. an explicit
+    /// session-destroyed event), a bounded cleanup could hook there —
+    /// none exists today, so correctness wins over the small dictionary.
+    private var botChatSessionProfiles: [String: String] = [:]
+    /// One resolve/create/open flight per bot name: double-tapping a row must
+    /// not mint two canonical chats (upstream `canonicalCreations`). The box
+    /// exists so a stale flight's cleanup can never evict a newer flight's
+    /// entry (identity-checked removal), and so a server switch can cancel
+    /// the underlying task.
+    private final class BotChatOpenFlight {
+        var task: Task<Bool, Never>?
+    }
+    private var botChatOpenFlights: [String: BotChatOpenFlight] = [:]
 
     /// Kept as a computed compatibility surface for views that only need the
     /// currently-running flag. New code should use `turnState` for actions.
@@ -414,13 +864,13 @@ final class AppState: ObservableObject {
     var composerPlaceholder: String {
         switch turnState {
         case .running:
-            return "\(busyInputMode.title) \(profileDisplayName(activeProfile))…"
+            return AppLocalization.string("\(busyInputMode.title) \(profileDisplayName(activeProfile))…")
         case .synchronizing, .reconnecting:
-            return "Checking agent activity…"
+            return AppLocalization.string("Checking agent activity…")
         case .unsupportedGateway:
-            return "Update Hermes to use chat controls"
+            return AppLocalization.string("Update Hermes to use chat controls")
         case .idle:
-            return "Message \(profileDisplayName(activeProfile))…"
+            return AppLocalization.string("Message \(profileDisplayName(activeProfile))…")
         }
     }
 
@@ -458,15 +908,30 @@ final class AppState: ObservableObject {
                 streamingPublishTask?.cancel()
                 streamingPublishTask = nil
                 hasScheduledStreamingPublish = false
-            } else if !streamingBuffer.isEmpty {
-                lastStreamingPublishBurst = max(
-                    streamingBuffer.count - streamingText.count,
-                    0
-                )
-                lastStreamingPublishDate = Date()
-                streamingText = streamingBuffer
+                reasoningPublishTask?.cancel()
+                reasoningPublishTask = nil
+                hasScheduledReasoningPublish = false
+            } else {
+                if !streamingBuffer.isEmpty {
+                    lastStreamingPublishBurst = max(
+                        streamingBuffer.count - streamingText.count,
+                        0
+                    )
+                    lastStreamingPublishDate = Date()
+                    streamingText = streamingBuffer
+                }
+                flushReasoningPublish()
             }
         }
+    }
+    /// Closes the modal sessions drawer if it is open. Session-opening flows
+    /// inside the sidebar call this unconditionally: in drawer mode it
+    /// dismisses the sheet, while in the iPad persistent-sidebar layout the
+    /// drawer is never presented (`showSidebar` stays false), so this is a
+    /// no-op and the persistent column remains visible.
+    func dismissSidebarDrawer() {
+        guard showSidebar else { return }
+        showSidebar = false
     }
     @Published var showModelPicker = false
     @Published var showContextSheet = false
@@ -474,7 +939,26 @@ final class AppState: ObservableObject {
     @Published var showGatewaySheet = false
     @Published var showAgentsSheet = false
     @Published var showVoiceSheet = false
+    /// Mirrors MainView's Settings sheet item so return-surface decisions can
+    /// tell whether Settings owns the surface across a background/foreground cycle.
+    @Published var isSettingsSheetPresented = false
     @Published var errorMessage: String?
+    /// A classified sign-in failure awaiting presentation on the login card.
+    /// Typed (not a string) so LoginView renders the full presentation —
+    /// title, actions, help routing — and delivered as a publisher so the
+    /// handoff works even when LoginView is already mounted (onReceive fires
+    /// on new emissions and replays the current value on mount). Consumed
+    /// once by LoginView; never read by the connected composer banner, so a
+    /// sign-in failure cannot resurface stale over a healthy session.
+    @Published var pendingLoginFailure: ConnectionFailurePresentation?
+    /// Round 6: the classified failure of the most recent failed connection
+    /// attempt (saved-credential reconnect, repair activation, or a failed
+    /// explicit connect). Typed — never recovered from user-facing strings —
+    /// so Repair Connection can seed its routing from the actual problem.
+    /// Cleared by any successful connection, by explicit disconnect, and
+    /// when the user starts a manual login (which abandons the prior
+    /// failure's repair context).
+    @Published var lastConnectionFailure: ConnectionFailure?
     @Published var showLogin = true
     @Published private(set) var composerPrefillText = ""
     @Published private(set) var composerPrefillToken = UUID()
@@ -484,10 +968,17 @@ final class AppState: ObservableObject {
     @Published var slashCommands: [SlashCommand] = AppState.builtInSlashCommands
     @Published var skills: [CapabilitySkill] = []
     @Published var toolsets: [CapabilityToolset] = []
+    /// Profile that owns the currently displayed skills/toolsets. Rows are
+    /// only presentable while this equals the active profile.
+    @Published private(set) var capabilitiesProfile: String?
+    /// Monotonic request token for capability loads; older requests can never
+    /// commit over newer ones (protects the A -> B -> A race).
+    private var capabilityLoadGeneration: UInt64 = 0
     @Published var mcpServers: [CapabilityMcpServer] = []
     @Published private(set) var voiceCapabilitySnapshot = VoiceCapabilitySnapshot.unavailable
     @Published private(set) var isVoiceEnabled = false
     @Published private(set) var voiceTranscriptionMode: VoiceTranscriptionMode = .hermes
+    @Published private(set) var continuousConversationEnabled = true
     @Published private(set) var appleSpeechAvailability = AppleOnDeviceSpeechTranscriber.currentAvailability()
 
     private var voiceAssistantObserverID: UUID?
@@ -497,9 +988,99 @@ final class AppState: ObservableObject {
             return await self.submitVoiceTranscript(transcript)
         },
         interrupt: { [weak self] in
-            await self?.interruptForVoice()
+            guard let self else { return false }
+            return await self.interruptForVoice()
+        },
+        onEndConversation: { [weak self] in
+            self?.closeVoiceConversation()
         }
     )
+    /// Logical identity of a Voice conversation suspended by an app lifecycle
+    /// transition (scene backgrounded / device locked). Identity only: it
+    /// never holds audio resources, gateway or transport references, session
+    /// leases, or task handles. Recorded when the scene deactivates with the
+    /// Voice sheet open, consumed by foreground restoration, and cleared by
+    /// every destructive Voice boundary (explicit Close, spoken End
+    /// Conversation, profile switch, server replacement, disconnect, forced
+    /// sign-out, voice disabled). In memory only — process death
+    /// intentionally loses it.
+    struct SuspendedVoiceConversation: Equatable {
+        let profile: String
+        let sessionID: String
+        let serverIdentity: String?
+    }
+    @Published private(set) var suspendedVoiceConversation: SuspendedVoiceConversation?
+    /// One-shot intent for the Voice sheet's auto-listen on fresh
+    /// presentation. Armed only by `openVoiceConversation` and consumed
+    /// exactly once by the sheet, so a restored suspended conversation can
+    /// never hot-start the microphone when SwiftUI recreates the sheet's
+    /// view identity. Lifecycle suspension and every destructive Voice
+    /// boundary disarm it.
+    internal(set) var voiceSheetShouldAutoListen = false
+
+    func consumeVoiceSheetAutoListen() -> Bool {
+        guard voiceSheetShouldAutoListen else { return false }
+        voiceSheetShouldAutoListen = false
+        return true
+    }
+    /// The profile the voice conversation controller's current session was
+    /// opened for. Close-time mute persistence is keyed on this rather than
+    /// on session liveness alone: an audio interruption or any boundary that
+    /// stops the controller must still let a same-profile Close persist the
+    /// user's mute, while a Close arriving after a profile flip (the sheet's
+    /// deferred `onDismiss`) must not write the outgoing profile's mute into
+    /// the now-active profile's blob.
+    internal(set) var voiceControllerSessionProfile: String?
+
+    /// Whether the CarPlay scene currently presents the shared Voice
+    /// conversation. Pure surface bookkeeping: CarPlay is another Voice
+    /// presentation surface over the same runtime, never a second owner.
+    @Published private(set) var isCarPlayVoiceSurfaceActive = false
+
+    func setCarPlayVoiceSurfaceActive(_ active: Bool) {
+        isCarPlayVoiceSurfaceActive = active
+    }
+
+    /// Whether at least one legitimate Voice presentation surface is
+    /// actually presenting Voice: the phone scene counts only while the
+    /// Voice sheet is up (a foreground phone with the sheet closed presents
+    /// nothing), while a connected CarPlay surface presents Voice by
+    /// itself. This — not the raw phone scene phase — is the Voice runtime's
+    /// foreground gate: live Voice audio is allowed exactly while this is
+    /// true. It deliberately does NOT fake phone `.active`:
+    /// transport/chat reconciliation continues to read `isSceneActive` for
+    /// phone-specific behavior.
+    var hasActiveVoiceSurface: Bool {
+        (isSceneActive && showVoiceSheet) || isCarPlayVoiceSurfaceActive
+    }
+
+    /// Re-asserts the Voice runtime gate from the current surface
+    /// bookkeeping. Presenting the phone Voice sheet must call this BEFORE
+    /// auto-listen: with CarPlay absent the gate is false while the sheet is
+    /// closed (`hasActiveVoiceSurface` requires the sheet), and
+    /// `startListening` is gated on it.
+    func reassertVoiceSurfaceGate() {
+        voiceConversationController.setForegroundActive(hasActiveVoiceSurface)
+    }
+
+    /// Manual per-message read aloud for completed assistant responses.
+    /// TTS-only: independent of the voice conversation and of STT.
+    lazy var messageReadAloudController = MessageReadAloudController(
+        reportError: { [weak self] message in
+            self?.errorMessage = message
+        }
+    )
+    /// The bridge instance the read aloud gateway was built against. The
+    /// gateway captures its bridge at init, so a gateway outliving its bridge
+    /// (disconnect, re-login, bridge rotation) is dead and must be rebuilt
+    /// rather than kept.
+    private var readAloudGatewayBridge: DashboardTicketBridge?
+
+    /// Test-only seam: when set, the voice capability refresh requests
+    /// through it instead of the dashboard bridge, keeping
+    /// `refreshVoiceCapabilities` hermetic in tests. Mirrors the
+    /// `installVoiceCapabilityStateForTesting` precedent.
+    var voiceCapabilityRequesterForTesting: VoiceConfigurationRequesting?
 
     // MARK: - Cron
 
@@ -515,6 +1096,11 @@ final class AppState: ObservableObject {
         let requestedSessionId: String
         var automaticSyncOperationID: UUID?
         var resolvedSessionId: String?
+        /// Durable id an admitted resume explicitly established for this
+        /// conversation (parsed from `stored_session_id` / `session_key`).
+        /// Routing state only — it rebinds the conversation's runtime to a
+        /// new stored key without ever looking like navigation.
+        var resolvedDurableSessionId: String?
         var acceptedSessionIDs: Set<String>
         let acceptsAnySession: Bool
         let streamTextAtBoundary: String?
@@ -525,6 +1111,7 @@ final class AppState: ObservableObject {
             token: UUID,
             requestedSessionId: String,
             automaticSyncOperationID: UUID? = nil,
+            resolvedDurableSessionId: String? = nil,
             acceptedSessionIDs: Set<String> = [],
             acceptsAnySession: Bool = false,
             streamTextAtBoundary: String? = nil,
@@ -534,6 +1121,7 @@ final class AppState: ObservableObject {
             self.token = token
             self.requestedSessionId = requestedSessionId
             self.automaticSyncOperationID = automaticSyncOperationID
+            self.resolvedDurableSessionId = resolvedDurableSessionId
             self.acceptedSessionIDs = acceptedSessionIDs
             self.acceptsAnySession = acceptsAnySession
             self.streamTextAtBoundary = streamTextAtBoundary
@@ -557,12 +1145,38 @@ final class AppState: ObservableObject {
         let reasoning: String?
     }
 
+    /// One live reasoning segment as projected to the UI: the identity and
+    /// mount timestamp are fixed for the segment's lifetime, only `content`
+    /// advances at display cadence. Rendering treats it exactly like a
+    /// settled `.reasoning` row (same ThinkingCard presentation).
+    struct LiveReasoningSegment: Equatable {
+        let id: String
+        let timestamp: String
+        var content: String
+    }
     private var reconciliationToken = UUID()
+    /// Set by the resume admission gate when it rejects a contradictory or
+    /// foreign-owned identity. Automatic-return recovery treats ordinary
+    /// resume failures as retryable; a rejected identity is deterministic,
+    /// so reconnect scheduling skips it instead of looping on the same
+    /// contradiction. Main-actor state, valid for the current reconcile only.
+    private var reconciliationWasIdentityRejected = false
+    /// Set only when the currently owned resume RPC definitively reports
+    /// that its requested session no longer exists. Callers use this to
+    /// retire a saved automatic-return target instead of retrying it forever.
+    private var reconciliationSessionWasNotFound = false
     private var reconciliation: Reconciliation?
     private var activeClientEpoch = UUID()
     private var activeAssistantMessageId: String?
     private var activeReasoningMessageId: String?
     private var receivedReasoningForCurrentTurn = false
+    /// Authoritative merged reasoning for the live thinking card. Raw deltas
+    /// merge into this buffer immediately; the published transcript is only
+    /// republished at a coalesced cadence so an expanded ThinkingCard cannot
+    /// monopolize main-actor layout work during a live reasoning stream.
+    private var reasoningBuffer = ""
+    private var reasoningPublishTask: Task<Void, Never>?
+    private var hasScheduledReasoningPublish = false
     private var streamingBuffer = ""
     /// Gateway deltas can arrive much faster than SwiftUI can lay out a chat
     /// transcript. Keep the authoritative buffer intact, but publish at a
@@ -581,6 +1195,16 @@ final class AppState: ObservableObject {
     private var responseHaptics = ResponseHapticState()
     private var scenePhaseTask: Task<Void, Never>?
     private var scenePhaseAttemptID: UUID?
+    /// Armed only by a real .background phase. Ordinary inactive → active
+    /// transitions (Control Center, incoming-call banner) must not be treated
+    /// as reopening the app, so they never arm the preferred return surface.
+    private var hasEnteredBackgroundScenePhase = false
+    private var hasRequestedColdLaunchReturnSurface = false
+    /// Presentation watermark for the preferred return surface: how far
+    /// through `preferredReturnSurfaceRequest` MainView has consumed, kept
+    /// here (not in view state) so it survives MainView teardown on sign-out.
+    private var consumedReturnSurfaceRequest: UInt64 = 0
+    private var deferredReturnSurfaceRequest: UInt64?
     private var explicitSessionOpenTask: Task<Bool, Never>?
     private var explicitSessionOpenRequestID: UUID?
     private var activeAutomaticChatResumeWork: ChatResumeAutomaticWorkToken?
@@ -617,6 +1241,16 @@ final class AppState: ObservableObject {
     /// Coalesces presentation-cache flushes during streaming so we
     /// don't serialize and write UserDefaults on every WebSocket frame.
     private var presentationCacheFlushTask: Task<Void, Never>?
+    /// Monotonic fence for deferred presentation-cache writes. Bumped when
+    /// the active profile identity changes so a coalesced flush scheduled
+    /// under one profile can never land in another profile's namespace.
+    private var presentationCacheProfileEpoch = 0
+    /// Injectable stand-in for the debounce sleep. Defaults to wall-clock
+    /// `Task.sleep`; deterministic tests park a pending flush mid-flight
+    /// through this seam instead of racing its timing.
+    private let presentationCacheDebounceSuspension: @Sendable (
+        Duration
+    ) async throws -> Void
     /// A resume without explicit active-turn confirmation can restore a
     /// decision card from local presentation data. Keep the card in memory for
     /// this AppState so another foreground resume can still show it, but strip
@@ -645,19 +1279,37 @@ final class AppState: ObservableObject {
     private let sessionTitleRecoveryTracker = SessionTitleRecoveryTracker()
     private let sessionRenameOperationsOverride: SessionRenameOperation.Operations?
     private let sessionCatalogLoaderOverride: ((Bool) async throws -> [SessionSummary])?
+    /// Test seam mirroring `sessionCatalogLoader`: overrides the dashboard
+    /// `/api/profiles` fetch inside `loadProfiles()` so success, failure, and
+    /// late-response ordering can be modeled without a live WebKit bridge.
+    private let profileDiscoveryLoaderOverride: (@MainActor () async throws -> [String: Any])?
     private var reconnectAttempts = 0
+    /// Whether the UI scene is active. Backgrounded scene updates must
+    /// complete within ~10s of wall clock before the watchdog kills the app
+    /// (0x8BADF00D), so reconnect work is deferred while this is false.
+    /// Deliberately true at init: launches head toward active, and blocking
+    /// the cold-start restore on the first scene-phase event would regress
+    /// startup. `.inactive` is treated like `.background` on purpose — it
+    /// immediately precedes backgrounding on home-press, and a socket that
+    /// dies under a system overlay is recovered by the `.active` scene task.
+    private var isSceneActive = true
     private var connectedAt: Date?
     private var sessionCatalogCache = SessionCatalogCache()
     private var projectsRequestGeneration = 0
+    /// Fences optional approval-queue reads across re-entrant MainActor
+    /// awaits. A late response must not populate a replacement conversation.
+    private var pendingApprovalsRequestGeneration: UInt64 = 0
     private let sessionPresentationCache: SessionPresentationCache
     private let sessionYoloStore: SessionYoloStore
+    private let conversationIdentityIndex: ConversationIdentityIndex
     private var sessionYoloWriteRevision: UInt64 = 0
     private var sessionYoloWriteRevisions: [ChatScrollSessionKey: UInt64] = [:]
-    /// Sessions whose user-initiated YOLO write is awaiting its RPC. The
-    /// override store is only updated after the gateway accepts, so readers
-    /// (notably the resume re-assert) must not treat the store as current
-    /// while a write is in flight.
-    private var inFlightSessionYoloWrites: Set<ChatScrollSessionKey> = []
+    /// Sessions whose user-initiated YOLO write is awaiting its RPC, tracked
+    /// by reference count so overlapping writes for the same session each own
+    /// an independent registration. The override store is only updated after
+    /// the gateway accepts, so readers (notably the resume re-assert) must not
+    /// treat the store as current while any write is in flight.
+    private var inFlightSessionYoloWriteCounts: [ChatScrollSessionKey: Int] = [:]
     /// The last session-level `yolo` the gateway itself reported, distinct
     /// from `runtime.yolo`, which also folds in the profile floor and the
     /// stored override.
@@ -675,11 +1327,6 @@ final class AppState: ObservableObject {
         let isAuthoritative: Bool
     }
 
-    private struct PersistedSessionTranscript {
-        let resolvedSessionId: String?
-        let messages: [ChatMessage]
-    }
-
     private struct TitleGenerationSettings {
         let enabled: Bool
         let language: String?
@@ -689,17 +1336,51 @@ final class AppState: ObservableObject {
         ISO8601DateFormatter().string(from: Date())
     }
 
+    /// Durable-owned presentation persistence: once the conversation's
+    /// durable identity is positively established (a catalog-confirmed or
+    /// admission-established canonical), the durable key is the only key
+    /// presentation writes land under — runtime aliases are never
+    /// re-persisted, so a flush can never recreate an alias copy that
+    /// `consolidateUnderDurableKey` retired. Without a durable id
+    /// (runtime-only conversations) the supplied ids pass through unchanged.
+    static func durableOwnedPresentationIDs(
+        _ ids: [String],
+        durableSessionID: String?
+    ) -> [String] {
+        guard let durableSessionID = ChatScrollIdentityNormalization.sessionID(durableSessionID) else {
+            return ids
+        }
+        // A lookup may need the whole alias set, but a WRITE does not: the
+        // durable key owns the persisted record.
+        return [durableSessionID]
+    }
+
+    private func presentationCacheSessionIDs(for sessionID: String) -> [String] {
+        Self.durableOwnedPresentationIDs(
+            [
+                sessionID,
+                activeSessionId,
+                reconciliation?.requestedSessionId,
+                reconciliation?.resolvedSessionId
+            ].compactMap { $0 },
+            durableSessionID: activeChatScrollSessionIdentity.canonicalSessionID
+        )
+    }
+
     /// Hermes can omit UI-only fields from persisted history. Retain a bounded
     /// local record so a reload does not drop a timestamp or tool preview.
     private func cacheMessagePresentation(for sessionIDs: [String] = []) {
-        let ids = sessionIDs + [
-            activeSessionId,
-            reconciliation?.requestedSessionId,
-            reconciliation?.resolvedSessionId
-        ].compactMap { $0 }
+        let ids = Self.durableOwnedPresentationIDs(
+            sessionIDs + [
+                activeSessionId,
+                reconciliation?.requestedSessionId,
+                reconciliation?.resolvedSessionId
+            ].compactMap { $0 },
+            durableSessionID: activeChatScrollSessionIdentity.canonicalSessionID
+        )
         let restorationKeys: Set<String>? = {
             guard let restorationGuard = restoredPendingDecisionCardsAwaitingConfirmation,
-                  restorationGuard.profile == activeProfile,
+                  restorationGuard.profile == presentationProfile(for: activeSessionId),
                   activeSessionId == restorationGuard.sessionID else {
                 return nil
             }
@@ -719,7 +1400,7 @@ final class AppState: ObservableObject {
         // store's pending keys or the flush would drop the card before the
         // notification-open resume merge could restore it.
         let storedPendingDecisionKeys = sessionPresentationCache.storedPendingDecisionKeys(
-            profile: activeProfile,
+            profile: presentationProfile(for: activeSessionId),
             sessionIDs: ids
         )
         let pendingDecisionKeysToPreserve = restorationKeys
@@ -729,7 +1410,7 @@ final class AppState: ObservableObject {
             || !storedPendingDecisionKeys.isEmpty
         sessionPresentationCache.save(
             cacheableMessages,
-            profile: activeProfile,
+            profile: presentationProfile(for: activeSessionId),
             sessionIDs: ids,
             preservePendingDecisionCards: preservePendingDecisionCards,
             unconfirmedPendingDecisionKeys: pendingDecisionKeysToPreserve
@@ -743,6 +1424,12 @@ final class AppState: ObservableObject {
     /// so continuous streaming can never postpone a flush indefinitely.
     private func schedulePresentationCacheFlush(for sessionId: String) {
         presentationCacheFlushTask?.cancel()
+        // Capture the profile identity this deferred write belongs to. The
+        // task only keeps the session ID immutable; everything else it reads
+        // (messages, reconciliation IDs, restoration guards) is live state.
+        let scheduledProfile = activeProfile
+        let scheduledEpoch = presentationCacheProfileEpoch
+        let suspendForDebounce = presentationCacheDebounceSuspension
         let now = Date()
         let sinceLastFlush = lastPresentationCacheFlushDate
             .map { now.timeIntervalSince($0) }
@@ -752,11 +1439,22 @@ final class AppState: ObservableObject {
         let delay: Duration = sinceLastFlush >= 5 ? .zero : .seconds(2)
         presentationCacheFlushTask = Task { [weak self] in
             do {
-                try await Task.sleep(for: delay)
+                try await suspendForDebounce(delay)
             } catch {
                 return
             }
             guard !Task.isCancelled, let self else { return }
+            // Stale-execution fence: if the app switched profiles while this
+            // flush was parked, the captured session ID no longer describes
+            // the live transcript, and writing through the now-active cache
+            // namespace would cross-contaminate profiles. switchProfile also
+            // flushes and cancels before switching; this guard keeps the
+            // operation safe on its own so no caller can forget it.
+            guard self.activeProfile == scheduledProfile,
+                  self.presentationCacheProfileEpoch == scheduledEpoch else {
+                presentationCacheFlushTask = nil
+                return
+            }
             self.cacheMessagePresentation(for: [sessionId])
             self.lastPresentationCacheFlushDate = Date()
             self.presentationCacheFlushTask = nil
@@ -772,9 +1470,46 @@ final class AppState: ObservableObject {
         cacheMessagePresentation()
     }
 
+    /// Assigns the active profile and fences deferred presentation-cache
+    /// work: any coalesced flush scheduled under another profile becomes
+    /// stale the moment the identity changes. Call this instead of assigning
+    /// `activeProfile` directly so no mutation site can skip the fence.
+    ///
+    /// Deliberately NOT flushing here: on rollbacks (failed switches) the
+    /// still-active identity does not own the restored in-memory content,
+    /// so the synchronous outgoing-transcript flush belongs at each forward
+    /// transition site (`switchProfile`, `connect(with:profile:)`) where
+    /// that ownership is guaranteed. Both fence conditions in
+    /// `schedulePresentationCacheFlush` are intentionally redundant — string
+    /// equality is the readable guard, the wrapping `&+= 1` (overflows only
+    /// after ~9.2×10^18 switches — unreachable) catches A→B→A round-trips —
+    /// do not simplify either away.
+    private func setActiveProfile(_ newValue: String) {
+        guard newValue != activeProfile else { return }
+        activeProfile = newValue
+        presentationCacheProfileEpoch &+= 1
+    }
+
+#if DEBUG
+    /// Deterministic-test access to the pending coalesced flush. Awaiting its
+    /// value settles every deferred-write decision (cancelled, fenced, or
+    /// completed) without wall-clock timing. Test-only plumbing; compiled out
+    /// of release builds.
+    var presentationCacheFlushOperationForTesting: Task<Void, Never>? {
+        presentationCacheFlushTask
+    }
+
+    func setActiveProfileForTesting(_ profile: String) {
+        setActiveProfile(profile)
+    }
+#endif
+
     // MARK: - Persistence
 
     private let defaults: UserDefaults
+    /// Kept outside ChatResumeStore on purpose: the return surface is a
+    /// presentation preference, not part of the resume schema.
+    static let chatReturnSurfaceKey = "conduit.chatReturnSurface.v1"
     private let activeSessionTitlesByProfileKey = "conduit.activeSessionTitlesByProfile.v1"
     private let pinnedSessionIDsByProfileKey = "conduit.pinnedSessionIdsByProfile.v1"
     private let activeProfileKey = "conduit.activeProfile"
@@ -785,7 +1520,9 @@ final class AppState: ObservableObject {
     private let sessionFilterOrderKey = "conduit.sessionFilterOrder.v1"
     private let reviewSummaryCacheKey = "conduit.reviewSummaryCache.v1"
     private let knownProfilesKey = "conduit.knownProfiles.v1"
-    private let chatResumeServerIdentityKey = "conduit.chatResumeServerIdentity.v1"
+    /// Shared with the saved-dashboard migration (which relabels a legacy
+    /// URL identity to the dashboard UUID), so it is a static.
+    static let chatResumeServerIdentityKey = "conduit.chatResumeServerIdentity.v1"
     private var activeSessionTitlesByProfile: [String: String] = [:]
     private var pinnedSessionIDsByProfile: [String: [String]] = [:]
     private let chatResumeCoordinator: ChatResumeCoordinator
@@ -836,35 +1573,50 @@ final class AppState: ObservableObject {
         chatResumeCoordinator: ChatResumeCoordinator? = nil,
         recoverySequence: ChatResumeRecoverySequence = ChatResumeRecoverySequence(),
         loadSavedConnection shouldLoadSavedConnection: Bool = true,
+        dashboardRegistry preloadedRegistry: SavedDashboardRegistry? = nil,
         clearSessionPresentationCache: @escaping () -> Void = {
             SessionPresentationCache.shared.clear()
         },
         sessionRenameOperations: SessionRenameOperation.Operations? = nil,
         sessionCatalogLoader: ((Bool) async throws -> [SessionSummary])? = nil,
+        profileDiscoveryLoader: (@MainActor () async throws -> [String: Any])? = nil,
         reconnectScheduler: ChatResumeReconnectScheduler? = nil,
         reconnectExecutor: ChatResumeReconnectExecutor? = nil,
         chatResumeLifecycleOperations: ChatResumeLifecycleOperations = .live,
         sessionPresentationCache: SessionPresentationCache = .shared,
-        sessionYoloStore: SessionYoloStore? = nil
+        sessionYoloStore: SessionYoloStore? = nil,
+        conversationIdentityIndex: ConversationIdentityIndex? = nil,
+        presentationCacheDebounceSuspension: (@Sendable (Duration) async throws -> Void)? = nil
     ) {
+        self.presentationCacheDebounceSuspension =
+            presentationCacheDebounceSuspension
+            ?? { duration in try await Task.sleep(for: duration) }
         self.defaults = defaults
+        // The registry (and its legacy migration) loads before any connection
+        // hydration: scoped auth records are meaningless without it.
+        self.savedDashboardRegistry = preloadedRegistry
+            ?? SavedDashboardMigrator.loadRegistry(defaults: defaults)
         self.sessionPresentationCache = sessionPresentationCache
         self.sessionYoloStore = sessionYoloStore ?? SessionYoloStore(defaults: defaults)
+        self.conversationIdentityIndex = conversationIdentityIndex ?? ConversationIdentityIndex()
         self.chatResumeCoordinator = chatResumeCoordinator
             ?? ChatResumeCoordinator(store: ChatResumeStore(defaults: defaults))
         self.recoverySequence = recoverySequence
         self.clearSessionPresentationCache = clearSessionPresentationCache
         sessionRenameOperationsOverride = sessionRenameOperations
         sessionCatalogLoaderOverride = sessionCatalogLoader
+        profileDiscoveryLoaderOverride = profileDiscoveryLoader
         self.reconnectScheduler = reconnectScheduler ?? scheduleChatResumeReconnectTask
         self.reconnectExecutor = reconnectExecutor
         self.chatResumeLifecycleOperations = chatResumeLifecycleOperations
         self.initialChatResumeServerIdentity = defaults
-            .string(forKey: "conduit.chatResumeServerIdentity.v1")
-            .flatMap(Self.normalizedChatResumeServerIdentity)
+            .string(forKey: Self.chatResumeServerIdentityKey)
+            .flatMap(Self.normalizedStoredChatResumeIdentity)
             ?? defaults.string(forKey: "conduit.dashboardURL")
                 .flatMap(Self.normalizedChatResumeServerIdentity)
         chatResumeBehavior = self.chatResumeCoordinator.behavior
+        chatReturnSurface = defaults.string(forKey: Self.chatReturnSurfaceKey)
+            .flatMap(ChatReturnSurface.init(rawValue:)) ?? .conversation
         defaultProfileName = ProfileAppearanceStore.loadDefaultName()
         profileAvatarURLs = ProfileAppearanceStore.loadAvatarURLs()
         appIconChoice = UIApplication.shared.alternateIconName == AppIconChoice.light.alternateIconName ? .light : .dark
@@ -886,6 +1638,16 @@ final class AppState: ObservableObject {
            let stored = try? JSONDecoder().decode([String: [String]].self, from: data) {
             pinnedSessionIDsByProfile = stored
         }
+        // Hydrate the visible profile list from the persisted known-profile
+        // cache before any discovery runs. A cold launch must not present an
+        // effectively empty list — starting from `[]` is what let a single
+        // failed /api/profiles refresh collapse the picker to one entry and
+        // persist that degraded list over the complete cache. The union also
+        // heals a cache a pre-fix build already degraded: `default` and the
+        // remembered active profile are re-added on first launch.
+        profiles = orderedProfiles(
+            (defaults.stringArray(forKey: knownProfilesKey) ?? []) + [activeProfile, "default"]
+        )
         restoreActiveSessionState(for: activeProfile)
         restorePinnedSessions(for: activeProfile)
         if shouldLoadSavedConnection {
@@ -896,7 +1658,7 @@ final class AppState: ObservableObject {
     func restoreActiveSessionState(for profile: String) {
         clearPendingDecisionRestorationGuard()
         activeSessionId = chatResumeCoordinator.lastSessionID(for: profile)
-        activeSessionTitle = activeSessionTitlesByProfile[profile] ?? "New conversation"
+        activeSessionTitle = activeSessionTitlesByProfile[profile] ?? AppLocalization.string("New conversation")
     }
 
     private func restorePinnedSessions(for profile: String) {
@@ -943,7 +1705,7 @@ final class AppState: ObservableObject {
 
     private func pendingDecisionRestorationMessages(for sessionID: String) -> [ChatMessage] {
         guard let restorationGuard = restoredPendingDecisionCardsAwaitingConfirmation,
-              restorationGuard.profile == activeProfile,
+              restorationGuard.profile == presentationProfile(for: sessionID),
               restorationGuard.sessionID == sessionID else {
             return []
         }
@@ -960,21 +1722,27 @@ final class AppState: ObservableObject {
         restoredPendingDecisionCardsAwaitingConfirmation = nil
     }
 
-    private func setActiveSessionState(id: String?, title: String? = nil) {
+    private func setActiveSessionState(
+        id: String?,
+        title: String? = nil,
+        recordsResumeSelection: Bool = true
+    ) {
         if activeSessionId != id {
             clearPendingDecisionRestorationGuard()
             resetResponseHapticTurn()
         }
         activeSessionId = id
-        if let persistedID = ChatSessionPersistenceIdentity.canonicalID(
-            for: id,
-            identity: activeChatScrollSessionIdentity,
-            catalog: sessions + cronSessions,
-            activeProfile: activeProfile
-        ) {
-            chatResumeCoordinator.rememberSessionID(persistedID, for: activeProfile)
-        } else {
-            chatResumeCoordinator.rememberSessionID(nil, for: activeProfile)
+        if recordsResumeSelection {
+            if let persistedID = ChatSessionPersistenceIdentity.canonicalID(
+                for: id,
+                identity: activeChatScrollSessionIdentity,
+                catalog: sessions + cronSessions,
+                activeProfile: activeProfile
+            ) {
+                chatResumeCoordinator.rememberSessionID(persistedID, for: activeProfile)
+            } else {
+                chatResumeCoordinator.rememberSessionID(nil, for: activeProfile)
+            }
         }
         if let title {
             activeSessionTitle = title
@@ -1006,6 +1774,94 @@ final class AppState: ObservableObject {
         recoverySequence.preserveTransportAfterAutomaticIntentCancellation()
         chatResumeBehavior = chatResumeCoordinator.behavior
         chatResumeRestorationRequest = nil
+    }
+
+    /// True when any presented sheet owns the surface other than the sessions
+    /// drawer itself. Explicit navigation and existing modals take precedence
+    /// over the preferred return surface.
+    var isModalSheetPresented: Bool {
+        showModelPicker || showContextSheet || showWorkspaceSheet || showGatewaySheet
+            || showAgentsSheet || showVoiceSheet || isSettingsSheetPresented
+    }
+
+    /// True when an explicit destination exists but has not been routed yet
+    /// (a notification tap or voice intent recorded before the app was
+    /// connected). Routing services own this fact; only the read lives here,
+    /// mirroring how syncSession already defers to a pending notification
+    /// target. Explicit navigation outranks the preferred return surface from
+    /// the moment the destination exists, not just once routing starts.
+    var hasPendingExplicitNavigation: Bool {
+        PushNotificationService.shared.pendingTarget != nil
+            || PendingVoiceIntentStore.shared.hasPendingIntent
+    }
+
+    /// Persisted separately from the resume store: this only changes which
+    /// surface is presented first on a qualifying return, and deliberately
+    /// issues no presentation request — the next qualifying return picks it up.
+    func setChatReturnSurface(_ surface: ChatReturnSurface) {
+        guard surface != chatReturnSurface else { return }
+        chatReturnSurface = surface
+        defaults.set(surface.rawValue, forKey: Self.chatReturnSurfaceKey)
+    }
+
+    /// Issues a one-shot preferred-return-surface request. Suppressed while
+    /// an explicit destination is pending or being opened, or when a modal
+    /// sheet already owns the surface; MainView re-checks at presentation
+    /// time as a backstop.
+    func requestPreferredReturnSurface() {
+        guard chatReturnSurface == .sessions else { return }
+        guard !hasPendingExplicitNavigation else { return }
+        guard !isOpeningNotificationSession else { return }
+        guard !isModalSheetPresented else { return }
+        preferredReturnSurfaceRequest &+= 1
+    }
+
+    /// MainView's first authenticated appearance in this process is the
+    /// cold-launch return. Mid-process re-entries (disconnect → sign back
+    /// in) are not cold launches; they rely on the scene-phase path.
+    func requestPreferredReturnSurfaceForColdLaunch() {
+        guard !hasRequestedColdLaunchReturnSurface else { return }
+        hasRequestedColdLaunchReturnSurface = true
+        requestPreferredReturnSurface()
+    }
+
+    /// Auth teardown (sign-out) is not a qualifying return. Retire any
+    /// outstanding preferred-return request at the boundary — claimed,
+    /// unclaimed, or deferred — so a MainView recreated on the next sign-in
+    /// can never present a stale request. The monotonic counter is left
+    /// untouched; only the consumed watermark advances.
+    private func retireOutstandingPreferredReturnSurfaceRequests() {
+        consumedReturnSurfaceRequest = max(consumedReturnSurfaceRequest, preferredReturnSurfaceRequest)
+        deferredReturnSurfaceRequest = nil
+    }
+
+    /// Claims the pending preferred-return-surface request for presentation.
+    /// Returns true exactly once per issued request — the watermark lives in
+    /// AppState, so a MainView recreated after sign-out/sign-in can never
+    /// re-present an already-claimed request.
+    ///
+    /// Consumption semantics: while explicit navigation is pending the claim
+    /// defers without consuming; the next unblocked claim of the same request
+    /// then drops it, because the explicit route fully won that qualifying
+    /// return. In-flight notification opens, modals, and preference changes
+    /// consume-and-drop immediately (established precedence losers).
+    func claimPreferredReturnSurfacePresentation() -> Bool {
+        let current = preferredReturnSurfaceRequest
+        guard current > consumedReturnSurfaceRequest else { return false }
+        if hasPendingExplicitNavigation {
+            deferredReturnSurfaceRequest = current
+            return false
+        }
+        defer { deferredReturnSurfaceRequest = nil }
+        if deferredReturnSurfaceRequest == current {
+            consumedReturnSurfaceRequest = current
+            return false
+        }
+        consumedReturnSurfaceRequest = current
+        guard chatReturnSurface == .sessions,
+              !isOpeningNotificationSession,
+              !isModalSheetPresented else { return false }
+        return true
     }
 
     func recordChatViewport(_ snapshot: ChatScrollSnapshot, for key: ChatScrollSessionKey) {
@@ -1161,6 +2017,7 @@ final class AppState: ObservableObject {
     }
 
     func beginAutomaticChatResumeWork() -> ChatResumeAutomaticWorkToken {
+        composerEditClaimedAutomaticWork = false
         if let activeAutomaticChatResumeWork,
            chatResumeCoordinator.isCurrent(activeAutomaticChatResumeWork) {
             return activeAutomaticChatResumeWork
@@ -1193,7 +2050,13 @@ final class AppState: ObservableObject {
         automaticWorkToken: ChatResumeAutomaticWorkToken?,
         automaticReconnectOperationID: UUID?
     ) -> ChatResumeTransportContinuation? {
-        guard !Task.isCancelled else { return nil }
+        // Checked after every suspension in connect(with:),
+        // reconnectForRetry, and the post-connect sync flow — the gate is
+        // transport-wide, not reconnect-only: any chat-resume work that goes
+        // inactive/backgrounded mid-flight must not keep publishing state
+        // (watchdog: 0x8BADF00D). handleScenePhase(.active) re-establishes
+        // the transport and syncs the session catalog on return.
+        guard !Task.isCancelled, isSceneActive else { return nil }
         if let automaticReconnectOperationID,
            activeAutomaticReconnectOperation?.id != automaticReconnectOperationID {
             return nil
@@ -1273,6 +2136,57 @@ final class AppState: ObservableObject {
         activeAutomaticChatResumeWork = nil
         recoverySequence.preserveTransportAfterAutomaticIntentCancellation()
         chatResumeRestorationRequest = nil
+    }
+
+    /// A genuine composer edit is explicit ownership of the visible
+    /// conversation, exactly like sending, navigating, or scrolling: any
+    /// automatic-return work still in flight (a foreground health check that
+    /// may yet fall back to a reconnect, an in-flight `.automaticReturn`
+    /// reconnect or sync, an armed retry timer, an unconsumed restoration
+    /// request) loses its authority to select a different session. Transport
+    /// recovery itself is not stopped — `cancelChatResumeRestoration()`
+    /// demotes the in-flight and queued purpose to `.preserveCurrent`, so a
+    /// reconnect that is already running hands off and preserves this
+    /// session, and a foreground attempt whose health check fails after the
+    /// edit repairs the transport with `.preserveCurrent` instead of
+    /// `.automaticReturn`.
+    ///
+    /// At most one cancellation lands per automatic-work generation: the
+    /// first edit that finds work outstanding claims it, later edits during
+    /// the same window are latched no-ops (`chatResumeRestorationRequest` is
+    /// `@Published`, so a per-keystroke nil write would re-render ChatView),
+    /// and a new foreground/reconnect generation re-arms through
+    /// `beginAutomaticChatResumeWork()`. With nothing outstanding this is a
+    /// pure no-op, so calling it per keystroke publishes no state and cannot
+    /// invalidate the viewport that a later, unrelated foreground return
+    /// will need.
+    func noteComposerUserEdit() {
+        guard automaticChatResumeWorkMayStillSelectSession else { return }
+        guard !composerEditClaimedAutomaticWork else { return }
+        composerEditClaimedAutomaticWork = true
+        cancelChatResumeRestoration()
+    }
+
+    /// Latch for `noteComposerUserEdit()`: set once an edit has invalidated
+    /// the current generation's automatic-return intent, cleared when the
+    /// next generation begins. Every automatic generation mints its token
+    /// here (a cancelled token is stale, so a new one is always minted), so
+    /// clearing at entry re-arms the composer for each new window.
+    private var composerEditClaimedAutomaticWork = false
+
+    /// Whether any automatic-return work is outstanding that could still
+    /// replace the active session. `activeAutomaticChatResumeWork` alone is
+    /// not evidence: a completed foreground refresh leaves its token behind,
+    /// and nothing ever re-reads it once the scene attempt and its operations
+    /// have finished.
+    private var automaticChatResumeWorkMayStillSelectSession: Bool {
+        scenePhaseAttemptID != nil
+            || reconnectTask != nil
+            || activeAutomaticSyncOperation != nil
+            || activeAutomaticReconnectOperation != nil
+            || recoverySequence.currentPurpose == .automaticReturn
+            || recoverySequence.queuedReconnectPurpose == .automaticReturn
+            || chatResumeRestorationRequest != nil
     }
 
     private func cancelChatResumeTransportRecovery() {
@@ -1373,13 +2287,35 @@ final class AppState: ObservableObject {
 
     @discardableResult
     func prepareChatResumeForConnection(to baseURL: String) -> Bool {
-        guard let identity = Self.normalizedChatResumeServerIdentity(baseURL) else { return false }
-        let previousIdentity = defaults.string(forKey: chatResumeServerIdentityKey)
-            .flatMap(Self.normalizedChatResumeServerIdentity)
+        prepareChatResumeForConnection(to: baseURL, dashboardID: nil)
+    }
+
+    /// The authoritative server-change boundary. The dashboard UUID is the
+    /// server identity when the target is a saved dashboard: URL spellings
+    /// can collide across servers and a dashboard's address can move, while
+    /// the UUID is stable. Same-dashboard reconnects (same UUID) are never
+    /// treated as a server switch; every identity change retires the
+    /// outgoing server's runtime ownership exactly once, through this one
+    /// state machine.
+    @discardableResult
+    func prepareChatResumeForConnection(to baseURL: String, dashboardID: UUID?) -> Bool {
+        let identity: String
+        if let dashboardID {
+            identity = dashboardID.uuidString
+        } else if let normalized = Self.normalizedChatResumeServerIdentity(baseURL) {
+            identity = normalized
+        } else {
+            // An unparseable, dashboard-less URL is the caller's mistake; the
+            // stored identity must not be overwritten with garbage.
+            return false
+        }
+        let previousIdentity = defaults.string(forKey: Self.chatResumeServerIdentityKey)
+            .flatMap(Self.normalizedStoredChatResumeIdentity)
             ?? initialChatResumeServerIdentity
-        defaults.set(identity, forKey: chatResumeServerIdentityKey)
+        defaults.set(identity, forKey: Self.chatResumeServerIdentityKey)
         guard let previousIdentity, previousIdentity != identity else { return false }
 
+        retireSpeechOperationsForServerReplacement(previousIdentity: previousIdentity, identity: identity)
         chatResumeCoordinator.clearResumeState()
         cancelOwnedAutomaticOperations()
         activeAutomaticChatResumeWork = nil
@@ -1387,6 +2323,7 @@ final class AppState: ObservableObject {
         recoverySequence.cancel()
         chatResumeRestorationRequest = nil
         invalidateReconciliation()
+        invalidateServerCompactionState()
         sessionCatalogCache.removeAll()
         sessions = []
         cronSessions = []
@@ -1397,9 +2334,12 @@ final class AppState: ObservableObject {
         profiles = []
         clearPendingDecisionRestorationGuard()
         activeSessionId = nil
-        activeSessionTitle = "New conversation"
+        activeSessionTitle = AppLocalization.string("New conversation")
         messages = []
+        persistedTranscriptWindow = nil
+        resetTranscriptLifecycleEvidence()
         clearStreamingText()
+        resetReasoningTurn()
         activeSessionTitlesByProfile = [:]
         pinnedSessionIDsByProfile = [:]
         pinnedSessionIDs = []
@@ -1408,10 +2348,94 @@ final class AppState: ObservableObject {
         defaults.removeObject(forKey: reviewSummaryCacheKey)
         defaults.removeObject(forKey: knownProfilesKey)
         clearSessionPresentationCache()
+        // Identity evidence and per-session overrides are keyed only by
+        // (profile, session id); without this clear they would leak between
+        // Hermes servers whose strings collide. Same boundary that clears
+        // the resume store, titles, pins, and review cache.
+        conversationIdentityIndex.removeAll()
+        sessionYoloStore.clearAllOverrides()
+        // Bot Mode state is per-server: the roster, the capability phase, and
+        // the in-memory bot-chat profile registry all describe the outgoing
+        // gateway and are re-probed when the Bots surface is next opened.
+        invalidateBotModeState()
         return true
     }
 
-    private static func normalizedChatResumeServerIdentity(_ baseURL: String) -> String? {
+    /// Drops all Bot Mode runtime state at a server-identity boundary. The
+    /// epoch bump fences every in-flight roster response; in-flight bot
+    /// opens are cancelled so a stale flight can never navigate the UI or
+    /// mutate state against the outgoing server.
+    private func invalidateBotModeState() {
+        botRosterEpoch += 1
+        botChatOpenFlights.values.forEach { $0.task?.cancel() }
+        botChatSessionProfiles.removeAll()
+        botChatOpenFlights.removeAll()
+        botRoster = []
+        botRosterRefreshToken = nil
+        // The in-flight refresh, if any, still completes but its epoch guard
+        // discards the stale snapshot; drop the join handle so the next
+        // identity's first refresh cannot join a dead flight.
+        botRosterRefreshFlight = nil
+        isRefreshingBotRoster = false
+        botModePhase = .idle
+    }
+
+    /// Runtime-only speech retirement at the server-replacement boundary.
+    ///
+    /// Voice Conversation and Read Aloud own speech transports that are
+    /// independent of `HermesClient`: a gateway binds one dashboard bridge and
+    /// base URL, and each spoken response opens its own ticket-minted speech
+    /// websocket. Those transports would otherwise keep streaming against —
+    /// and playing audio from — the outgoing server after a new connection
+    /// becomes authoritative, because replacing the client or the gateway
+    /// reference does not terminate an operation that already holds the old
+    /// gateway. This mirrors the voice teardown `disconnect()` performs, with
+    /// the operation generations doing the rest: every parked continuation
+    /// (capture resume, speech drain, playback completion) re-checks its
+    /// generation and turns inert, so nothing the outgoing server owned can
+    /// resurrect capture or playback.
+    ///
+    /// Deliberately NOT logout: no credential, cookie, ticket, or preference
+    /// state is touched here — only the outgoing connection's runtime speech
+    /// ownership. If the incoming connection fails to activate, the retired
+    /// operations stay retired; the outgoing server's speech is not valid
+    /// merely because the replacement failed. Same-server reconnects never
+    /// reach this path: `prepareDashboardBridge(for:)` keeps the bridge (and
+    /// therefore the gateways) when the normalized URL is unchanged, and the
+    /// capability refresh intentionally keeps equivalent gateways alive.
+    private func retireSpeechOperationsForServerReplacement(previousIdentity: String, identity: String) {
+        let voiceWasLive = voiceConversationController.hasLiveVoiceSession
+        let readAloudWasActive: Bool
+        if case .idle = messageReadAloudController.state {
+            readAloudWasActive = false
+        } else {
+            readAloudWasActive = true
+        }
+        speechOwnershipLog.info(
+            "Server replacement \(previousIdentity, privacy: .private) -> \(identity, privacy: .private): retiring speech ownership (voiceLive=\(voiceWasLive ? "yes" : "no", privacy: .public), readAloudActive=\(readAloudWasActive ? "yes" : "no", privacy: .public))"
+        )
+        voiceConversationController.stop()
+        // Read Aloud teardown flows through the controller's own pinned
+        // Option-A semantics: replacing a non-nil gateway performs the single
+        // authoritative stop. A nil gateway means nothing can be live — an
+        // operation cannot start without one.
+        messageReadAloudController.setGateway(nil)
+        // A swapped gateway must never hand a later operation to the outgoing
+        // server's bridge; the incoming connection rebuilds both references
+        // from its own bridge (capability refresh, read-aloud assignment).
+        voiceConversationController.setGateway(nil)
+        readAloudGatewayBridge = nil
+        // Server replacement is a destructive Voice boundary: a suspended
+        // conversation from the outgoing server must never be restored.
+        suspendedVoiceConversation = nil
+        voiceSheetShouldAutoListen = false
+        voiceControllerSessionProfile = nil
+        showVoiceSheet = false
+    }
+
+    /// Internal so the saved-dashboard migration can normalize the legacy
+    /// identity key the same way the runtime boundary does.
+    static func normalizedChatResumeServerIdentity(_ baseURL: String) -> String? {
         guard let normalized = try? ConnectionURLPolicy.normalizedBaseURL(baseURL),
               var components = URLComponents(string: normalized),
               let scheme = components.scheme?.lowercased(),
@@ -1423,6 +2447,17 @@ final class AppState: ObservableObject {
             components.port = nil
         }
         return components.string
+    }
+
+    /// Stored chat-resume identities are either a normalized server URL
+    /// (legacy builds) or a dashboard UUID string (multi-server). UUID
+    /// strings pass through untouched; URL shapes normalize as before. A
+    /// UUID-shaped stored value must never be URL-parsed into nil — that
+    /// would make every cold start look like a server switch.
+    static func normalizedStoredChatResumeIdentity(_ stored: String) -> String? {
+        let trimmed = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        if UUID(uuidString: trimmed) != nil { return trimmed }
+        return Self.normalizedChatResumeServerIdentity(stored)
     }
 
     private func refreshActiveChatScrollSessionIdentity(
@@ -1444,6 +2479,7 @@ final class AppState: ObservableObject {
             catalog: identityCatalog,
             requestedSessionID: reconciliation?.requestedSessionId,
             resolvedSessionID: reconciliation?.resolvedSessionId,
+            resolvedDurableSessionID: reconciliation?.resolvedDurableSessionId,
             previousIdentity: current,
             isReconciling: isReconciling ?? current.isReconciling,
             advanceSettledRevision: advanceSettledRevision
@@ -1463,40 +2499,64 @@ final class AppState: ObservableObject {
         to updated: ChatScrollSessionIdentity,
         catalog: [SessionSummary]
     ) {
-        guard let canonicalKey = updated.canonicalSessionKey,
-              let canonicalSession = catalog.first(where: { session in
-                  let profile = session.profile ?? canonicalKey.profile
-                  return ChatScrollSessionKey(
-                      profile: profile,
-                      sessionID: session.id
-                  ) == canonicalKey
-              }) else { return }
+        guard let canonicalKey = updated.canonicalSessionKey else { return }
 
-        let equivalentSessionIDs = Set(
-            ([canonicalSession.id] + canonicalSession.alternateIds).compactMap { sessionID in
-                let key = ChatScrollSessionKey(
-                    profile: canonicalKey.profile,
-                    sessionID: sessionID
-                )
-                return key.isValid ? key.sessionID : nil
+        // Catalog-confirmed path: the new canonical is a catalog row, so the
+        // row's id set positively establishes the previous runtime-keyed
+        // persistence to migrate.
+        if let canonicalSession = catalog.first(where: { session in
+            let profile = session.profile ?? canonicalKey.profile
+            return ChatScrollSessionKey(
+                profile: profile,
+                sessionID: session.id
+            ) == canonicalKey
+        }) {
+            let equivalentSessionIDs = Set(
+                ([canonicalSession.id] + canonicalSession.alternateIds).compactMap { sessionID in
+                    let key = ChatScrollSessionKey(
+                        profile: canonicalKey.profile,
+                        sessionID: sessionID
+                    )
+                    return key.isValid ? key.sessionID : nil
+                }
+            )
+
+            let persistedKey = chatResumeCoordinator
+                .lastSessionID(for: canonicalKey.profile)
+                .map { ChatScrollSessionKey(profile: canonicalKey.profile, sessionID: $0) }
+            let activeKey = activeSessionId.map {
+                ChatScrollSessionKey(profile: canonicalKey.profile, sessionID: $0)
             }
-        )
+            let candidates = [persistedKey, current.canonicalSessionKey, activeKey]
+                .compactMap { $0 }
+            guard let runtimeKey = candidates.first(where: {
+                $0 != canonicalKey
+                    && $0.profile == canonicalKey.profile
+                    && equivalentSessionIDs.contains($0.sessionID)
+            }) else { return }
 
-        let persistedKey = chatResumeCoordinator
-            .lastSessionID(for: canonicalKey.profile)
-            .map { ChatScrollSessionKey(profile: canonicalKey.profile, sessionID: $0) }
-        let activeKey = activeSessionId.map {
-            ChatScrollSessionKey(profile: canonicalKey.profile, sessionID: $0)
+            chatResumeCoordinator.migrateSessionIdentity(from: runtimeKey, to: canonicalKey)
+            return
         }
-        let candidates = [persistedKey, current.canonicalSessionKey, activeKey]
-            .compactMap { $0 }
-        guard let runtimeKey = candidates.first(where: {
-            $0 != canonicalKey
-                && $0.profile == canonicalKey.profile
-                && equivalentSessionIDs.contains($0.sessionID)
-        }) else { return }
 
-        chatResumeCoordinator.migrateSessionIdentity(from: runtimeKey, to: canonicalKey)
+        // Admission-confirmed path: the canonical just moved to a durable id
+        // that the resume response POSITIVELY admitted (establishment for a
+        // runtime-only conversation) and that has no catalog row yet. The
+        // reconciliation's accepted set is positive evidence of which
+        // previous conversation keys belong to this same conversation, so the
+        // runtime-keyed snapshot and resume-store entry can migrate without
+        // catalog confirmation. Conversation-scoped: only the previous
+        // canonical key of THIS conversation migrates; profile-scoped: the
+        // coordinator migration requires a same-profile key pair.
+        guard let admittedDurable = reconciliation?.resolvedDurableSessionId,
+              canonicalKey.sessionID == admittedDurable,
+              let previousKey = current.canonicalSessionKey,
+              previousKey != canonicalKey,
+              previousKey.profile == canonicalKey.profile,
+              reconciliation?.acceptedSessionIDs.contains(previousKey.sessionID) == true else {
+            return
+        }
+        chatResumeCoordinator.migrateSessionIdentity(from: previousKey, to: canonicalKey)
     }
 
     func makeSettingsSnapshot() -> SettingsSnapshot {
@@ -1508,8 +2568,9 @@ final class AppState: ObservableObject {
             theme: themePreference,
             busyInputMode: busyInputMode,
             chatResumeBehavior: chatResumeBehavior,
+            chatReturnSurface: chatReturnSurface,
             displayPreferences: displayPreferences,
-            cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: connection?.baseUrl)
+            cloudflareAccess: dashboardScopedCloudflareAccess(for: connection?.baseUrl)
         )
     }
 
@@ -1517,15 +2578,19 @@ final class AppState: ObservableObject {
         if let baseURL = connection?.baseUrl,
            let access = CloudflareAccessCredentials.from(clientID: clientID, clientSecret: clientSecret) {
             let normalized = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? baseURL
-            KeychainHelper.saveCloudflareAccess(access, origin: normalized)
-        } else {
-            KeychainHelper.clearCloudflareAccess()
+            if let dashboardID = resolveDashboardID(forNormalizedURL: normalized, registerIfMissing: true) {
+                KeychainHelper.saveCloudflareAccess(access, origin: normalized, dashboardID: dashboardID)
+            }
+        } else if let dashboardID = activeDashboardID {
+            KeychainHelper.clearCloudflareAccess(dashboardID: dashboardID)
         }
         if let baseURL = connection?.baseUrl { prepareDashboardBridge(for: baseURL) }
     }
 
     func removeCloudflareAccess() {
-        KeychainHelper.clearCloudflareAccess()
+        if let dashboardID = activeDashboardID {
+            KeychainHelper.clearCloudflareAccess(dashboardID: dashboardID)
+        }
         if let baseURL = connection?.baseUrl { prepareDashboardBridge(for: baseURL) }
     }
 
@@ -1548,7 +2613,7 @@ final class AppState: ObservableObject {
     func selectAppIcon(_ choice: AppIconChoice) async -> Bool {
         guard choice != appIconChoice else { return true }
         guard UIApplication.shared.supportsAlternateIcons else {
-            errorMessage = "This build does not include alternate app icons."
+            errorMessage = AppLocalization.string("This build does not include alternate app icons.")
             return false
         }
 
@@ -1556,7 +2621,7 @@ final class AppState: ObservableObject {
             UIApplication.shared.setAlternateIconName(choice.alternateIconName) { [weak self] error in
                 Task { @MainActor in
                     if let error {
-                        self?.errorMessage = "Could not change the app icon: \(error.localizedDescription)"
+                        self?.errorMessage = AppLocalization.string("Could not change the app icon: \(error.localizedDescription)")
                         continuation.resume(returning: false)
                     } else {
                         self?.appIconChoice = choice
@@ -1614,11 +2679,73 @@ final class AppState: ObservableObject {
 
     // MARK: - Connection management
 
+#if DEBUG
+    /// UI-test-only connected state: a snapshot connection with no client and
+    /// no transport. Reconnect paths refuse to run while it is active (see
+    /// `reconnectForRetry`), so the stubbed session is inert by construction
+    /// and Settings-UI tests never touch a network or a real dashboard.
+    private static func uiTestConnectedStub() -> HermesConnection? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-CONDUIT_UI_TEST_CONNECTED_DASHBOARD"),
+              index + 1 < arguments.count else { return nil }
+        return HermesConnection(baseUrl: arguments[index + 1], ticket: "ui-test-stub")
+    }
+
+    /// UI-test-only FAILED-connection state (Round 6): a snapshot connection
+    /// with a surfaced, classified stable failure so the Repair Connection
+    /// entry is visible. Inert by construction under the same reconnect
+    /// suppression as the connected stub. `-CONDUIT_UI_TEST_FAILURE_KIND
+    /// none` retains no failure, so the repair entry opens straight on the
+    /// staged test.
+    private static func uiTestFailedConnectionStub() -> HermesConnection? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-CONDUIT_UI_TEST_FAILED_CONNECTION"),
+              index + 1 < arguments.count else { return nil }
+        return HermesConnection(baseUrl: arguments[index + 1], ticket: "ui-test-stub")
+    }
+
+    private static func uiTestFailureKind() -> ConnectionFailure? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-CONDUIT_UI_TEST_FAILURE_KIND"),
+              index + 1 < arguments.count else { return .hostNotFound }
+        return arguments[index + 1] == "none" ? nil : .hostNotFound
+    }
+#endif
+
     func loadSavedConnection() {
-        if let credentials = KeychainHelper.loadCredentials() {
-            Task { await restoreSavedCredentials(credentials) }
-        } else if let saved = KeychainHelper.loadConnection() {
-            rememberDashboardURL(saved.baseUrl)
+        #if DEBUG
+        if let stub = Self.uiTestFailedConnectionStub() {
+            let failureKind = Self.uiTestFailureKind()
+            lifecycleLog.notice("UI-test failed-connection stub active: repair surface visible, transport inert")
+            connection = stub
+            isConnected = false
+            isConnecting = false
+            turnState = .reconnecting
+            lastConnectionFailure = failureKind
+            errorMessage = AppLocalization.string("The connection to Hermes was lost. (UI test stub)")
+            showLogin = false
+            return
+        }
+        if let stub = Self.uiTestConnectedStub() {
+            lifecycleLog.notice("UI-test connected stub active: no transport will be created and reconnects are inert")
+            connection = stub
+            isConnected = true
+            isConnecting = false
+            showLogin = false
+            return
+        }
+        #endif
+        guard let activeID = savedDashboardRegistry.activeDashboardID,
+              let dashboard = savedDashboardRegistry.dashboard(with: activeID) else {
+            // No saved dashboards (clean install) or none selected: present
+            // the sign-in / add-dashboard flow.
+            showLogin = true
+            return
+        }
+        rememberDashboardURL(dashboard.normalizedURL)
+        if let credentials = KeychainHelper.loadCredentials(dashboardID: activeID) {
+            Task { await restoreSavedCredentials(credentials, dashboardID: activeID) }
+        } else if let saved = KeychainHelper.loadConnection(dashboardID: activeID) {
             // Keep the authenticated app shell in place while WebKit restores
             // its cookie process. A cold WebKit launch is not evidence that the
             // dashboard sign-in expired.
@@ -1627,9 +2754,13 @@ final class AppState: ObservableObject {
             isConnecting = true
             turnState = .synchronizing
             Task { await restoreSavedConnection(saved) }
+        } else {
+            // The selected dashboard has no reusable auth left (signed out or
+            // removed on another surface): present its sign-in, seeded with
+            // its own address.
+            showLogin = true
         }
     }
-
     func connect(with conn: HermesConnection, profile: String = "default") async {
         await connect(
             with: conn,
@@ -1650,14 +2781,25 @@ final class AppState: ObservableObject {
         if cancelsResumeRestoration {
             cancelChatResumeTransportRecovery()
         }
-        guard let normalizedBaseURL = try? ConnectionURLPolicy.normalizedBaseURL(conn.baseUrl) else {
+        // Preserve which URL-policy rule failed instead of reporting every
+        // normalization failure as insecure transport, and hand the login
+        // card a typed classified presentation rather than a string.
+        let normalizedBaseURL: String
+        do {
+            normalizedBaseURL = try ConnectionURLPolicy.normalizedBaseURL(conn.baseUrl)
+        } catch {
             isConnecting = false
             isConnected = false
             showLogin = true
-            errorMessage = ConnectionURLPolicyError.insecureTransport.localizedDescription
+            pendingLoginFailure = .presenting(ConnectionFailureClassifier.classify(error))
             return
         }
-        prepareChatResumeForConnection(to: normalizedBaseURL)
+        // Adoption resolves the saved dashboard this connection belongs to
+        // (registering it when new) BEFORE the server-change boundary runs,
+        // so the boundary's identity is the dashboard UUID and the bridge
+        // built below can read this dashboard's scoped Cloudflare token.
+        let adoptedDashboardID = adoptDashboard(forNormalizedURL: normalizedBaseURL)
+        prepareChatResumeForConnection(to: normalizedBaseURL, dashboardID: adoptedDashboardID)
         let automaticWorkToken = syncPurpose == .automaticReturn
             ? (existingAutomaticWorkToken ?? beginAutomaticChatResumeWork())
             : nil
@@ -1689,12 +2831,19 @@ final class AppState: ObservableObject {
         showLogin = false
         connection = conn
         if activeProfile != profile {
+            // Hard profile boundary for this forward transition: cancel the
+            // debounced stream flush and write synchronously while the
+            // current profile still owns the in-memory transcript. Mirrors
+            // switchProfile(to:reusing:).
+            flushPendingPresentationCache()
             sessions = []
             cronSessions = []
             archivedSessions = []
             slashCommands = Self.builtInSlashCommands
         }
-        activeProfile = profile
+        // Fence deferred presentation-cache writes created under the
+        // previous profile before transcripts change over.
+        setActiveProfile(profile)
         restoreActiveSessionState(for: profile)
         restorePinnedSessions(for: profile)
         defaults.set(profile, forKey: activeProfileKey)
@@ -1719,9 +2868,12 @@ final class AppState: ObservableObject {
             handedOffAutomaticIntent = continuation.handedOffAutomaticIntent
             isConnected = true
             isConnecting = false
+            // A fresh healthy session never inherits an older banner error.
+            errorMessage = nil
+            lastConnectionFailure = nil
             reconnectAttempts = 0
             connectedAt = Date()
-            KeychainHelper.saveConnection(conn)
+            KeychainHelper.saveConnection(conn, dashboardID: adoptedDashboardID)
 
             await loadChatResumeProfiles()
             guard let continuation = transportContinuation(
@@ -1776,11 +2928,198 @@ final class AppState: ObservableObject {
             isConnected = false
             turnState = .reconnecting
             errorMessage = error.localizedDescription
+            // The typed classification is retained for Repair Connection's
+            // seeding and routing; the raw error never reaches the UI.
+            lastConnectionFailure = ConnectionFailureClassifier.classify(error)
             // Only an explicit dashboard 401/403 may return the user to the
             // sign-in screen. A transient gateway or WebKit startup failure
             // must retain the saved dashboard session and retry.
             showLogin = false
-            scheduleReconnect(purpose: continuation.purpose)
+            if continuation.purpose == .preserveCurrent {
+                recoverySequence.complete()
+                scheduleReconnect(purpose: continuation.purpose)
+            } else {
+                scheduleReconnectAfterFailedSync()
+            }
+        }
+    }
+
+    // MARK: - Connection Repair (Round 6)
+
+    /// Builds the Repair seed from the configuration that actually failed:
+    /// the active (failed) connection's exact URL, safely available
+    /// credentials for it, and the origin-matched Cloudflare token. Nil when
+    /// there is no failed target — a healthy connected session is never a
+    /// repair candidate.
+    func makeConnectionRepairContext() -> ConnectionRepairContext? {
+        guard let failedURL = connection?.baseUrl, !isConnected else { return nil }
+        return repairContext(for: failedURL)
+    }
+
+    /// Repair seed for a failed SAVED-credential reconnect (login screen):
+    /// the failed target is the saved record's dashboard, and the record
+    /// itself — kept intact by the failure path — supplies the seed under
+    /// the normal seeding rules (a Face ID-protected record surrenders its
+    /// username only).
+    func makeSavedConnectionRepairContext() -> ConnectionRepairContext? {
+        guard let activeID = activeDashboardID,
+              let credentials = KeychainHelper.loadCredentials(dashboardID: activeID) else { return nil }
+        return repairContext(for: credentials.baseURL)
+    }
+
+    private func repairContext(for failedURL: String) -> ConnectionRepairContext {
+        let scopedCredentials = activeDashboardID.flatMap { KeychainHelper.loadCredentials(dashboardID: $0) }
+        let seeded = ConnectionSetupSeeding.wizardCredentials(
+            for: failedURL,
+            saved: scopedCredentials
+        )
+        return ConnectionRepairContext(
+            draft: ConnectionSetupDraft(
+                existingServerURL: failedURL,
+                username: seeded?.username ?? "",
+                password: seeded?.password ?? ""
+            ),
+            cloudflareAccess: dashboardScopedCloudflareAccess(for: failedURL),
+            cloudflareOriginURL: failedURL,
+            failure: lastConnectionFailure
+        )
+    }
+
+    /// Repair entry for a failed SAVED-credential reconnect (login screen).
+    /// Like the composer entry, this is an explicit user takeover: any
+    /// outstanding automatic recovery loses authority before the wizard
+    /// opens, so it can never install a connection underneath the repair.
+    @discardableResult
+    func beginSavedConnectionRepair() -> ConnectionRepairContext? {
+        guard let context = makeSavedConnectionRepairContext() else { return nil }
+        cancelChatResumeTransportRecovery()
+        return context
+    }
+
+    /// Entering Repair is an explicit user takeover of connection recovery:
+    /// outstanding automatic recovery — the scheduled reconnect timer, its
+    /// operations, and its automatic work — loses authority here, so a stale
+    /// automatic reconnect can never install a connection or select a
+    /// session over the user's explicit repair. Dismissal does not silently
+    /// restart the loop; the user is left in the stable disconnected state.
+    @discardableResult
+    func beginConnectionRepair() -> ConnectionRepairContext? {
+        guard let context = makeConnectionRepairContext() else { return nil }
+        cancelChatResumeTransportRecovery()
+        return context
+    }
+
+    /// The wizard's activation handler for the Repair entry: runs the
+    /// explicit reconnect through the authoritative connection path and
+    /// persists the tested configuration only after activation succeeds.
+    func connectionRepairActivationHandler(
+    ) -> (ConnectionRepairHandoff) async -> ConnectionRepairActivationOutcome {
+        let activator = AppStateConnectionRepairActivator(appState: self)
+        return { handoff in await activator.activate(handoff) }
+    }
+
+    /// The explicit repair activation behind Reconnect Now / Sign In to
+    /// Reconnect. Revokes outstanding automatic recovery authority first,
+    /// commits the validated transaction's cookies (native only — browser
+    /// sign-in publishes its own cookies through the AuthWebView flow), then
+    /// connects with `.preserveCurrent`: the server confirms the preserved
+    /// session identity, never automatic-return selection.
+    func performConnectionRepair(
+        _ handoff: ConnectionRepairHandoff
+    ) async -> ConnectionRepairActivationOutcome {
+        // The PRE-activation target anchors persistence: it decides whether
+        // the tested URL counts as changed (remember it) and whether the
+        // Cloudflare token needs a same-origin re-bind.
+        let failedTarget = connection?.baseUrl
+        cancelChatResumeTransportRecovery()
+        let outcome: ConnectionRepairActivationOutcome
+        switch handoff {
+        case .native(let candidate):
+            // The one-shot candidate is consumed here, whether activation
+            // succeeds or fails: its cookies are committed exactly once, and
+            // a failed activation requires a fresh test, never a retry of a
+            // spent transaction. If activation fails after the commit, the
+            // committed cookies belong to a genuinely authenticated session
+            // (login and ticket mint both succeeded first) — they are
+            // naturally superseded by the next explicit test or sign-in and
+            // are deliberately not rolled back.
+            if let dashboardID = resolveDashboardID(
+                forURL: candidate.configuration.serverURL,
+                registerIfMissing: true
+            ) {
+                candidate.nativeConnection.commitCookies(dashboardID: dashboardID)
+            }
+            outcome = await activateRepairedConnection(with: HermesConnection(
+                baseUrl: candidate.configuration.serverURL,
+                ticket: candidate.nativeConnection.ticket
+            ))
+        case .browserSignIn(let ticket, let baseURL, _):
+            outcome = await activateRepairedConnection(with: HermesConnection(
+                baseUrl: baseURL,
+                ticket: ticket
+            ))
+        }
+        guard outcome == .activated else { return outcome }
+        persistActivatedRepair(handoff, failedTarget: failedTarget)
+        return outcome
+    }
+
+    /// The authoritative activation step. A test success is not a guarantee
+    /// the world is unchanged; if the websocket activation fails, the
+    /// failure is classified, the reconnect `connect` armed is cancelled (no
+    /// automatic retry), the remembered dashboard URL is restored, and the
+    /// caller stays in Repair.
+    private func activateRepairedConnection(
+        with conn: HermesConnection
+    ) async -> ConnectionRepairActivationOutcome {
+        // connect() remembers the URL it attempts by design; a FAILED
+        // activation must not move the remembered dashboard (the saved
+        // connection and credentials are untouched by the failure path
+        // already).
+        let rememberedURL = defaults.string(forKey: dashboardURLKey)
+        await connect(
+            with: conn,
+            profile: activeProfile,
+            syncPurpose: .preserveCurrent,
+            cancelsResumeRestoration: false
+        )
+        guard isConnected else {
+            if let rememberedURL { defaults.set(rememberedURL, forKey: dashboardURLKey) }
+            // connect() armed an automatic retry in its failure path; the
+            // explicit repair owns recovery, so the loop stays stopped until
+            // the user tests and reconnects again.
+            cancelChatResumeTransportRecovery()
+            return .failed(lastConnectionFailure ?? .unknown)
+        }
+        return .activated
+    }
+
+    /// Persists the tested configuration ONLY after successful activation.
+    /// Reuses the Round-5 apply plan (replace-never-create credentials,
+    /// same-origin Cloudflare rewrites) anchored at the failed target so a
+    /// changed URL is remembered and a path-only move re-binds the token.
+    private func persistActivatedRepair(
+        _ handoff: ConnectionRepairHandoff,
+        failedTarget: String?
+    ) {
+        switch handoff {
+        case .native(let candidate):
+            let anchor = failedTarget ?? candidate.configuration.serverURL
+            let plan = ConnectionSetupApplication.plan(
+                result: candidate.configuration,
+                currentDashboardURL: anchor,
+                savedCredentials: savedCredentialsForDashboard(at: anchor),
+                savedCloudflareAccess: dashboardScopedCloudflareAccess(for: anchor)
+            )
+            plan.perform(appState: self)
+        case .browserSignIn(_, let baseURL, _):
+            // Existing browser-auth semantics: no reusable password exists,
+            // stale native credentials are cleared, the activated dashboard
+            // is remembered, and same-origin Cloudflare rules are untouched.
+            rememberDashboardURL(baseURL)
+            if let dashboardID = resolveDashboardID(forURL: baseURL, registerIfMissing: false) {
+                KeychainHelper.clearCredentials(dashboardID: dashboardID)
+            }
         }
     }
 
@@ -1793,14 +3132,24 @@ final class AppState: ObservableObject {
         recoverySequence.cancel()
         chatResumeRestorationRequest = nil
         invalidateReconciliation()
+        invalidateServerCompactionState()
         cancelScenePhaseAttempt()
+        lastConnectionFailure = nil
         client?.disconnect()
         isConnected = false
         isConnecting = false
         connectedAt = nil
-        KeychainHelper.clearConnection()
-        KeychainHelper.clearCredentials()
-        KeychainHelper.clearCloudflareAccess()
+        // Sign Out of This Dashboard: only the active dashboard's reusable
+        // auth is cleared. Its SavedDashboard metadata and every other
+        // dashboard's records are untouched. The dashboard identity is
+        // captured BEFORE any state is nulled so the web/native session is
+        // cleared even when there is no live connection.
+        let signingOutDashboardID = activeDashboardID
+        if let dashboardID = signingOutDashboardID {
+            KeychainHelper.clearConnection(dashboardID: dashboardID)
+            KeychainHelper.clearCredentials(dashboardID: dashboardID)
+            KeychainHelper.clearCloudflareAccess(dashboardID: dashboardID)
+        }
         // The Keychain mirror of the dashboard cookies is cleared above, but
         // the live session cookies live on in WebKit's persistent default data
         // store and the shared Foundation cookie store. Without removing them,
@@ -1808,16 +3157,27 @@ final class AppState: ObservableObject {
         // session could be silently resumed on the next authentication flow.
         // Capture the origin before nulling `connection` and purge both stores.
         let dashboardBaseURL = connection?.baseUrl
+            ?? signingOutDashboardID.flatMap { savedDashboardRegistry.dashboard(with: $0)?.normalizedURL }
         connection = nil
         client = nil
         dashboardTicketBridge?.invalidate()
         dashboardTicketBridge = nil
         voiceConversationController.stop()
+        messageReadAloudController.stop()
+        // The bridge is invalidated above; a gateway built against it can
+        // never open a stream again, so it must not survive the re-login.
+        messageReadAloudController.setGateway(nil)
+        readAloudGatewayBridge = nil
+        suspendedVoiceConversation = nil
+        voiceSheetShouldAutoListen = false
+        voiceControllerSessionProfile = nil
         showVoiceSheet = false
         voiceCapabilitySnapshot = .unavailable
         isVoiceEnabled = false
         voiceTranscriptionMode = .hermes
+        continuousConversationEnabled = true
         appleSpeechAvailability = AppleOnDeviceSpeechTranscriber.currentAvailability()
+        retireOutstandingPreferredReturnSurfaceRequests()
         showLogin = true
         sessions = []
         archivedSessions = []
@@ -1829,27 +3189,38 @@ final class AppState: ObservableObject {
         sessionCatalogCache.removeAll()
         pinnedSessionIDs = []
         messages = []
-        setActiveSessionState(id: nil, title: "New conversation")
+        persistedTranscriptWindow = nil
+        setActiveSessionState(id: nil, title: AppLocalization.string("New conversation"))
         clearStreamingText()
+        resetReasoningTurn()
         turnState = .idle
         defaults.removeObject(forKey: activeSessionTitlesByProfileKey)
         defaults.removeObject(forKey: pinnedSessionIDsByProfileKey)
         activeSessionTitlesByProfile = [:]
         pinnedSessionIDsByProfile = [:]
         defaults.removeObject(forKey: activeProfileKey)
-        clearDashboardWebSession(for: dashboardBaseURL)
+        clearDashboardWebSession(dashboardID: signingOutDashboardID, baseURL: dashboardBaseURL)
     }
 
-    /// Removes the dashboard origin's cookies from the WebKit default data
-    /// store and the shared Foundation cookie store. The Foundation store is
-    /// cleared synchronously first so no rapid reconnect can reuse the native
-    /// session cookie; the WebKit store can only be mutated asynchronously, so
-    /// it is dispatched as a background task.
-    private func clearDashboardWebSession(for dashboardBaseURL: String?) {
-        guard let dashboardBaseURL else { return }
-        DashboardCookiePersistence.clearNativeCookies(for: dashboardBaseURL)
+    /// Clears a dashboard's web session at Sign Out / Remove. With a
+    /// dashboard identity the session is DASHBOARD-OWNED (#148): the
+    /// identified WebKit store is removed entirely and the dashboard's native
+    /// jar is wiped (plus exact-host residue in the shared jar — parent-domain
+    /// cookies shared with a sibling dashboard are never touched). Without an
+    /// identity (legacy/test shapes) the origin-scoped default-store cleanup
+    /// remains.
+    private func clearDashboardWebSession(dashboardID: UUID?, baseURL: String?) {
+        if let dashboardID {
+            Task { await DashboardCookiePersistence.clearWebKitSession(for: dashboardID) }
+            if let baseURL {
+                DashboardCookiePersistence.clearNativeCookies(dashboardID: dashboardID, baseURL: baseURL)
+            }
+            return
+        }
+        guard let baseURL else { return }
+        DashboardCookiePersistence.clearNativeCookies(for: baseURL)
         Task { @MainActor in
-            if let url = URL(string: dashboardBaseURL) {
+            if let url = URL(string: baseURL) {
                 await DashboardCookiePersistence.clear(
                     from: WKWebsiteDataStore.default().httpCookieStore,
                     for: url
@@ -1858,8 +3229,229 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Saved dashboards (#148)
+
+    /// Resolves the saved dashboard reached at this URL. Normalized URLs are
+    /// unique in the registry; `registerIfMissing` creates (but does not
+    /// activate) an entry, for pre-connection writes such as the browser
+    /// sign-in's Cloudflare token save.
+    @discardableResult
+    func resolveDashboardID(forNormalizedURL normalized: String, registerIfMissing: Bool) -> UUID? {
+        if let existing = savedDashboardRegistry.dashboardID(atNormalizedURL: normalized) {
+            return existing
+        }
+        guard registerIfMissing else { return nil }
+        return registerDashboard(forNormalizedURL: normalized)
+    }
+
+    /// Registers a saved dashboard for this address (if missing) and returns
+    /// its UUID — never optional, so adoption and pre-connection writes have
+    /// one non-failable registration path.
+    @discardableResult
+    func registerDashboard(forNormalizedURL normalized: String) -> UUID {
+        if let existing = savedDashboardRegistry.dashboardID(atNormalizedURL: normalized) {
+            return existing
+        }
+        var registry = savedDashboardRegistry
+        let id = UUID()
+        let label = SavedDashboardLabel.derive(from: normalized, existingLabels: registry.dashboards.map(\.label))
+        registry.dashboards.append(SavedDashboard(id: id, label: label, normalizedURL: normalized))
+        savedDashboardRegistry = registry
+        SavedDashboardRegistryStore.save(registry)
+        return id
+    }
+
+    func resolveDashboardID(forURL baseURL: String, registerIfMissing: Bool) -> UUID? {
+        let normalized = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL))
+            ?? baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        return resolveDashboardID(forNormalizedURL: normalized, registerIfMissing: registerIfMissing)
+    }
+
+    /// Connection adoption: resolves the dashboard this connection belongs
+    /// to (registering it when new) and makes it the active/selected target.
+    /// Idempotent for reconnects. When the stored chat-resume identity still
+    /// names this server by URL (the pre-adoption boundary ran before the
+    /// dashboard existed), it is relabeled to the UUID so the next
+    /// connection to this dashboard is recognized as same-server.
+    @discardableResult
+    func adoptDashboard(forNormalizedURL normalized: String) -> UUID {
+        let id = registerDashboard(forNormalizedURL: normalized)
+        if savedDashboardRegistry.activeDashboardID != id {
+            var registry = savedDashboardRegistry
+            registry.activeDashboardID = id
+            savedDashboardRegistry = registry
+            SavedDashboardRegistryStore.save(registry)
+        }
+        if let stored = defaults.string(forKey: Self.chatResumeServerIdentityKey),
+           let normalizedStored = Self.normalizedChatResumeServerIdentity(stored),
+           normalizedStored == normalized {
+            defaults.set(id.uuidString, forKey: Self.chatResumeServerIdentityKey)
+        }
+        return id
+    }
+
+    /// The origin-matched Cloudflare token for the dashboard reached at this
+    /// URL, read from that dashboard's scoped record only.
+    func dashboardScopedCloudflareAccess(for baseURL: String?) -> CloudflareAccessCredentials? {
+        guard let baseURL else { return nil }
+        let normalized = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL))
+            ?? baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let dashboardID = resolveDashboardID(forNormalizedURL: normalized, registerIfMissing: false) else { return nil }
+        return KeychainHelper.loadCloudflareAccess(dashboardID: dashboardID, for: baseURL)
+    }
+
+    /// Saved password credentials for the dashboard reached at this URL.
+    func savedCredentialsForDashboard(at baseURL: String) -> DashboardCredentials? {
+        guard let dashboardID = resolveDashboardID(forURL: baseURL, registerIfMissing: false) else { return nil }
+        return KeychainHelper.loadCredentials(dashboardID: dashboardID)
+    }
+
+    /// Bumped on every dashboard switch; a restore that started under an
+    /// older generation must not install its connection underneath a newer
+    /// switch.
+    private var dashboardSwitchGeneration: UInt64 = 0
+
+    /// Switch to a saved dashboard. Switching is NOT disconnecting: the
+    /// outgoing dashboard stays saved with its auth intact, but its runtime
+    /// ownership (client, sessions, speech) is retired IMMEDIATELY through
+    /// the authoritative `prepareChatResumeForConnection` boundary — a
+    /// switch that then fails to authenticate must not leave the outgoing
+    /// server streaming behind the new target's sign-in surface. The target
+    /// becomes the selected dashboard BEFORE connecting, so a failed switch
+    /// leaves it selected; no other dashboard is auto-connected.
+    func switchDashboard(to id: UUID) async {
+        guard let dashboard = savedDashboardRegistry.dashboard(with: id) else { return }
+        if id == activeDashboardID && (isConnected || isConnecting) {
+            // Already there: a same-dashboard reconnect is not a switch.
+            return
+        }
+        dashboardSwitchGeneration &+= 1
+        let generation = dashboardSwitchGeneration
+        selectDashboardTarget(id)
+        rememberDashboardURL(dashboard.normalizedURL)
+        _ = prepareChatResumeForConnection(to: dashboard.normalizedURL, dashboardID: id)
+        retireConnectionRuntimeForDashboardSwitch()
+        if let credentials = KeychainHelper.loadCredentials(dashboardID: id) {
+            await restoreSavedCredentials(credentials, dashboardID: id, switchGeneration: generation)
+            return
+        }
+        if let saved = KeychainHelper.loadConnection(dashboardID: id) {
+            // Cookie/ticket-based resume: keep the app shell up while the
+            // bridge restores the dashboard's own cookie mirror.
+            connection = saved
+            showLogin = false
+            isConnecting = true
+            turnState = .synchronizing
+            await restoreSavedConnection(saved, switchGeneration: generation)
+            return
+        }
+        // No reusable auth: present the sign-in surface seeded for this
+        // dashboard's address.
+        turnState = .idle
+        showLogin = true
+    }
+
+    /// Runtime-only teardown of the live connection when switching
+    /// dashboards. `prepareChatResumeForConnection` (called just before) owns
+    /// the server-replacement state retirement; this retires the transport
+    /// and connection-scoped surfaces it does not touch. Deliberately NOT
+    /// disconnect(): no saved auth, cookie mirror, or registry state is
+    /// cleared — the outgoing dashboard stays signed in while saved.
+    private func retireConnectionRuntimeForDashboardSwitch() {
+        cancelChatResumeTransportRecovery()
+        cancelScenePhaseAttempt()
+        cancelScheduledReconnect()
+        lastConnectionFailure = nil
+        pendingLoginFailure = nil
+        errorMessage = nil
+        client?.disconnect()
+        client = nil
+        // Fence already-queued callbacks from the outgoing server: they are
+        // epoch-gated, and no new client is created on the authless path.
+        activeClientEpoch = UUID()
+        connection = nil
+        isConnected = false
+        isConnecting = false
+        connectedAt = nil
+        dashboardTicketBridge?.invalidate()
+        dashboardTicketBridge = nil
+        // A flush scheduled under the outgoing server must not write through
+        // after the switch; the boundary already cleared the cache it would
+        // resurrect content into.
+        presentationCacheFlushTask?.cancel()
+        presentationCacheFlushTask = nil
+        messageReadAloudController.setGateway(nil)
+        readAloudGatewayBridge = nil
+        voiceConversationController.setGateway(nil)
+        voiceCapabilitySnapshot = .unavailable
+        isVoiceEnabled = false
+        retireOutstandingPreferredReturnSurfaceRequests()
+    }
+
+    private func switchGenerationIsCurrent(_ generation: UInt64) -> Bool {
+        generation == dashboardSwitchGeneration
+    }
+
+    /// Marks a dashboard as the selected target without connecting. A failed
+    /// switch leaves the target selected — retry/repair is presented for it,
+    /// and no other dashboard is auto-connected.
+    func selectDashboardTarget(_ id: UUID) {
+        guard savedDashboardRegistry.dashboard(with: id) != nil else { return }
+        guard savedDashboardRegistry.activeDashboardID != id else { return }
+        var registry = savedDashboardRegistry
+        registry.activeDashboardID = id
+        savedDashboardRegistry = registry
+        SavedDashboardRegistryStore.save(registry)
+    }
+
+    /// Sign Out of This Dashboard: clears the dashboard's reusable
+    /// auth/session/cookie material — and nothing else. SavedDashboard
+    /// metadata and every other dashboard's state are untouched. For the
+    /// active dashboard this is the full Disconnect teardown, scoped.
+    func signOutDashboard(_ id: UUID) {
+        guard let dashboard = savedDashboardRegistry.dashboard(with: id) else { return }
+        if id == activeDashboardID {
+            disconnect()
+            return
+        }
+        KeychainHelper.clearConnection(dashboardID: id)
+        KeychainHelper.clearCredentials(dashboardID: id)
+        KeychainHelper.clearCloudflareAccess(dashboardID: id)
+        // The dashboard is not connected, but its OWN web session may still
+        // hold live cookies from an earlier session; sign-out removes the
+        // identified WebKit store and the dashboard's native jar (plus
+        // exact-host shared-jar residue). Sibling dashboards sharing a parent
+        // domain are untouched.
+        Task { await DashboardCookiePersistence.clearWebKitSession(for: id) }
+        DashboardCookiePersistence.clearNativeCookies(dashboardID: id, baseURL: dashboard.normalizedURL)
+    }
+
+    /// Remove Dashboard: deletes the SavedDashboard and clears ONLY its
+    /// secure state. Removing the active dashboard leaves Conduit
+    /// disconnected with the dashboard selection/add flow presented — no
+    /// other saved dashboard is auto-connected.
+    func removeDashboard(_ id: UUID) {
+        guard savedDashboardRegistry.dashboard(with: id) != nil else { return }
+        let wasActive = id == activeDashboardID
+        if wasActive {
+            // Full scoped teardown of the active dashboard's auth and live
+            // session (including its origin's cookies).
+            disconnect()
+        } else {
+            signOutDashboard(id)
+        }
+        var registry = savedDashboardRegistry
+        registry.dashboards.removeAll { $0.id == id }
+        if registry.activeDashboardID == id { registry.activeDashboardID = nil }
+        savedDashboardRegistry = registry
+        SavedDashboardRegistryStore.save(registry)
+        if wasActive {
+            showLogin = true
+        }
+    }
+
     private func makeClient(connection: HermesConnection, profile: String) -> HermesClient {
-        let client = HermesClient(connection: connection, profile: profile, cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: connection.baseUrl))
+        let client = HermesClient(connection: connection, profile: profile, cloudflareAccess: dashboardScopedCloudflareAccess(for: connection.baseUrl))
         let epoch = UUID()
         activeClientEpoch = epoch
         client.onEvent = { [weak self] event in
@@ -1882,46 +3474,147 @@ final class AppState: ObservableObject {
     /// only needed to mint a replacement ticket after that socket actually
     /// disconnects or fails. Requiring a freshly restored WebKit cookie before
     /// every launch was what turned a healthy saved Hermes session into login.
-    private func restoreSavedConnection(_ saved: HermesConnection) async {
+    private func restoreSavedConnection(_ saved: HermesConnection, switchGeneration: UInt64? = nil) async {
+        if let switchGeneration, !switchGenerationIsCurrent(switchGeneration) {
+            return
+        }
         prepareDashboardBridge(for: saved.baseUrl)
+        // Re-fence after the bridge's async setup window: never install a
+        // stale switch's connection.
+        if let switchGeneration, !switchGenerationIsCurrent(switchGeneration) {
+            return
+        }
         await connect(with: saved, profile: activeProfile)
     }
 
-    private func restoreSavedCredentials(_ credentials: DashboardCredentials) async {
+    private func restoreSavedCredentials(
+        _ credentials: DashboardCredentials,
+        dashboardID: UUID? = nil,
+        switchGeneration: UInt64? = nil
+    ) async {
+        // A superseded dashboard switch owns the flow; this stale restore
+        // must not prompt, spend network, or install its connection — and it
+        // must not touch presentation state the newer switch now owns.
+        if let switchGeneration, !switchGenerationIsCurrent(switchGeneration) {
+            return
+        }
+        let scopedDashboardID = dashboardID ?? activeDashboardID
         rememberDashboardURL(credentials.baseURL)
 
         if credentials.requiresFaceID {
             guard BiometricAuth.isFaceIDAvailable,
-                  await BiometricAuth.authenticate(reason: "Unlock Conduit") else {
-                showLogin = true
+                  await BiometricAuth.authenticate(reason: AppLocalization.string("Unlock Conduit")) else {
+                // A superseded switch owns the flow: present nothing.
+                if restoreOwnsFlow(switchGeneration) { showLogin = true }
+                return
+            }
+            // Re-fence after the biometric await: a superseded switch owns
+            // the flow now.
+            if let switchGeneration, !switchGenerationIsCurrent(switchGeneration) {
                 return
             }
         }
 
         do {
-            let ticket = try await NativeAuthClient(baseURL: credentials.baseURL, cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: credentials.baseURL)).connect(
+            let access = scopedDashboardID.flatMap {
+                KeychainHelper.loadCloudflareAccess(dashboardID: $0, for: credentials.baseURL)
+            }
+            let authenticatedConnection = try await NativeAuthClient(baseURL: credentials.baseURL, cloudflareAccess: access).connect(
                 username: credentials.username,
                 password: credentials.password
             )
-            await connect(with: HermesConnection(baseUrl: credentials.baseURL, ticket: ticket), profile: activeProfile)
+            // Re-fence after the network await: never install a stale
+            // switch's connection (its adoptDashboard would flip selection).
+            if let switchGeneration, !switchGenerationIsCurrent(switchGeneration) {
+                return
+            }
+            if let scopedDashboardID {
+                authenticatedConnection.commitCookies(dashboardID: scopedDashboardID)
+            }
+            await connect(with: HermesConnection(baseUrl: credentials.baseURL, ticket: authenticatedConnection.ticket), profile: activeProfile)
+        } catch is CancellationError {
+            // A superseded connect owns the flow from here; fall back to the
+            // login screen silently — but only if THIS restore still owns
+            // the flow. A stale restore (a newer switch won) writes nothing.
+            if restoreOwnsFlow(switchGeneration) { showLogin = true }
         } catch {
             // A rejected saved password falls back to the native login screen
             // without erasing it, allowing the user to correct the account.
-            showLogin = true
-            errorMessage = error.localizedDescription
+            // The typed classified handoff replaces the old string write, so
+            // the composer banner never inherits a stale sign-in message.
+            presentCredentialRestoreFailure(
+                ConnectionFailureClassifier.classify(error),
+                switchGeneration: switchGeneration
+            )
         }
+    }
+
+    /// Whether a restore that started under this switch generation may still
+    /// write state. Nil generations (non-switch restore paths) always own.
+    private func restoreOwnsFlow(_ generation: UInt64?) -> Bool {
+        guard let generation else { return true }
+        return switchGenerationIsCurrent(generation)
+    }
+
+    /// The fenced failure presentation for a saved-credential restore: a
+    /// superseded restore (a newer dashboard switch won) must not set
+    /// `showLogin`, `pendingLoginFailure`, or `lastConnectionFailure` over
+    /// the winner's state. Returns whether anything was written (test seam).
+    @discardableResult
+    func presentCredentialRestoreFailure(
+        _ failure: ConnectionFailure,
+        switchGeneration: UInt64?
+    ) -> Bool {
+        guard restoreOwnsFlow(switchGeneration) else { return false }
+        lastConnectionFailure = failure
+        showLogin = true
+        pendingLoginFailure = .presenting(failure)
+        return true
     }
 
     private func prepareDashboardBridge(for baseUrl: String) {
         let normalized = baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let access = KeychainHelper.loadCloudflareAccess(for: normalized)
+        let access = dashboardScopedCloudflareAccess(for: normalized)
         if dashboardTicketBridge?.baseURL != normalized || dashboardTicketBridge?.cloudflareAccess != access {
             dashboardTicketBridge?.invalidate()
-            dashboardTicketBridge = DashboardTicketBridge(baseURL: normalized, cloudflareAccess: access)
+            dashboardTicketBridge = DashboardTicketBridge(
+                baseURL: normalized,
+                cloudflareAccess: access,
+                dashboardID: resolveDashboardID(forURL: normalized, registerIfMissing: false)
+            )
         }
     }
 
-    private func requireSignIn(message: String) {
+    /// Classification seam for the silent-renewal sign-in handoff: when a
+    /// saved-password re-auth was attempted and failed, that error (429
+    /// throttle, 401 rejection, 503 outage) explains far more than the bare
+    /// bridge signInRequired. The winning error is classified — never
+    /// rendered via errorDescription. Internal for unit testing.
+    static func silentRenewalSignInFailure(
+        reauthError: Error?,
+        bridgeError: DashboardTicketBridgeError
+    ) -> ConnectionFailurePresentation {
+        .presenting(reauthError.map(ConnectionFailureClassifier.classify)
+            ?? ConnectionFailureClassifier.classify(bridgeError))
+    }
+
+    /// Forces the sign-in screen with a classified failure presentation.
+    /// Prefer this overload whenever the failure derives from an Error — the
+    /// full presentation (title, actions, help routing) reaches the login
+    /// card untouched.
+    func requireSignIn(failure: ConnectionFailurePresentation) {
+        performSignInRequired(pendingFailure: failure)
+    }
+
+    /// Forces the sign-in screen with a human-authored notice message. Only
+    /// for genuinely hand-written strings — Error-derived text must go
+    /// through requireSignIn(failure:) so it is classified, never rendered
+    /// raw.
+    func requireSignIn(message: String) {
+        performSignInRequired(pendingFailure: .notice(title: AppLocalization.string("Sign-in didn’t complete"), message: message))
+    }
+
+    private func performSignInRequired(pendingFailure: ConnectionFailurePresentation) {
         cancelChatResumeTransportRecovery()
         invalidateReconciliation()
         cancelSecondaryProfileTitleRecovery()
@@ -1933,13 +3626,36 @@ final class AppState: ObservableObject {
         connection = nil
         dashboardTicketBridge?.invalidate()
         dashboardTicketBridge = nil
+        // A forced sign-out kills the bridge mid-playback; stop the read
+        // aloud and drop its gateway the same way Disconnect does.
+        messageReadAloudController.stop()
+        messageReadAloudController.setGateway(nil)
+        readAloudGatewayBridge = nil
+        // Forced sign-out supersedes any suspended Voice conversation (the
+        // restore-time connection identity check would fail closed anyway);
+        // stop the controller and drop the sheet immediately like
+        // Disconnect does instead of waiting for the next scene cycle.
+        suspendedVoiceConversation = nil
+        voiceSheetShouldAutoListen = false
+        voiceControllerSessionProfile = nil
+        voiceConversationController.stop()
+        showVoiceSheet = false
         projects = []
         supportsProjects = false
         projectsLoading = false
-        KeychainHelper.clearConnection()
+        if let dashboardID = activeDashboardID {
+            // Forced sign-out is scoped like Disconnect: only the active
+            // dashboard's saved ticket (and cookie mirror) is retired.
+            KeychainHelper.clearConnection(dashboardID: dashboardID)
+        }
         turnState = .idle
+        retireOutstandingPreferredReturnSurfaceRequests()
+        // The banner content belonged to the session being torn down; with
+        // the LoginView onAppear consume gone, this is what keeps a
+        // connected-era error from resurfacing stale after re-login.
+        errorMessage = nil
         showLogin = true
-        errorMessage = message
+        pendingLoginFailure = pendingFailure
     }
 
     // MARK: - Authoritative reconciliation
@@ -1955,13 +3671,15 @@ final class AppState: ObservableObject {
         purpose: ChatResumeSyncPurpose,
         using existingReconciliationToken: UUID?,
         automaticWorkToken existingAutomaticWorkToken: ChatResumeAutomaticWorkToken?,
-        requiredViewportTransitionGeneration: UInt64? = nil
+        requiredViewportTransitionGeneration: UInt64? = nil,
+        historySourceUnavailable: Bool = false
     ) async {
         _ = await performSyncSession(
             purpose: purpose,
             using: existingReconciliationToken,
             automaticWorkToken: existingAutomaticWorkToken,
-            requiredViewportTransitionGeneration: requiredViewportTransitionGeneration
+            requiredViewportTransitionGeneration: requiredViewportTransitionGeneration,
+            historySourceUnavailable: historySourceUnavailable
         )
     }
 
@@ -1969,7 +3687,8 @@ final class AppState: ObservableObject {
         purpose: ChatResumeSyncPurpose,
         using existingReconciliationToken: UUID?,
         automaticWorkToken existingAutomaticWorkToken: ChatResumeAutomaticWorkToken?,
-        requiredViewportTransitionGeneration: UInt64? = nil
+        requiredViewportTransitionGeneration: UInt64? = nil,
+        historySourceUnavailable: Bool = false
     ) async -> ChatResumeSyncExecutionOutcome {
         guard chatViewportTransitionIsCurrent(
             requiredViewportTransitionGeneration
@@ -2027,6 +3746,15 @@ final class AppState: ObservableObject {
         ) else { return .superseded }
         let profile = activeProfile
         let retainedActiveTurn = activeTurnCatalogSession()
+        // Capture the selected conversation's complete identity — durable id,
+        // runtime id, and every positively confirmed alias — BEFORE replacing
+        // the published catalog. A preserve-current recovery is allowed to
+        // outlive a transient catalog omission; it must not fall back to
+        // another chat, and it must not rediscover its alias set from the
+        // replacement catalog that just forgot it.
+        let preservedIdentity = purpose == .preserveCurrent
+            ? captureConversationIdentity(for: activeSessionId)
+            : nil
         turnState = .synchronizing
 
         do {
@@ -2073,6 +3801,9 @@ final class AppState: ObservableObject {
             }
             sessions = allSessions.filter { $0.source != .cron }
             cronSessions = allSessions.filter { $0.source == .cron }
+            // Labeled rows are positive identity evidence; commit them so
+            // notification routing survives a later catalog omission.
+            conversationIdentityIndex.recordCatalogIdentity(allSessions, profile: profile)
 
             guard automaticChatResumeWorkIsCurrent(
                 automaticWorkToken,
@@ -2084,37 +3815,237 @@ final class AppState: ObservableObject {
                 )
                 return chatResumeSyncInterruptionOutcome(for: automaticWorkToken)
             }
-            let target = selectChatResumeTarget(
+            // A canonical Bot Chat is reserved presentation state reachable
+            // only through the Bots roster: it must never be chosen as this
+            // workspace's ordinary resume target. Selection-only — the
+            // published catalog above stays raw — and deliberately
+            // roster-INDEPENDENT, because a cold launch has no roster yet and
+            // a stale visible canonical row would otherwise be the newest
+            // candidate, making itself the active conversation, the
+            // cold-restore selection, and the persisted title's source.
+            let resumeCandidates = BotChatHygiene.ordinaryResumeCandidates(
+                allSessions,
+                roster: botRoster
+            )
+            // A cold launch can receive a catalog before Hermes has indexed
+            // the just-created/in-flight conversation. When Continue Where I
+            // Left Off names a saved identity that is absent from that
+            // catalog, resume it directly rather than letting the catalog's
+            // first row replace the user's conversation.
+            let missingSavedSessionID = chatResumeCoordinator.missingSavedSessionID(
                 in: allSessions,
                 profile: profile,
-                purpose: purpose,
-                currentSessionID: activeSessionId,
-                automaticWorkToken: automaticWorkToken,
-                automaticSyncOperationID: automaticOperationID
+                purpose: purpose
             )
+            if let missingSavedSessionID {
+                chatResumeRestorationRequest = nil
+                chatResumeCoordinator.prepareDirectTarget(
+                    sessionID: missingSavedSessionID,
+                    profile: profile,
+                    purpose: purpose
+                )
+            }
+            let target = missingSavedSessionID == nil
+                ? selectChatResumeTarget(
+                    in: resumeCandidates,
+                    profile: profile,
+                    purpose: purpose,
+                    currentSessionID: activeSessionId,
+                    automaticWorkToken: automaticWorkToken,
+                    automaticSyncOperationID: automaticOperationID
+                )
+                : nil
             if let target {
+                // A freshly selected catalog row positively establishes the
+                // target's identity: the row's ids are the accepted set, and
+                // its stored id (when labeled) is the durable one. For a
+                // preserve-current hit, keep the PRE-captured aliases too —
+                // the refreshed row can keep the conversation while dropping
+                // a runtime alias, and in-flight events for that alias must
+                // stay associated with this reconciliation. The union is
+                // durably anchored: a row sharing only a colliding runtime
+                // alias must not absorb the selected conversation's aliases.
+                let targetIDs = Set([target.id] + target.alternateIds)
+                var acceptedTargetIDs = targetIDs
+                if let preservedIdentity,
+                   !targetIDs.isDisjoint(with: preservedIdentity.acceptedSessionIDs) {
+                    let targetStored = target.storedSessionId
+                    let durablyAnchored = targetStored == nil
+                        || preservedIdentity.durableSessionID == nil
+                        || targetStored == preservedIdentity.durableSessionID
+                        || targetStored.map { preservedIdentity.acceptedSessionIDs.contains($0) } ?? false
+                    if durablyAnchored {
+                        acceptedTargetIDs.formUnion(preservedIdentity.acceptedSessionIDs)
+                    }
+                }
+                let targetIdentity = ConversationIdentity(
+                    profile: profile,
+                    durableSessionID: target.storedSessionId ?? target.id,
+                    runtimeSessionID: target.storedSessionId != nil ? target.id : nil,
+                    acceptedSessionIDs: acceptedTargetIDs
+                )
                 let succeeded = await reconcile(
                     sessionId: target.id,
                     using: client,
                     token: token,
-                    acceptedSessionIDs: Set([target.id] + target.alternateIds),
+                    acceptedSessionIDs: acceptedTargetIDs,
+                    conversationIdentity: targetIdentity,
                     automaticWorkToken: automaticWorkToken,
                     automaticSyncOperationID: automaticOperationID,
-                    requiredViewportTransitionGeneration: requiredViewportTransitionGeneration
+                    requiredViewportTransitionGeneration: requiredViewportTransitionGeneration,
+                    historySourceUnavailable: historySourceUnavailable
                 )
                 if !succeeded,
                    purpose == .automaticReturn,
+                   !reconciliationWasIdentityRejected,
                    automaticChatResumeWorkIsCurrent(
                     automaticWorkToken,
                     syncOperationID: automaticOperationID
                    ),
                    token == reconciliationToken,
                    profile == activeProfile {
-                    scheduleReconnect(purpose: purpose)
+                    scheduleReconnectAfterFailedSync()
                 }
                 return succeeded
                     ? .completed
                     : chatResumeSyncInterruptionOutcome(for: automaticWorkToken)
+            } else if let missingSavedSessionID {
+                // The store holds the durable session ID after an admitted
+                // resume. It remains safe to address directly even while the
+                // catalog temporarily omits the row; an identity gate still
+                // rejects a contradictory server response.
+                let savedIdentity = ConversationIdentity(
+                    profile: profile,
+                    durableSessionID: missingSavedSessionID,
+                    runtimeSessionID: nil,
+                    acceptedSessionIDs: [missingSavedSessionID]
+                )
+                let succeeded = await reconcile(
+                    sessionId: missingSavedSessionID,
+                    using: client,
+                    token: token,
+                    acceptedSessionIDs: savedIdentity.acceptedSessionIDs,
+                    conversationIdentity: savedIdentity,
+                    automaticWorkToken: automaticWorkToken,
+                    automaticSyncOperationID: automaticOperationID,
+                    requiredViewportTransitionGeneration: requiredViewportTransitionGeneration,
+                    historySourceUnavailable: historySourceUnavailable
+                )
+                if !succeeded,
+                   reconciliationSessionWasNotFound,
+                   automaticChatResumeWorkIsCurrent(
+                    automaticWorkToken,
+                    syncOperationID: automaticOperationID
+                   ),
+                   chatViewportTransitionIsCurrent(requiredViewportTransitionGeneration),
+                   token == reconciliationToken,
+                   profile == activeProfile,
+                   let activeClient = self.client,
+                   activeClient === client {
+                    // `session.resume` code 4007 is authoritative evidence
+                    // that the saved conversation was deleted. Forget only
+                    // the still-current pointer, then select from the catalog
+                    // we already loaded under the same ownership fences.
+                    guard chatResumeCoordinator.lastSessionID(for: profile) == missingSavedSessionID else {
+                        return .superseded
+                    }
+                    let handledMissingSessionError = errorMessage
+                    chatResumeCoordinator.rememberSessionID(nil, for: profile)
+                    if let fallback = selectChatResumeTarget(
+                        in: resumeCandidates,
+                        profile: profile,
+                        purpose: purpose,
+                        currentSessionID: nil,
+                        automaticWorkToken: automaticWorkToken,
+                        automaticSyncOperationID: automaticOperationID
+                    ) {
+                        let fallbackIDs = Set([fallback.id] + fallback.alternateIds)
+                        let fallbackIdentity = ConversationIdentity(
+                            profile: profile,
+                            durableSessionID: fallback.storedSessionId ?? fallback.id,
+                            runtimeSessionID: fallback.storedSessionId != nil ? fallback.id : nil,
+                            acceptedSessionIDs: fallbackIDs
+                        )
+                        let fallbackSucceeded = await reconcile(
+                            sessionId: fallback.id,
+                            using: client,
+                            token: token,
+                            acceptedSessionIDs: fallbackIDs,
+                            conversationIdentity: fallbackIdentity,
+                            automaticWorkToken: automaticWorkToken,
+                            automaticSyncOperationID: automaticOperationID,
+                            requiredViewportTransitionGeneration: requiredViewportTransitionGeneration,
+                            historySourceUnavailable: historySourceUnavailable
+                        )
+                        if fallbackSucceeded, errorMessage == handledMissingSessionError {
+                            errorMessage = nil
+                        }
+                        if !fallbackSucceeded,
+                           !reconciliationWasIdentityRejected,
+                           !reconciliationSessionWasNotFound,
+                           automaticChatResumeWorkIsCurrent(
+                            automaticWorkToken,
+                            syncOperationID: automaticOperationID
+                           ),
+                           token == reconciliationToken,
+                           profile == activeProfile {
+                            // The prior saved identity was authoritatively
+                            // deleted; do not let it masquerade as a visible
+                            // preserve-current target on the retry.
+                            activeSessionId = nil
+                            scheduleReconnectAfterFailedSync()
+                        }
+                        return fallbackSucceeded
+                            ? .completed
+                            : chatResumeSyncInterruptionOutcome(for: automaticWorkToken)
+                    }
+                    await createAndReconcileSession(
+                        using: client,
+                        profile: profile,
+                        token: token,
+                        resumePurpose: purpose,
+                        automaticWorkToken: automaticWorkToken,
+                        automaticSyncOperationID: automaticOperationID,
+                        requiredViewportTransitionGeneration: requiredViewportTransitionGeneration
+                    )
+                    return automaticChatResumeWorkIsCurrent(
+                        automaticWorkToken,
+                        syncOperationID: automaticOperationID
+                    ) ? .completed : chatResumeSyncInterruptionOutcome(for: automaticWorkToken)
+                }
+                if !succeeded,
+                   !reconciliationWasIdentityRejected,
+                   automaticChatResumeWorkIsCurrent(
+                    automaticWorkToken,
+                    syncOperationID: automaticOperationID
+                   ),
+                   token == reconciliationToken,
+                   profile == activeProfile {
+                    scheduleReconnectAfterFailedSync()
+                }
+                return succeeded
+                    ? .completed
+                    : chatResumeSyncInterruptionOutcome(for: automaticWorkToken)
+            } else if purpose == .preserveCurrent, let preservedIdentity,
+                      let preservedSessionID = preservedIdentity.resumeTargetID {
+                // The refreshed catalog omitted the selected conversation (or
+                // only its runtime alias). Resume the captured identity
+                // directly with the alias set captured BEFORE the replacement,
+                // so stream events addressed to a forgotten runtime alias stay
+                // associated with this reconciliation instead of leaking into
+                // or being erased by the transcript replacement.
+                let succeeded = await reconcile(
+                    sessionId: preservedSessionID,
+                    using: client,
+                    token: token,
+                    acceptedSessionIDs: preservedIdentity.acceptedSessionIDs,
+                    conversationIdentity: preservedIdentity,
+                    automaticWorkToken: automaticWorkToken,
+                    automaticSyncOperationID: automaticOperationID,
+                    requiredViewportTransitionGeneration: requiredViewportTransitionGeneration,
+                    historySourceUnavailable: historySourceUnavailable
+                )
+                return succeeded ? .completed : chatResumeSyncInterruptionOutcome(for: automaticWorkToken)
             } else {
                 await createAndReconcileSession(
                     using: client,
@@ -2149,13 +4080,13 @@ final class AppState: ObservableObject {
                 return chatResumeSyncInterruptionOutcome(for: automaticWorkToken)
             }
             turnState = .reconnecting
-            errorMessage = "Failed to load gateway sessions: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Failed to load gateway sessions: \(error.localizedDescription)")
             settleReconciliation(
                 token,
                 automaticSyncOperationID: automaticOperationID
             )
             if purpose == .automaticReturn {
-                scheduleReconnect(purpose: purpose)
+                scheduleReconnectAfterFailedSync()
             }
             return .completed
         }
@@ -2341,9 +4272,13 @@ final class AppState: ObservableObject {
         using client: HermesClient,
         token: UUID,
         acceptedSessionIDs: Set<String> = [],
+        conversationIdentity: ConversationIdentity? = nil,
         automaticWorkToken: ChatResumeAutomaticWorkToken? = nil,
         automaticSyncOperationID: UUID? = nil,
-        requiredViewportTransitionGeneration: UInt64? = nil
+        requiredViewportTransitionGeneration: UInt64? = nil,
+        historySourceUnavailable: Bool = false,
+        presentationMigrationSessionIDs: Set<String> = [],
+        conversationProfile: String? = nil
     ) async -> Bool {
         guard automaticChatResumeWorkIsCurrent(
             automaticWorkToken,
@@ -2351,6 +4286,11 @@ final class AppState: ObservableObject {
         ), chatViewportTransitionIsCurrent(requiredViewportTransitionGeneration) else {
             return false
         }
+        // Canonical Bot Chats live in the bot's profile: every re-entry path
+        // (explicit open, reconnect, refresh, preserve-current sync) resolves
+        // the resume scope through the in-memory registry, so a re-resume can
+        // never land on the dashboard profile and lose the session.
+        let conversationScopeProfile = conversationProfile ?? botConversationProfile(for: sessionId)
         let priorReconciliation = reconciliation?.token == token ? reconciliation : nil
         let bufferedEvents = priorReconciliation?.bufferedEvents ?? []
         reconciliation = Reconciliation(
@@ -2362,6 +4302,14 @@ final class AppState: ObservableObject {
             streamSessionIDAtBoundary: priorReconciliation?.streamSessionIDAtBoundary,
             bufferedEvents: bufferedEvents
         )
+        // Any previously held durable anchors belong to a different reconcile
+        // transaction; they are re-adopted below only from a transcript this
+        // reconcile actually validated and accepted. A rejected identity
+        // restores them — the rejection must not consume ordering evidence.
+        let savedDurablePersistedRowIDs = durablePersistedRowIDs
+        durablePersistedRowIDs = []
+        reconciliationWasIdentityRejected = false
+        reconciliationSessionWasNotFound = false
         refreshActiveChatScrollSessionIdentity(isReconciling: true)
         turnState = .synchronizing
         let profile = activeProfile
@@ -2369,25 +4317,112 @@ final class AppState: ObservableObject {
         // local-write position before launching either request so a response
         // from the older snapshot cannot clear the newer override.
         let yoloWriteBaseline = sessionYoloWriteBaseline(for: sessionId)
+        var resumeRPCFailedSessionNotFound = false
 
         do {
             // Match Hermes Desktop: fetch the durable transcript and resume the
-            // live runtime concurrently. `session.resume` intentionally uses a
-            // compact projection which omits persisted timestamps, while the
-            // HTTP endpoint reads the timestamped rows from state.db.
+            // live runtime concurrently. The compact resume (`omit_messages`)
+            // keeps the whole persisted transcript out of the WebSocket
+            // response; the HTTP endpoint reads the timestamped rows from
+            // state.db and hydrates the conversation instead.
             let bridge = dashboardTicketBridge
-            async let resumedSession = openChatResumeSession(
-                sessionId,
-                using: client
-            )
-            async let persistedTranscript = dashboardSessionTranscript(
-                sessionId: sessionId,
-                profile: profile,
-                using: bridge
-            )
-
-            let result = try await resumedSession
-            let transcript = await persistedTranscript
+            // Prefer the compact projection whenever a history source exists
+            // to hydrate the transcript — the dashboard bridge, or a test seam
+            // standing in for one. A cold bridge does not change the flavor:
+            // requestJSON's bounded readiness poll (30 × 100 ms) waits for the
+            // page inside the concurrent transcript fetch, so the compact
+            // resume is never delayed by that wait, and a bridge still not
+            // usable afterwards degrades to the single legacy resume. The
+            // legacy resume — cold bridge, gateway without the history route —
+            // carries the transcript in the RPC response, whose size is
+            // bounded by the socket limit (the pre-compact behavior).
+            //
+            // A caller that POSITIVELY established structural history
+            // absence moments ago (the foreground freshness path) skips the
+            // compact attempt entirely: a compact resume here would be
+            // followed by a doomed history request and a second legacy
+            // resume — one non-compact resume does the whole job.
+            let compactResume = !historySourceUnavailable
+                && (chatResumeLifecycleOperations.persistedTranscript != nil || bridge != nil)
+            var result: SessionResumeResult
+            var transcript: PersistedSessionTranscript?
+            if compactResume {
+                async let resumedSession = openChatResumeSession(
+                    sessionId,
+                    using: client,
+                    compact: true,
+                    profile: conversationScopeProfile
+                )
+                async let transcriptOutcome = persistedTranscriptOutcome(
+                    sessionId: sessionId,
+                    profile: conversationScopeProfile ?? profile,
+                    using: bridge
+                )
+                do {
+                    result = try await resumedSession
+                } catch {
+                    resumeRPCFailedSessionNotFound = (error as? RpcError)?.code == 4007
+                    throw error
+                }
+                switch await transcriptOutcome {
+                case .hydrated(let persisted):
+                    // The endpoint may resolve a runtime ID to its stored
+                    // session ID; only rows belonging to this session may
+                    // hydrate the transcript. A foreign identity means the
+                    // history source is unusable for this resume — request
+                    // the transcript through the resume RPC instead.
+                    if transcriptMatchesSession(
+                        persisted,
+                        requestedSessionId: sessionId,
+                        resumedSessionId: result.sessionId
+                    ) {
+                        transcript = persisted
+                    } else {
+                        do {
+                            result = try await openChatResumeSession(
+                                sessionId,
+                                using: client,
+                                compact: false,
+                                profile: conversationScopeProfile
+                            )
+                        } catch {
+                            resumeRPCFailedSessionNotFound = (error as? RpcError)?.code == 4007
+                            throw error
+                        }
+                    }
+                case .unavailable:
+                    // No usable history source (missing bridge, or a gateway
+                    // predating the messages endpoint): re-resume carrying
+                    // the transcript, exactly as pre-compact builds did.
+                    do {
+                        result = try await openChatResumeSession(
+                            sessionId,
+                            using: client,
+                            compact: false,
+                            profile: conversationScopeProfile
+                        )
+                    } catch {
+                        resumeRPCFailedSessionNotFound = (error as? RpcError)?.code == 4007
+                        throw error
+                    }
+                case .failed(let error):
+                    // An unrelated history failure must not be papered over by
+                    // a legacy resume that would hide it: surface it instead.
+                    throw error
+                }
+            } else {
+                do {
+                    result = try await openChatResumeSession(
+                        sessionId,
+                        using: client,
+                        compact: false,
+                        profile: conversationScopeProfile
+                    )
+                } catch {
+                    resumeRPCFailedSessionNotFound = (error as? RpcError)?.code == 4007
+                    throw error
+                }
+            }
             guard automaticChatResumeWorkIsCurrent(
                     automaticWorkToken,
                     syncOperationID: automaticSyncOperationID
@@ -2402,9 +4437,138 @@ final class AppState: ObservableObject {
                 return false
             }
 
+            // Admission gate: validate what the resume response claims about
+            // this conversation BEFORE adopting anything. A rejected claim
+            // must not be adopted into conversation-owned state: no
+            // `activeSessionId`, selected conversation identity, transcript,
+            // scroll canonical identity, conversation persistence key,
+            // composer ownership, presentation cache, or resume-store
+            // selected identity may change. The refreshed session catalog is
+            // independent discovery state and is NOT rolled back on
+            // rejection.
+            let referenceIdentity = conversationIdentity ?? ConversationIdentity(
+                profile: profile,
+                durableSessionID: nil,
+                runtimeSessionID: reconciliation?.requestedSessionId,
+                acceptedSessionIDs: acceptedSessionIDs.union([sessionId])
+            )
+            let claim = ResumeIdentityClaim(
+                runtimeSessionID: result.sessionId,
+                durableSessionID: result.storedSessionId
+            )
             var context = reconciliation
-            context?.resolvedSessionId = result.sessionId
-            context?.acceptedSessionIDs.insert(result.sessionId)
+            switch ConversationIdentityGate.admit(
+                claim: claim,
+                selected: referenceIdentity,
+                catalog: sessions + cronSessions
+            ) {
+            case .failure(let rejection):
+                sessionCatalogLog.fault(
+                    "Rejected contradictory resume: \(String(describing: rejection), privacy: .public); requested=\(sessionId, privacy: .public), returned=\(result.sessionId, privacy: .public)"
+                )
+                // Restore the ordering evidence the reconcile entry cleared:
+                // ordering evidence is conversation-owned state, so a
+                // rejection may not consume it. (The already-published
+                // catalog refresh stays — discovery state is independent of
+                // the rejected claim.)
+                durablePersistedRowIDs = savedDurablePersistedRowIDs
+                reconciliationWasIdentityRejected = true
+                // Unstick the synchronizing wait without clobbering a live
+                // running turn; the transcript and identity above are left
+                // exactly as they were.
+                if turnState == .synchronizing {
+                    turnState = .idle
+                }
+                errorMessage = AppLocalization.string("Hermes returned a different conversation while resuming this one. Try reopening it.")
+                settleReconciliation(token, automaticSyncOperationID: automaticSyncOperationID)
+                chatResumeCoordinator.abandonPendingAutomaticSync()
+                return false
+            case .success:
+                context?.resolvedSessionId = result.sessionId
+                context?.acceptedSessionIDs.insert(result.sessionId)
+                // A response that explicitly names the durable identity may
+                // ESTABLISH it for a runtime-only conversation (the same
+                // adoption the create path performs) or confirm the selected
+                // one. It never overwrites a different established durable
+                // id — confirmed-alias claims keep the existing binding.
+                if let established = result.storedSessionId, !established.isEmpty,
+                   referenceIdentity.durableSessionID == nil
+                    || referenceIdentity.durableSessionID == established {
+                    context?.resolvedDurableSessionId = established
+                }
+                // Commit the admitted result as FRESH AUTHORITATIVE evidence
+                // in the shared identity index: the app just accepted this
+                // resume into conversation-owned state, so the index must
+                // agree — a historical conflicting mapping for the same
+                // runtime id is rebound here, never kept (split-brain is
+                // unacceptable between the selected conversation and the
+                // index).
+                //
+                // Durable candidates in priority order: an explicitly
+                // established stored id from the response, the selected
+                // conversation's established durable id, and finally the
+                // RESUME TARGET itself — the request was addressed by that
+                // stored id, so it is the durable the app is acting on (for
+                // a runtime-addressed resume the mapping degenerates to a
+                // self-mapping, which the index skips as information-free).
+                let requestedDurableCandidate: String? = sessionId
+                let admittedDurable = context?.resolvedDurableSessionId
+                    ?? referenceIdentity.durableSessionID
+                    ?? requestedDurableCandidate
+                if let admittedDurable, !admittedDurable.isEmpty {
+                    for admittedRuntimeID in [result.sessionId, sessionId] {
+                        conversationIdentityIndex.recordAuthoritative(
+                            runtimeID: admittedRuntimeID,
+                            durableID: admittedDurable,
+                            // A canonical Bot Chat is indexed under the BOT's
+                            // profile: it must never satisfy an identity
+                            // lookup made for a dashboard-profile
+                            // conversation.
+                            profile: conversationScopeProfile ?? profile,
+                            source: .resume
+                        )
+                    }
+                    // Keep the bot-chat resume scope reachable for every
+                    // later re-resume of this conversation (reconnects,
+                    // refreshes) — in-memory only, never a durable pointer.
+                    if let conversationScopeProfile {
+                        noteBotChatSession(result.sessionId, profile: conversationScopeProfile)
+                        noteBotChatSession(sessionId, profile: conversationScopeProfile)
+                        noteBotChatSession(result.storedSessionId, profile: conversationScopeProfile)
+                    }
+                    // Durable-owned presentation: the durable key is the
+                    // only persistent presentation key for this
+                    // conversation. Runtime-keyed records migrate into it
+                    // now, and the alias keys are retired so a later
+                    // re-attribution of a runtime id to a different
+                    // conversation can never inherit this presentation.
+                    // `presentationMigrationSessionIDs` are notification
+                    // presentation sources — untrusted as identity, so they
+                    // were never added to the accepted set; now that
+                    // admission HAS succeeded they are legitimate migration
+                    // sources for the pending decision cards they carried.
+                    let runtimeAliases = acceptedSessionIDs
+                        .union([result.sessionId, sessionId])
+                        .union(presentationMigrationSessionIDs)
+                        .subtracting([admittedDurable])
+                    sessionPresentationCache.consolidateUnderDurableKey(
+                        // The conversation's own namespace: a bot chat's
+                        // presentation survives dashboard-profile switches.
+                        profile: conversationScopeProfile ?? profile,
+                        durableSessionID: admittedDurable,
+                        runtimeAliases: Array(runtimeAliases)
+                    )
+                }
+                // A live voice turn captured the pre-rebind runtime; the
+                // admitted alias keeps its assistant stream flowing — but
+                // only when the reconciled conversation IS the voice turn's
+                // conversation (positive id overlap), never another one.
+                voiceConversationController.extendAssistantSessionIDs(
+                    [result.sessionId],
+                    ofConversationContaining: referenceIdentity.acceptedSessionIDs
+                        .union([sessionId])
+                )
+            }
             reconciliation = context
             refreshActiveChatScrollSessionIdentity(isReconciling: true)
 
@@ -2419,28 +4583,125 @@ final class AppState: ObservableObject {
                     resumedSessionId: result.sessionId
                 )
             } ?? false
+            // Adopt the durable row ids ONLY from a transcript this reconcile
+            // validated and accepted; they anchor the ambiguous-delivery
+            // verifier's ordering evidence for this conversation. The
+            // persisted ORDERING frontier is re-established from the same
+            // acceptance — never carried over from a previous conversation
+            // state.
+            durablePersistedRowIDs = (transcriptMatches ? transcript?.durableRowIDs : nil) ?? []
+            persistedOrderingFrontier = Self.orderingFrontier(
+                from: transcriptMatches ? transcript : nil
+            )
+
+            // Capture the pre-reconcile transcript and window for the graft
+            // decision below before either is replaced. The window write
+            // itself happens after the graft: whether the refreshed tail
+            // grafted onto the backfilled prefix determines whether the
+            // prefix-preservation fact survives into the refreshed window.
+            let previousTranscriptMessages = messages
+            let priorWindow = persistedTranscriptWindow
             if let transcript, transcriptMatches, result.snapshot.hasLiveProjection, !transcript.messages.isEmpty {
                 // Desktop keeps its live projection during an active turn. Seed
                 // the same durable presentation details first so the completed
                 // portion of a backgrounded turn does not lose its timestamps.
+                // Durable-owned: writes land on the durable key only, so the
+                // alias keys consolidation just retired stay retired.
+                let presentationDurableID = context?.resolvedDurableSessionId
+                    ?? referenceIdentity.durableSessionID
+                    ?? sessionId
                 sessionPresentationCache.save(
                     transcript.messages,
-                    profile: profile,
-                    sessionIDs: [sessionId, result.sessionId, transcript.resolvedSessionId].compactMap { $0 }
+                    profile: conversationScopeProfile ?? profile,
+                    sessionIDs: Self.durableOwnedPresentationIDs(
+                        [sessionId, result.sessionId, transcript.resolvedSessionId].compactMap { $0 },
+                        durableSessionID: presentationDurableID
+                    )
                 )
             }
-            let shouldUsePersistedTranscript = !result.snapshot.hasLiveProjection
-                && transcriptMatches
-                && (transcript.map { !$0.messages.isEmpty || result.messages.isEmpty } ?? false)
+            // A compact resume ships no persisted transcript, so the REST rows
+            // are the durable base even while a turn is live: the in-flight
+            // projection rides on top through the streaming bubble, matching
+            // Desktop's cache-as-base rendering. A resume that carried
+            // messages keeps the historical precedence where a live projection
+            // wins over the REST read.
+            let resumeCarriedTranscript = !result.messages.isEmpty
+            let shouldUsePersistedTranscript = transcriptMatches
+                && (transcript.map { !$0.messages.isEmpty || !resumeCarriedTranscript } ?? false)
+                && (!result.snapshot.hasLiveProjection || !resumeCarriedTranscript)
+            let priorWindowForGraft = priorWindowOwnsThisConversation(
+                priorWindow,
+                requestedSessionId: sessionId,
+                resolvedSessionId: transcript?.resolvedSessionId,
+                runtimeSessionId: result.sessionId,
+                profile: conversationScopeProfile ?? profile
+            ) ? priorWindow : nil
             let presentationResult: SessionResumeResult
+            var graftedBackfilledPrefix = false
             if let transcript, shouldUsePersistedTranscript {
+                // A re-reconciliation replaces only the newest page. Keep
+                // everything "Load earlier messages" already backfilled by
+                // re-anchoring the refreshed tail onto the older prefix;
+                // without this, any reconnect during a browsed long session
+                // would silently truncate the visible history back to one
+                // page. The graft must survive REPEATED reconciles — the
+                // explicit hasBackfilledPrefix flag carries that fact, since
+                // the network coverage reset below erases the offset
+                // evidence after the first one.
+                let grafted = PersistedTranscriptWindow.grafting(
+                    refreshedTail: transcript.messages,
+                    ontoBackfilled: previousTranscriptMessages,
+                    window: priorWindowForGraft
+                )
                 presentationResult = SessionResumeResult(
                     sessionId: result.sessionId,
-                    messages: transcript.messages,
+                    storedSessionId: result.storedSessionId,
+                    messages: grafted.messages,
                     snapshot: result.snapshot
                 )
+                graftedBackfilledPrefix = grafted.grafted
             } else {
                 presentationResult = result
+            }
+
+            // Persisted-history window bookkeeping. The window describes the
+            // REST-fetched display history only — runtime state above is
+            // untouched. A pagination echo carrying the `order=latest` tail
+            // contract opens the bounded window; a legacy one-shot hydration
+            // (or a hydration that failed the session-identity gate) leaves
+            // no window, because no older page exists to fetch. A graft that
+            // kept the backfilled prefix preserves that fact; a refreshed
+            // tail with no safe anchor is authoritative and resets it.
+            //
+            // The refresh resets coverage to the fetched page even when the
+            // graft kept older rows. The next backfills then retrace
+            // the backfilled prefix in page-sized increments, each deduped
+            // against held rows, until coverage catches up — harmless
+            // duplicate requests that self-correct, never gaps. Under-
+            // counting is the safe direction: trusting the prior coverage
+            // after a server-side rewrite could silently skip rows. A
+            // conversation that was already fully backfilled re-lights the
+            // affordance once and re-retires on its first terminal page.
+            if let transcript, transcriptMatches, let page = transcript.page,
+               page.honorsTailContract {
+                // The window records EVERY identity the accepted
+                // transaction produced — requested, resolved stored, and
+                // runtime — so ownership stays self-contained even before
+                // the session catalog learns the runtime↔stored alias.
+                // The profile stamp is the conversation's own scope: a bot
+                // chat's older pages must be fetched from the BOT's store.
+                persistedTranscriptWindow = PersistedTranscriptWindowState(
+                    requestedSessionID: sessionId,
+                    profile: conversationScopeProfile ?? profile,
+                    pageSize: PersistedTranscriptPagination.pageSize,
+                    resolvedSessionID: transcript.resolvedSessionId,
+                    runtimeSessionID: result.sessionId,
+                    nextOffset: page.rawReturned,
+                    canLoadEarlier: page.mayHaveOlderRows(fetchedRowCount: page.rawReturned),
+                    hasBackfilledPrefix: graftedBackfilledPrefix
+                )
+            } else {
+                persistedTranscriptWindow = nil
             }
 
             let resumeSessionIDs = [result.sessionId, reconciliation?.requestedSessionId]
@@ -2449,7 +4710,6 @@ final class AppState: ObservableObject {
                 since: yoloWriteBaseline,
                 sessionIDs: resumeSessionIDs
             )
-
             guard applyChatResume(
                 presentationResult,
                 automaticWorkToken: automaticWorkToken,
@@ -2458,6 +4718,7 @@ final class AppState: ObservableObject {
                 settleReconciliation(token, automaticSyncOperationID: automaticSyncOperationID)
                 return false
             }
+            schedulePendingApprovalsRefresh(sessionId: result.sessionId, using: client)
             await refreshChatResumeContext(sessionId: result.sessionId, using: client)
 
             guard automaticChatResumeWorkIsCurrent(
@@ -2484,18 +4745,18 @@ final class AppState: ObservableObject {
                 let acceptedSessionIDs: Set<String>
                 if let boundary,
                    let boundarySessionID = boundary.streamSessionIDAtBoundary {
-                    // Do not infer that a newly returned runtime ID belongs
-                    // to this boundary solely because the resume RPC returned
-                    // it. Keep only IDs already accepted for the boundary and
-                    // known as aliases of that catalog session; an empty
-                    // result intentionally disables deduplication rather than
-                    // risking text from a different session.
-                    acceptedSessionIDs = boundary.acceptedSessionIDs.intersection(
-                        knownSessionIDs(for: boundarySessionID)
-                    )
+                    // The boundary's accepted set was captured from the
+                    // catalog and scroll identity BEFORE recovery replaced
+                    // them, so it survives a refresh that temporarily forgot
+                    // the runtime alias. Do NOT re-derive it from the
+                    // replaced catalog: that would drop exactly the alias the
+                    // resume window needs. An empty set intentionally
+                    // disables deduplication rather than risking text from a
+                    // different session.
+                    acceptedSessionIDs = boundary.acceptedSessionIDs
                     if !acceptedSessionIDs.contains(result.sessionId) {
                         sessionCatalogLog.debug(
-                            "Skipping buffered delta dedup because resumed session \(result.sessionId, privacy: .public) is not a catalog-confirmed alias of the reconciliation boundary"
+                            "Skipping buffered delta dedup because resumed session \(result.sessionId, privacy: .public) is not a boundary-confirmed alias (boundary=\(boundarySessionID, privacy: .public))"
                         )
                     }
                 } else {
@@ -2591,7 +4852,18 @@ final class AppState: ObservableObject {
                 return false
             }
             turnState = .reconnecting
-            errorMessage = "Failed to restore this conversation: \(error.localizedDescription)"
+            reconciliationSessionWasNotFound = resumeRPCFailedSessionNotFound
+            switch error {
+            case is LegacyTranscriptOversizedError, DashboardTicketBridgeError.oversizedResponse:
+                // Oversized history responses carry their own user-facing
+                // copy: the legacy compatibility message for an old backend
+                // attempting the whole transcript, neutral copy for a
+                // bounded current-Hermes page with one enormous row (which
+                // must not claim the backend lacks pagination).
+                errorMessage = error.localizedDescription
+            default:
+                errorMessage = AppLocalization.string("Failed to restore this conversation: \(error.localizedDescription)")
+            }
             settleReconciliation(token, automaticSyncOperationID: automaticSyncOperationID)
             chatResumeCoordinator.abandonPendingAutomaticSync()
             return false
@@ -2600,12 +4872,20 @@ final class AppState: ObservableObject {
 
     private func openChatResumeSession(
         _ sessionID: String,
-        using client: HermesClient
+        using client: HermesClient,
+        compact: Bool,
+        profile: String? = nil
     ) async throws -> SessionResumeResult {
-        if let openSession = chatResumeLifecycleOperations.openSession {
-            return try await openSession(client, sessionID)
+        if let openSessionWithProfile = chatResumeLifecycleOperations.openSessionWithProfile {
+            return try await openSessionWithProfile(client, sessionID, compact, profile)
         }
-        return try await client.openSession(sessionID)
+        if let openSession = chatResumeLifecycleOperations.openSession {
+            return try await openSession(client, sessionID, compact)
+        }
+        if compact {
+            return try await client.openSession(sessionID, profile: profile)
+        }
+        return try await client.openSessionLegacy(sessionID, profile: profile)
     }
 
     private func refreshChatResumeContext(
@@ -2616,6 +4896,139 @@ final class AppState: ObservableObject {
             await refreshContext(client, sessionId)
         } else {
             await refreshContextUsage(sessionId: sessionId, using: client)
+        }
+    }
+
+    /// Best-effort recovery for approvals queued behind the single oldest
+    /// `pending_approval` carried by `session.resume`. The read is deliberately
+    /// detached from the foreground restore path and additive: an absent row
+    /// is not expiry evidence, and a replay must not unlock a local submission
+    /// or terminal decision.
+    @discardableResult
+    func schedulePendingApprovalsRefresh(
+        sessionId: String,
+        using client: HermesClient,
+        replacingLegacyErrorMessageID: String? = nil
+    ) -> Task<Void, Never> {
+        pendingApprovalsRequestGeneration &+= 1
+        let generation = pendingApprovalsRequestGeneration
+        let profile = presentationProfile(for: sessionId)
+        let viewportGeneration = chatViewportTransitionGeneration
+        let reconciliationGeneration = reconciliationToken
+        let acceptedSessionIDs = activeChatScrollSessionIdentity.equivalentSessionIDs
+            .union([sessionId])
+
+        // Snapshot every locally-known identified pending/submitting request
+        // ID *before* the RPC starts.  After the response returns only IDs
+        // present in this snapshot are eligible for retirement — approvals
+        // that arrived via stream events while the RPC was in flight are
+        // invisible to the snapshot and therefore safe from spurious deletion.
+        let identifiedRequestIDsKnownAtRequestStart: Set<String> = Set(
+            messages.compactMap { message in
+                guard let approval = message.approval,
+                      acceptedSessionIDs.contains(approval.sessionId),
+                      let reqId = approval.requestId,
+                      SessionPresentationCache.isPendingDecision(approval.status) else {
+                    return nil
+                }
+                return reqId
+            }
+        )
+
+        return Task { @MainActor [weak self] in
+            let approvals: [ApprovalActivity]
+            do {
+                if let pendingApprovalsWithProfile = self?.chatResumeLifecycleOperations.pendingApprovalsWithProfile {
+                    approvals = try await pendingApprovalsWithProfile(client, sessionId, profile)
+                } else if let pendingApprovals = self?.chatResumeLifecycleOperations.pendingApprovals {
+                    approvals = try await pendingApprovals(client, sessionId)
+                } else {
+                    approvals = try await client.pendingApprovals(sessionId: sessionId, profile: profile)
+                }
+            } catch {
+                // Older gateways do not expose approval.pending, and this
+                // optional recovery read may also time out. Neither is
+                // evidence that an already-present card was resolved.
+                return
+            }
+            guard let self,
+                  generation == self.pendingApprovalsRequestGeneration,
+                  profile == self.presentationProfile(for: sessionId),
+                  self.client === client,
+                  viewportGeneration == self.chatViewportTransitionGeneration,
+                  reconciliationGeneration == self.reconciliationToken,
+                  !acceptedSessionIDs.isDisjoint(
+                    with: self.activeChatScrollSessionIdentity.equivalentSessionIDs
+                  ) else { return }
+
+            let acceptedApprovals = approvals.filter {
+                acceptedSessionIDs.contains($0.sessionId)
+            }
+            let returnedIdentifiedRequestIDs = Set(acceptedApprovals.compactMap { $0.requestId })
+            let cacheSessionIDs = self.presentationCacheSessionIDs(for: sessionId)
+
+            if let replacingLegacyErrorMessageID {
+                let identifiedApprovals = acceptedApprovals.filter { $0.requestId != nil }
+                if !identifiedApprovals.isEmpty {
+                    self.messages.removeAll { $0.id == replacingLegacyErrorMessageID }
+                }
+                // Started only after the legacy response settled: these
+                // identified rows are fresh gateway truth and can replace the
+                // ambiguous legacy card without guessing by text or position.
+                for approval in identifiedApprovals {
+                    self.applyApprovalActivity(approval, authoritative: true)
+                }
+            } else {
+                // A successful approval.pending read provides the authoritative
+                // unresolved identified queue. Retire any local identified
+                // pending/submitting cards that are absent from the returned
+                // queue, provided they are not actively executing an in-process
+                // submission RPC right now on this device.
+                var retiredRequestIDs = Set<String>()
+                self.messages.removeAll { message in
+                    guard let existing = message.approval,
+                          acceptedSessionIDs.contains(existing.sessionId),
+                          let reqId = existing.requestId,
+                          SessionPresentationCache.isPendingDecision(existing.status) else {
+                        return false
+                    }
+                    // Only IDs that existed locally before the RPC started are
+                    // eligible — anything that arrived via a stream event while
+                    // the RPC was in flight must survive.
+                    guard identifiedRequestIDsKnownAtRequestStart.contains(reqId) else {
+                        return false
+                    }
+                    if self.hasLiveApprovalSubmission(for: existing, equivalentSessionIDs: acceptedSessionIDs) {
+                        return false
+                    }
+                    if !returnedIdentifiedRequestIDs.contains(reqId) {
+                        retiredRequestIDs.insert(reqId)
+                        return true
+                    }
+                    return false
+                }
+                for reqId in retiredRequestIDs {
+                    self.sessionPresentationCache.removePendingDecision(
+                        key: "approval-request:\(reqId)",
+                        profile: profile,
+                        sessionIDs: cacheSessionIDs
+                    )
+                }
+
+                for approval in acceptedApprovals {
+                    if approval.requestId != nil {
+                        // Identified approvals are authoritatively reconciled
+                        // against the gateway's complete pending queue.
+                        self.applyApprovalActivity(approval, authoritative: true)
+                    } else {
+                        // Legacy approvals are session-scoped and FIFO; do not
+                        // destructively overwrite legacy active cards with an
+                        // authoritative replay.
+                        self.applyApprovalActivity(approval, authoritative: false)
+                    }
+                }
+            }
+            self.cacheMessagePresentation()
         }
     }
 
@@ -2655,7 +5068,7 @@ final class AppState: ObservableObject {
             if let returnedProfile = created.profile,
                !profilesMatch(returnedProfile, profile) {
                 turnState = .idle
-                errorMessage = "Hermes created this conversation in \(profileDisplayName(returnedProfile)), not \(profileDisplayName(profile)). It was not opened."
+                errorMessage = AppLocalization.string("Hermes created this conversation in \(profileDisplayName(returnedProfile)), not \(profileDisplayName(profile)). It was not opened.")
                 settleReconciliation(token, automaticSyncOperationID: automaticSyncOperationID)
                 chatResumeCoordinator.abandonPendingAutomaticSync()
                 await loadSessions(forceRefresh: true)
@@ -2664,7 +5077,7 @@ final class AppState: ObservableObject {
             let runtimeSessionID = created.sessionId.isEmpty ? (created.storedSessionId ?? "") : created.sessionId
             guard !runtimeSessionID.isEmpty else {
                 turnState = .idle
-                errorMessage = "Hermes created a conversation without a session ID."
+                errorMessage = AppLocalization.string("Hermes created a conversation without a session ID.")
                 settleReconciliation(token, automaticSyncOperationID: automaticSyncOperationID)
                 chatResumeCoordinator.abandonPendingAutomaticSync()
                 return
@@ -2675,13 +5088,14 @@ final class AppState: ObservableObject {
             // available immediately, so resuming here races the persistence
             // layer and leaves the composer stuck synchronizing.
             markChatViewportReplacement()
-            setActiveSessionState(id: runtimeSessionID, title: "New conversation")
+            setActiveSessionState(id: runtimeSessionID, title: AppLocalization.string("New conversation"))
             messages = []
+            persistedTranscriptWindow = nil
+            resetTranscriptLifecycleEvidence()
             noteChatViewportTranscriptReplacement()
             clearStreamingText()
             activeAssistantMessageId = nil
-            activeReasoningMessageId = nil
-            receivedReasoningForCurrentTurn = false
+            resetReasoningTurn()
             turnState = .idle
             errorMessage = nil
             // A fresh conversation has no per-session override and no
@@ -2701,6 +5115,21 @@ final class AppState: ObservableObject {
             }
 
             let storedID = created.storedSessionId ?? runtimeSessionID
+            // The create response's runtime/stored semantics are verified
+            // here (the summary is built from the same response), so the
+            // pair is fresh authoritative evidence: the created conversation
+            // is being adopted into the catalog below, and the index must
+            // agree rather than keep any historical mapping for the runtime.
+            if let runtime = ChatScrollIdentityNormalization.sessionID(runtimeSessionID),
+               let durable = ChatScrollIdentityNormalization.sessionID(storedID),
+               runtime != durable {
+                conversationIdentityIndex.recordAuthoritative(
+                    runtimeID: runtime,
+                    durableID: durable,
+                    profile: activeProfile,
+                    source: .create
+                )
+            }
             let summary = SessionSummary(
                 id: storedID,
                 alternateIds: [runtimeSessionID, created.storedSessionId]
@@ -2708,7 +5137,7 @@ final class AppState: ObservableObject {
                     .filter { $0 != storedID },
                 title: activeSessionTitle,
                 model: runtime.model.isEmpty ? "Hermes" : runtime.model,
-                updatedLabel: "now",
+                updatedLabel: AppLocalization.string("now"),
                 profile: activeProfile,
                 source: .chat,
                 isActive: true,
@@ -2756,11 +5185,11 @@ final class AppState: ObservableObject {
                 return
             }
             turnState = .idle
-            errorMessage = "Failed to create session: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Failed to create session: \(error.localizedDescription)")
             settleReconciliation(token, automaticSyncOperationID: automaticSyncOperationID)
             chatResumeCoordinator.abandonPendingAutomaticSync()
             if resumePurpose == .automaticReturn {
-                scheduleReconnect(purpose: resumePurpose)
+                scheduleReconnectAfterFailedSync()
             }
         }
     }
@@ -2777,11 +5206,23 @@ final class AppState: ObservableObject {
         ) else { return false }
         let retainedRestoredMessages = pendingDecisionRestorationMessages(for: result.sessionId)
         markChatViewportReplacement()
-        setActiveSessionState(id: result.sessionId, title: "New conversation")
-        updateActiveSessionTitle(
-            for: result.sessionId,
-            fallbackSessionId: reconciliation?.requestedSessionId
+        // A canonical Bot Chat keeps the title the open just applied (the
+        // bot's display label) and never enters the dashboard's cold-restore
+        // selection: the ordinary create-adoption defaults apply only to
+        // dashboard-profile conversations.
+        let isBotConversation = botConversationProfile(for: result.sessionId) != nil
+        setActiveSessionState(
+            id: result.sessionId,
+            title: isBotConversation ? nil : AppLocalization.string("New conversation"),
+            recordsResumeSelection: !isBotConversation
         )
+        if !isBotConversation {
+            persistAdmittedDurableSessionIdentity(from: result)
+            updateActiveSessionTitle(
+                for: result.sessionId,
+                fallbackSessionId: reconciliation?.requestedSessionId
+            )
+        }
         // Pending clarifications and approvals are user-actionable decision
         // events, not merely projections of the gateway's current turn state.
         // Hermes can omit a one-shot decision event from a resume, and
@@ -2801,27 +5242,84 @@ final class AppState: ObservableObject {
         }
         let restored = sessionPresentationCache.merge(
             result.messages + retainedMessages,
-            profile: activeProfile,
+            profile: presentationProfile(for: result.sessionId),
             sessionIDs: sessionIDs,
             includePendingClarifications: restorePendingDecisionCards,
-            includePendingApprovals: restorePendingDecisionCards
+            includePendingApprovals: restorePendingDecisionCards,
+            includePendingTools: result.snapshot.running != false
         )
         messages = mergeCachedReviews(into: restored, sessionId: result.sessionId)
+        if result.snapshot.running == false {
+            sessionPresentationCache.removePendingTools(
+                profile: presentationProfile(for: result.sessionId),
+                sessionIDs: presentationCacheSessionIDs(for: result.sessionId)
+            )
+        }
+        // The gateway's authoritative pending clarification restores the
+        // answerable card even when the one-shot clarify.request fired while
+        // this device was detached; answers locked before the detach come
+        // back keyed by qid and stay locked. Keyed by request_id, so a resume
+        // refresh updates an existing card instead of duplicating it.
+        if let pendingClarify = result.snapshot.pendingClarify {
+            applyClarifyActivity(pendingClarify, source: .authoritativeSnapshot)
+        }
+        let authoritativePendingApproval = result.snapshot.pendingApprovalPayload.flatMap {
+            MessageNormalizer.approvalActivity(from: $0, sessionId: result.sessionId)
+        }
+        if let pendingApproval = authoritativePendingApproval {
+            applyApprovalActivity(pendingApproval, authoritative: true)
+        }
         noteChatViewportTranscriptReplacement()
-        let gatewayPendingDecisionKeys = SessionPresentationCache.pendingDecisionKeys(in: result.messages)
+        // An authoritative resume/reconcile just replaced the transcript:
+        // whatever rows a failed freshness read could not see are now either
+        // present or authoritatively absent, any optimistic-turn provenance
+        // died with the rows it pointed at, and the adopted ordering
+        // frontier covers everything persisted — no local debt can outlive
+        // it.
+        transcriptFreshnessIsStale = false
+        locallyOwnedInFlightTurn = nil
+        pendingLocalOrderingDebt = nil
+        var gatewayPendingDecisionKeys = SessionPresentationCache.pendingDecisionKeys(in: result.messages)
+        if let pendingClarify = result.snapshot.pendingClarify {
+            gatewayPendingDecisionKeys.insert("clarify:\(pendingClarify.requestId)")
+        }
+        if let pendingApproval = authoritativePendingApproval,
+           let key = SessionPresentationCache.pendingDecisionKey(for: ChatMessage(
+               id: "pending-approval-key",
+               role: .approval,
+               content: pendingApproval.description,
+               timestamp: "",
+               approval: pendingApproval
+           )) {
+            gatewayPendingDecisionKeys.insert(key)
+        }
         let restoredPendingDecisionKeys = SessionPresentationCache
             .pendingDecisionKeys(in: messages)
             .subtracting(gatewayPendingDecisionKeys)
+        let liveSubmittingApprovalKeys = Set(
+            messages.compactMap { message -> String? in
+                guard let approval = message.approval, approval.status == .submitting else { return nil }
+                let equivalentSessionIDs = activeChatScrollSessionIdentity.equivalentSessionIDs
+                    .union([approval.sessionId])
+                guard hasLiveApprovalSubmission(
+                    for: approval,
+                    equivalentSessionIDs: equivalentSessionIDs
+                ) else { return nil }
+                return SessionPresentationCache.decisionKey(for: message)
+            }
+        )
+        let resettableRestoredDecisionKeys = restoredPendingDecisionKeys
+            .subtracting(liveSubmittingApprovalKeys)
         let gatewayHasPendingDecision = !gatewayPendingDecisionKeys.isEmpty
         var restoredMessagesAwaitingConfirmation: [ChatMessage] = []
-        if result.snapshot.running != true && !restoredPendingDecisionKeys.isEmpty {
+        if result.snapshot.running != true && !resettableRestoredDecisionKeys.isEmpty {
             Self.resetSubmittingRestoredDecisions(
                 in: &messages,
-                matching: restoredPendingDecisionKeys
+                matching: resettableRestoredDecisionKeys
             )
             restoredMessagesAwaitingConfirmation = messages.filter {
                 guard let key = SessionPresentationCache.decisionKey(for: $0),
-                      restoredPendingDecisionKeys.contains(key) else {
+                      resettableRestoredDecisionKeys.contains(key) else {
                     return false
                 }
                 return SessionPresentationCache.pendingDecisionKey(for: $0) != nil
@@ -2844,22 +5342,30 @@ final class AppState: ObservableObject {
             : []
         let shouldPersistMergedPresentation = gatewayConfirmsActiveTurn
             || !unconfirmedPendingDecisionKeys.isEmpty
+        // Persisted presentation is durable-owned: once this conversation's
+        // canonical/durable id is established, alias keys are not re-created
+        // by writes (the merge lookup above stays a tolerant superset).
+        let persistedSessionIDs = Self.durableOwnedPresentationIDs(
+            sessionIDs,
+            durableSessionID: reconciliation?.resolvedDurableSessionId
+                ?? activeChatScrollSessionIdentity.canonicalSessionID
+        )
         sessionPresentationCache.save(
             shouldPersistMergedPresentation ? messages : result.messages,
-            profile: activeProfile,
-            sessionIDs: sessionIDs,
+            profile: presentationProfile(for: result.sessionId),
+            sessionIDs: persistedSessionIDs,
             preservePendingDecisionCards: gatewayConfirmsActiveTurn || !unconfirmedPendingDecisionKeys.isEmpty,
             unconfirmedPendingDecisionKeys: unconfirmedPendingDecisionKeys
         )
-        if result.snapshot.running != true && !restoredPendingDecisionKeys.isEmpty {
+        if result.snapshot.running != true && !resettableRestoredDecisionKeys.isEmpty {
             let restoredAt = sessionPresentationCache.unconfirmedPendingDecisionDate(
-                profile: activeProfile,
+                profile: presentationProfile(for: result.sessionId),
                 sessionIDs: sessionIDs
             ) ?? Date()
             restoredPendingDecisionCardsAwaitingConfirmation = PendingDecisionRestorationGuard(
-                profile: activeProfile,
+                profile: presentationProfile(for: result.sessionId),
                 sessionID: result.sessionId,
-                pendingDecisionKeys: restoredPendingDecisionKeys,
+                pendingDecisionKeys: resettableRestoredDecisionKeys,
                 restoredAt: restoredAt,
                 messages: restoredMessagesAwaitingConfirmation
             )
@@ -2878,8 +5384,7 @@ final class AppState: ObservableObject {
             streamingText = recoveredText
         }
         activeAssistantMessageId = nil
-        activeReasoningMessageId = nil
-        receivedReasoningForCurrentTurn = false
+        resetReasoningTurn()
         applyRuntime(
             result.snapshot,
             for: result.sessionId
@@ -2892,18 +5397,58 @@ final class AppState: ObservableObject {
             turnState = .running
         } else if TurnState.fromGatewayRunning(result.snapshot.running) == .unsupportedGateway {
             turnState = .unsupportedGateway
-            errorMessage = "This Hermes gateway must support session turn state. Update Hermes to enable message, stop, and steer controls."
+            errorMessage = AppLocalization.string("This Hermes gateway must support session turn state. Update Hermes to enable message, stop, and steer controls.")
             return true
         } else {
             turnState = TurnState.fromGatewayRunning(result.snapshot.running)
         }
+        // The resume snapshot is authoritative about the turn state.
+        turnLifecycleEvidence = TurnLifecycleEvidence(
+            revision: turnLifecycleEvidence.revision &+ 1,
+            running: turnState.isRunning
+        )
+        turnStateIsStale = false
         return true
+    }
+
+    /// A resume can rotate the ephemeral runtime ID after a process relaunch.
+    /// Persist the stored identity that Hermes admitted, not the runtime ID
+    /// that happens to route this process, so the next cold launch addresses
+    /// the durable conversation even before its catalog row appears.
+    private func persistAdmittedDurableSessionIdentity(from result: SessionResumeResult) {
+        guard let durableSessionID = ChatScrollIdentityNormalization.sessionID(
+            reconciliation?.resolvedDurableSessionId ?? result.storedSessionId
+        ) else {
+            return
+        }
+        let durableKey = ChatScrollSessionKey(
+            profile: activeProfile,
+            sessionID: durableSessionID
+        )
+        guard durableKey.isValid else { return }
+
+        if let runtimeSessionID = ChatScrollIdentityNormalization.sessionID(result.sessionId) {
+            let runtimeKey = ChatScrollSessionKey(
+                profile: activeProfile,
+                sessionID: runtimeSessionID
+            )
+            if runtimeKey.isValid, runtimeKey != durableKey {
+                chatResumeCoordinator.migrateSessionIdentity(from: runtimeKey, to: durableKey)
+            }
+        }
+        chatResumeCoordinator.rememberSessionID(durableKey.sessionID, for: durableKey.profile)
     }
 
     static func hasPendingDecision(in messages: [ChatMessage]) -> Bool {
         messages.contains { message in
-            let clarifyPending = message.clarify?.status == .pending || message.clarify?.status == .submitting
-            let approvalPending = message.approval?.status == .pending || message.approval?.status == .submitting
+            // A retryable `.error` question/decision is still unresolved —
+            // the card remains answerable and must not read as completed.
+            let clarifyPending = message.clarify.map {
+                SessionPresentationCache.isPendingDecision($0.status)
+            } ?? false
+            let approvalPending = message.approval.map {
+                SessionPresentationCache.isPendingDecision($0.status)
+            } ?? false
             return clarifyPending || approvalPending
         }
     }
@@ -2914,12 +5459,18 @@ final class AppState: ObservableObject {
     ) {
         for index in messages.indices {
             if var clarify = messages[index].clarify,
-               clarify.status == .submitting,
+               clarify.questions.contains(where: { $0.status == .submitting }),
                let key = SessionPresentationCache.decisionKey(for: messages[index]),
                keys.contains(key) {
-                clarify.status = .pending
-                clarify.answer = nil
-                clarify.error = nil
+                // A restored .submitting question has no knowable outcome —
+                // its RPC died with the previous process. Answered sibling
+                // questions stay locked; only the in-flight ones reset.
+                for questionIndex in clarify.questions.indices
+                where clarify.questions[questionIndex].status == .submitting {
+                    clarify.questions[questionIndex].status = .pending
+                    clarify.questions[questionIndex].answer = nil
+                    clarify.questions[questionIndex].error = nil
+                }
                 messages[index].clarify = clarify
             }
             if var approval = messages[index].approval,
@@ -3245,14 +5796,31 @@ final class AppState: ObservableObject {
         )
     }
 
-    private func sessionYoloKeys(for sessionIDs: [String]) -> Set<ChatScrollSessionKey> {
-        Set(sessionIDs.map { ChatScrollSessionKey(profile: activeProfile, sessionID: $0) })
-            .filter(\.isValid)
+    /// Derives bookkeeping keys for an explicit profile. Callers must pass
+    /// the profile that owns the state being tracked; nothing here consults
+    /// mutable activeProfile.
+    private func sessionYoloKeys(
+        profile: String,
+        sessionIDs: [String]
+    ) -> Set<ChatScrollSessionKey> {
+        var keys = Set<ChatScrollSessionKey>()
+        for id in sessionIDs {
+            let candidate = ChatScrollSessionKey(profile: profile, sessionID: id)
+            if candidate.isValid { keys.insert(candidate) }
+        }
+        return keys
+    }
+
+    /// Current-state reads legitimately consult the active profile.
+    private func sessionYoloKeysForCurrentProfile(
+        sessionIDs: [String]
+    ) -> Set<ChatScrollSessionKey> {
+        sessionYoloKeys(profile: activeProfile, sessionIDs: sessionIDs)
     }
 
     private func sessionYoloWriteBaseline(for sessionID: String) -> SessionYoloWriteBaseline {
         let sessionIDs = [sessionID, canonicalSessionID(for: sessionID)].compactMap { $0 }
-        let keys = sessionYoloKeys(for: sessionIDs)
+        let keys = sessionYoloKeysForCurrentProfile(sessionIDs: sessionIDs)
         return SessionYoloWriteBaseline(
             revisions: Dictionary(uniqueKeysWithValues: keys.map { key in
                 (key, sessionYoloWriteRevisions[key] ?? 0)
@@ -3264,30 +5832,61 @@ final class AppState: ObservableObject {
         since baseline: SessionYoloWriteBaseline,
         sessionIDs: [String]
     ) -> Bool {
-        sessionYoloKeys(for: sessionIDs).contains { key in
+        sessionYoloKeysForCurrentProfile(sessionIDs: sessionIDs).contains { key in
             sessionYoloWriteRevisions[key, default: 0] > baseline.revisions[key, default: 0]
         }
     }
 
     private func recordSessionYoloWrite(for sessionIDs: [String]) {
         sessionYoloWriteRevision &+= 1
-        for key in sessionYoloKeys(for: sessionIDs) {
+        for key in sessionYoloKeysForCurrentProfile(sessionIDs: sessionIDs) {
             sessionYoloWriteRevisions[key] = sessionYoloWriteRevision
         }
     }
 
-    private func beginSessionYoloWrite(for sessionIDs: [String]) {
-        inFlightSessionYoloWrites.formUnion(sessionYoloKeys(for: sessionIDs))
-    }
-
-    private func endSessionYoloWrite(for sessionIDs: [String]) {
-        for key in sessionYoloKeys(for: sessionIDs) {
-            inFlightSessionYoloWrites.remove(key)
+    /// In-flight ownership is registered against explicit keys so the exact
+    /// entries created at operation start are the ones cleanup removes -
+    /// even when the active profile moved on while the RPC was suspended.
+    /// The reference-counted map supports overlapping writes for the same
+    /// session: each logical operation owns an independent registration, and
+    /// cleanup only removes the key when the last reference is released.
+    private func beginSessionYoloWrite(keys: Set<ChatScrollSessionKey>) {
+        for key in keys {
+            inFlightSessionYoloWriteCounts[key, default: 0] += 1
         }
     }
 
+    private func endSessionYoloWrite(keys: Set<ChatScrollSessionKey>) {
+        for key in keys {
+            let remaining = inFlightSessionYoloWriteCounts[key, default: 0] - 1
+            if remaining > 0 {
+                inFlightSessionYoloWriteCounts[key] = remaining
+            } else {
+                inFlightSessionYoloWriteCounts.removeValue(forKey: key)
+            }
+        }
+    }
+
+#if DEBUG
+    /// Test seam: the current dashboard-switch generation, so tests can
+    /// construct genuinely-stale (never-current) generation values for the
+    /// restore/renewal fences.
+    func dashboardSwitchGenerationForTesting() -> UInt64 {
+        dashboardSwitchGeneration
+    }
+
+    /// Test-only view of pending YOLO write ownership. Each entry maps a key
+    /// to the number of active operations holding it; a non-empty dictionary
+    /// after all operations settled means the bookkeeping leaked.
+    var inFlightSessionYoloWriteCountsForTesting: [ChatScrollSessionKey: Int] {
+        inFlightSessionYoloWriteCounts
+    }
+#endif
+
     private func hasInFlightSessionYoloWrite(sessionIDs: [String]) -> Bool {
-        !sessionYoloKeys(for: sessionIDs).isDisjoint(with: inFlightSessionYoloWrites)
+        sessionYoloKeysForCurrentProfile(sessionIDs: sessionIDs).contains { key in
+            (inFlightSessionYoloWriteCounts[key] ?? 0) > 0
+        }
     }
 
     private func applyRuntime(
@@ -3407,9 +6006,28 @@ final class AppState: ObservableObject {
 
     // MARK: - Reconnect and scene lifecycle
 
+    /// Server-side compaction claims and their scheduled expiry tasks are
+    /// gateway-owned lifecycle state: deliberate teardown boundaries
+    /// (sign-out, server replacement, socket loss) invalidate them together —
+    /// a `compacted` edge may never arrive across them. Local RPC claims
+    /// (`compressingSessionIDs`) are untouched: they are bounded by their own
+    /// request timeout.
+    private func invalidateServerCompactionState() {
+        serverCompactingSessionIDs.removeAll()
+        serverCompactionClaimExpiryTasks.values.forEach { $0.cancel() }
+        serverCompactionClaimExpiryTasks.removeAll()
+        serverCompactionClaims.removeAll()
+    }
+
     private func handleDisconnect() {
         let wasRunning = isBusy
         isConnected = false
+        // Gateway compaction lifecycle state is unverifiable across a socket
+        // loss (the orphan reaper may have torn the compressing session
+        // down, and a `compacted` edge may never arrive): never keep a
+        // spinner alive on state we can no longer trust. Local RPC claims
+        // survive — they are bounded by their own request timeout.
+        invalidateServerCompactionState()
         guard connection != nil else { return }
         turnState = .reconnecting
 
@@ -3427,6 +6045,15 @@ final class AppState: ObservableObject {
         purpose: ChatResumeSyncPurpose = .preserveCurrent
     ) {
         guard connection != nil else { return }
+        // A cycle scheduled while the scene is inactive can never run, so
+        // don't arm a timer or consume the queued reconnect purpose just to
+        // discard them when it fires. When reconnect work is deferred while
+        // the scene is inactive, handleScenePhase(.active) owns recovery when
+        // the app returns: if a visible conversation identity exists, foreground
+        // recovery repairs that same conversation using .preserveCurrent;
+        // .automaticReturn is used only when there is no current visible session
+        // identity to preserve.
+        guard isSceneActive else { return }
         if reconnectTask == nil {
             recoverySequence.clearQueuedReconnect()
         }
@@ -3441,15 +6068,35 @@ final class AppState: ObservableObject {
             break
         }
         let delay = immediately ? 0.1 : min(5.0, pow(2.0, Double(reconnectAttempts)))
-        if !immediately { reconnectAttempts += 1 }
+        // The backoff step is consumed only when the cycle actually runs.
+        // A timer canceled by scene backgrounding — or a cycle dropped for
+        // scene inactivity before execution — never counts as a gateway
+        // failure, so background/foreground cycling cannot ratchet the
+        // retry delay toward its cap without a real failure.
+        let incrementsBackoff = !immediately
 
         reconnectTask = reconnectScheduler(delay) { [weak self] in
             guard let self else { return }
             self.reconnectTask = nil
             let purpose = self.recoverySequence.takeQueuedReconnectPurpose()
                 ?? .preserveCurrent
+            guard self.isSceneActive else { return }
+            if incrementsBackoff { self.reconnectAttempts += 1 }
             await self.executeReconnect(purpose: purpose)
         }
+    }
+
+    private func scheduleReconnectAfterFailedSync() {
+        // Once an automatic sync fails with a visible conversation, repair
+        // around that conversation. On a truly cold launch there is no
+        // visible identity to preserve, so retain automatic return to the
+        // saved conversation instead of selecting an arbitrary catalog row.
+        let retryPurpose: ChatResumeSyncPurpose = activeSessionId == nil
+            ? .automaticReturn
+            : .preserveCurrent
+        cancelScheduledReconnect()
+        recoverySequence.complete()
+        scheduleReconnect(purpose: retryPurpose)
     }
 
     func reconnect() async {
@@ -3458,6 +6105,15 @@ final class AppState: ObservableObject {
     }
 
     private func executeReconnect(purpose: ChatResumeSyncPurpose) async {
+        // A reconnect cycle mints a ticket, reloads the session catalog, and
+        // mutates a series of @Published properties — each driving SwiftUI
+        // transactions on the main thread. On a flaky link that churn can
+        // saturate the main thread, and a backgrounded scene update then
+        // misses its 10s watchdog deadline. Drop the attempt here instead;
+        // handleScenePhase(.active) re-establishes the transport on return.
+        // This also makes the public reconnect() a no-op while the scene is
+        // inactive/backgrounded — the retry is picked up on the next .active.
+        guard isSceneActive else { return }
         if let reconnectExecutor {
             await reconnectExecutor(purpose)
         } else {
@@ -3466,7 +6122,22 @@ final class AppState: ObservableObject {
     }
 
     func reconnectForRetry(purpose requestedPurpose: ChatResumeSyncPurpose) async {
+        #if DEBUG
+        // The UI-test stubbed sessions have no transport to restore; every
+        // automatic or explicit reconnect is a deterministic no-op for them.
+        guard Self.uiTestConnectedStub() == nil,
+              Self.uiTestFailedConnectionStub() == nil else { return }
+        #endif
         guard let savedConnection = connection else { return }
+        // The renewal's ownership is captured BEFORE any await: the renewed
+        // ticket belongs to exactly this dashboard and this switch
+        // generation. After the mint (or the silent re-auth), the fences
+        // below reject a superseded renewal — a dashboard switch that ran
+        // meanwhile owns the flow, and the stale ticket must neither install
+        // nor resolve against the now-changed selection.
+        let renewalDashboardID = resolveDashboardID(forURL: savedConnection.baseUrl, registerIfMissing: false)
+            ?? activeDashboardID
+        let renewalSwitchGeneration = dashboardSwitchGeneration
         let purpose = beginChatResumeRecovery(purpose: requestedPurpose)
         let automaticWorkToken = purpose == .automaticReturn
             ? beginAutomaticChatResumeWork()
@@ -3501,6 +6172,10 @@ final class AppState: ObservableObject {
         if purpose == .automaticReturn, reconnectTask != nil {
             cancelScheduledReconnect()
         }
+        // The old socket died: turn edges may have been missed while the
+        // transport was down. The sync this cycle runs will re-confirm the
+        // state from the authoritative resume snapshot and clear the flag.
+        turnStateIsStale = true
         isConnecting = true
         turnState = .reconnecting
 
@@ -3508,25 +6183,45 @@ final class AppState: ObservableObject {
         do {
             let ticket = try await mintChatResumeTicket(for: savedConnection)
             guard refreshTransportContinuation() else { return }
+            // Re-fence after the mint await: never install a stale renewal
+            // under a newer dashboard switch, and never resolve its owner
+            // from the now-changed selection.
+            guard switchGenerationIsCurrent(renewalSwitchGeneration),
+                  activeDashboardID == renewalDashboardID else { return }
             connection = HermesConnection(baseUrl: savedConnection.baseUrl, ticket: ticket)
             self.connection = connection
-            KeychainHelper.saveConnection(connection)
+            if let dashboardID = renewalDashboardID {
+                KeychainHelper.saveConnection(connection, dashboardID: dashboardID)
+            }
         } catch {
             guard refreshTransportContinuation() else { return }
             if let bridgeError = error as? DashboardTicketBridgeError, case .signInRequired = bridgeError {
-                if let credentials = KeychainHelper.loadCredentials(),
+                var silentRenewalReauthError: Error?
+                let scopedCredentials = activeDashboardID.flatMap { KeychainHelper.loadCredentials(dashboardID: $0) }
+                if let credentials = scopedCredentials,
                    credentials.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == savedConnection.baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/")) {
                     do {
-                        let ticket = try await NativeAuthClient(baseURL: credentials.baseURL, cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: credentials.baseURL)).connect(
+                        let access = activeDashboardID.flatMap {
+                            KeychainHelper.loadCloudflareAccess(dashboardID: $0, for: credentials.baseURL)
+                        }
+                        let authenticatedConnection = try await NativeAuthClient(baseURL: credentials.baseURL, cloudflareAccess: access).connect(
                             username: credentials.username,
                             password: credentials.password
                         )
                         guard refreshTransportContinuation() else { return }
+                        // Re-fence after the re-auth network await: a
+                        // superseded renewal must not commit cookies into
+                        // (or reload a bridge for) the wrong dashboard.
+                        guard switchGenerationIsCurrent(renewalSwitchGeneration),
+                              activeDashboardID == renewalDashboardID else { return }
+                        if let renewalDashboardID {
+                            authenticatedConnection.commitCookies(dashboardID: renewalDashboardID)
+                        }
                         // URLSession and WebKit have separate cookie stores.
                         // Reload the bridge so it receives the fresh session.
                         dashboardTicketBridge?.reload()
                         await connect(
-                            with: HermesConnection(baseUrl: credentials.baseURL, ticket: ticket),
+                            with: HermesConnection(baseUrl: credentials.baseURL, ticket: authenticatedConnection.ticket),
                             profile: activeProfile,
                             syncPurpose: continuationPurpose,
                             cancelsResumeRestoration: false,
@@ -3535,21 +6230,40 @@ final class AppState: ObservableObject {
                         )
                         guard refreshTransportContinuation() else { return }
                         return
+                    } catch is CancellationError {
+                        // A superseded reconnect owns the flow from here; do
+                        // not force the user to the sign-in card for an
+                        // intentional cancellation.
+                        return
                     } catch {
                         guard refreshTransportContinuation() else { return }
-                        // This only determines whether recovery can be silent.
-                        // Preserve the saved credentials for the login screen.
+                        // The silent re-auth failure (429 throttle, 401
+                        // rejection, 503 outage…) is the most diagnostic
+                        // explanation for the forced sign-in; carry it to the
+                        // classifier. This only determines whether recovery
+                        // can be silent. Preserve the saved credentials for
+                        // the login screen.
+                        silentRenewalReauthError = error
                     }
                 }
                 guard refreshTransportContinuation() else { return }
-                requireSignIn(message: error.localizedDescription)
+                // The dashboard's session is gone (sign-in required): the
+                // typed classification routes Repair toward browser sign-in.
+                lastConnectionFailure = .loginRequired
+                requireSignIn(
+                    failure: Self.silentRenewalSignInFailure(
+                        reauthError: silentRenewalReauthError,
+                        bridgeError: bridgeError
+                    )
+                )
             } else {
                 guard refreshTransportContinuation() else { return }
                 isConnected = false
                 isConnecting = false
                 turnState = .reconnecting
-                errorMessage = "Failed to refresh the dashboard session: \(error.localizedDescription)"
-                scheduleReconnect(purpose: continuationPurpose)
+                lastConnectionFailure = ConnectionFailureClassifier.classify(error)
+                errorMessage = AppLocalization.string("Failed to refresh the dashboard session: \(error.localizedDescription)")
+                scheduleReconnectAfterFailedSync()
             }
             return
         }
@@ -3567,6 +6281,12 @@ final class AppState: ObservableObject {
                   let activeClient = self.client, activeClient === client else { return }
             isConnected = true
             isConnecting = false
+            // A fresh healthy session never inherits an older banner error —
+            // including the typed classification Repair Connection seeds
+            // from: a successful reconnect makes any previous failure stale,
+            // so a LATER unrelated failure must route repair from itself.
+            errorMessage = nil
+            lastConnectionFailure = nil
             reconnectAttempts = 0
             connectedAt = Date()
             guard let continuation = await synchronizeTransportContinuation(
@@ -3595,7 +6315,7 @@ final class AppState: ObservableObject {
             isConnected = false
             isConnecting = false
             turnState = .reconnecting
-            scheduleReconnect(purpose: continuationPurpose)
+            scheduleReconnectAfterFailedSync()
         }
     }
 
@@ -3661,12 +6381,42 @@ final class AppState: ObservableObject {
         }
         switch phase {
         case .active:
-            voiceConversationController.setForegroundActive(true)
+            isSceneActive = true
+            // Voice gate = "a legitimate Voice presentation surface exists".
+            // With the phone scene active this is trivially true; the same
+            // gate also stays true while the phone is backgrounded but the
+            // CarPlay surface is presenting the shared conversation.
+            voiceConversationController.setForegroundActive(hasActiveVoiceSurface)
+            messageReadAloudController.setForegroundActive(true)
+            // Voice restoration deliberately does NOT run here: the socket,
+            // bridge, and runtime session identity may all be stale after a
+            // background suspension. The suspended descriptor is consumed
+            // inside the reconciliation task below, after the authoritative
+            // transport/session state is established (or definitively fails).
+            // Consume the background arming even while signed out, so a
+            // background → active cycle on the login screen doesn't surface
+            // a stale request after the user signs back in.
+            let didReturnFromBackground = hasEnteredBackgroundScenePhase
+            hasEnteredBackgroundScenePhase = false
             guard connection != nil else { return nil }
+            // The preferred return surface belongs to the authenticated
+            // app: MainView presents the drawer while the automatic resume
+            // sync restores the chat underneath, and explicit navigation
+            // still wins via the suppression guards on both sides.
+            if didReturnFromBackground {
+                requestPreferredReturnSurface()
+            }
             cancelScenePhaseAttempt()
             // Publish the foreground reconciliation boundary synchronously.
             // ChatView may receive the same scene transition before the health
             // check task runs, so geometry alone must not restore stale rows.
+            // Consume the freshness arming here, synchronously with the
+            // transition: exactly one foreground return pays the bounded
+            // freshness check, overlay dips stay observational, and a refresh
+            // superseded mid-read is token-dead before it can act on stale
+            // evidence (every deactivation rotates the token).
+            let freshnessCheckArmed = foregroundFreshnessCheckArmed
+            foregroundFreshnessCheckArmed = false
             let token = beginReconciliation()
             let automaticWorkToken = beginAutomaticChatResumeWork()
             let sceneAttemptID = UUID()
@@ -3676,43 +6426,135 @@ final class AppState: ObservableObject {
                 defer { self.finishScenePhaseAttempt(id: sceneAttemptID) }
                 guard self.scenePhaseAttemptIsCurrent(sceneAttemptID) else { return }
                 if let client = self.client, client.isConnected {
+                    // A connect that aborted mid-flight (scene went inactive
+                    // before its checkpoint) can leave the UI's transport
+                    // flags unpublished — "connecting…" with sends disabled —
+                    // even though the socket is alive. Publish the healthy
+                    // transport before syncing; the reconnect path manages
+                    // these flags for unhealthy sockets.
+                    self.isConnected = true
+                    self.isConnecting = false
+                    lifecycleLog.notice(
+                        "Foreground refresh start: transport=retained localTurn=\(self.turnStateLogValue, privacy: .public)"
+                    )
                     do {
-                        try await client.healthCheck()
+                        try await self.verifyChatResumeTransportHealth(client)
                         guard self.scenePhaseAttemptIsCurrent(sceneAttemptID),
                               self.automaticChatResumeWorkIsCurrent(automaticWorkToken) else {
                             self.settleReconciliation(token)
                             return
                         }
-                        await self.syncSession(
-                            purpose: .automaticReturn,
-                            using: token,
+                        await self.refreshForegroundOnHealthyTransport(
+                            using: client,
+                            freshnessCheckArmed: freshnessCheckArmed,
+                            reconciliationToken: token,
                             automaticWorkToken: automaticWorkToken
                         )
                     } catch {
-                        guard self.scenePhaseAttemptIsCurrent(sceneAttemptID),
-                              self.automaticChatResumeWorkIsCurrent(automaticWorkToken) else {
+                        guard self.scenePhaseAttemptIsCurrent(sceneAttemptID) else {
                             self.settleReconciliation(token)
                             return
                         }
-                        await self.reconnectForRetry(purpose: .automaticReturn)
-                        self.settleReconciliation(token)
+                        if !self.automaticChatResumeWorkIsCurrent(automaticWorkToken) {
+                            // The automatic intent was invalidated mid-check
+                            // (composer edit, explicit viewport action): the
+                            // user owns the visible conversation, so repair
+                            // the transport without letting recovery select a
+                            // session.
+                            self.settleReconciliation(token)
+                            await self.reconnectForRetry(purpose: .preserveCurrent)
+                        } else {
+                            lifecycleLog.notice(
+                                "Foreground refresh: health check failed (\(error.localizedDescription, privacy: .private)); reconnecting"
+                            )
+                            await self.reconnectForRetry(
+                                purpose: self.foregroundRecoveryPurpose
+                            )
+                            self.settleReconciliation(token)
+                        }
                     }
                 } else {
-                    guard self.scenePhaseAttemptIsCurrent(sceneAttemptID),
-                          self.automaticChatResumeWorkIsCurrent(automaticWorkToken) else {
+                    guard self.scenePhaseAttemptIsCurrent(sceneAttemptID) else {
                         self.settleReconciliation(token)
                         return
                     }
-                    await self.reconnectForRetry(purpose: .automaticReturn)
-                    self.settleReconciliation(token)
+                    if !self.automaticChatResumeWorkIsCurrent(automaticWorkToken) {
+                        self.settleReconciliation(token)
+                        await self.reconnectForRetry(purpose: .preserveCurrent)
+                    } else {
+                        lifecycleLog.notice(
+                            "Foreground refresh start: transport=missing-or-unhealthy; reconnecting"
+                        )
+                        await self.reconnectForRetry(
+                            purpose: self.foregroundRecoveryPurpose
+                        )
+                        self.settleReconciliation(token)
+                    }
+                }
+                // Voice restoration runs here — after the authoritative
+                // reconciliation above established transport and session
+                // state — and only while this attempt is still current. A
+                // pending suspended conversation forces a capability refresh
+                // first: the pre-background snapshot cannot be trusted across
+                // suspension, and restoration must fail closed when the
+                // refreshed state says a fresh open would be rejected.
+                if self.scenePhaseAttemptIsCurrent(sceneAttemptID) {
+                    await self.refreshCapabilitiesAndRestoreSuspendedVoice(
+                        isCurrent: { self.scenePhaseAttemptIsCurrent(sceneAttemptID) }
+                    )
                 }
             }
             scenePhaseTask = task
             return task
 
         case .background:
-            voiceConversationController.setForegroundActive(false)
-            showVoiceSheet = false
+            isSceneActive = false
+            hasEnteredBackgroundScenePhase = true
+            // The socket can die while suspended and turn edges can be missed,
+            // so the local turn state must be re-confirmed against the
+            // authoritative runtime registry before the next composer submit
+            // decides between a new turn and a busy submission.
+            turnStateIsStale = true
+            // Snapshot the pre-suspension liveness evidence and arm the
+            // cross-surface freshness check: while suspended, another Hermes
+            // surface can start or finish turns whose stream events Conduit
+            // will never see (the socket may not survive the suspension).
+            preSuspensionTurnRunningSessionIDs = turnState.isRunning
+                ? acceptedIdentitySessionIDs(forRequested: activeSessionId ?? "")
+                : []
+            // A locally-owned in-flight turn is only continuity evidence
+            // while this conversation's turn is unsettled. A SETTLED turn
+            // (idle, or the unsupported-gateway dead end) expires the marker;
+            // .synchronizing/.reconnecting are mid-recovery, not settle —
+            // the turn may still be live, so the marker survives them. A
+            // marker left over from another session never survives.
+            if turnState == .idle || turnState == .unsupportedGateway {
+                locallyOwnedInFlightTurn = nil
+            } else if let marker = locallyOwnedInFlightTurn,
+                      let active = activeSessionId,
+                      !marker.sessionIDs.contains(active) {
+                locallyOwnedInFlightTurn = nil
+            }
+            foregroundFreshnessCheckArmed = true
+            messageReadAloudController.setForegroundActive(false)
+            // Suspension is not Close: an open Voice conversation releases its
+            // runtime ownership and is recorded for foreground restoration,
+            // and the sheet presentation intentionally survives the
+            // background transition. The exception is another active Voice
+            // presentation surface: with CarPlay presenting the shared
+            // conversation, the phone backgrounding is NOT a Voice lifecycle
+            // boundary — Voice must stay live for the driver — so the
+            // suspension (and its restoration descriptor) is skipped
+            // entirely. Read-aloud remains phone-bound and deactivates above.
+            if hasActiveVoiceSurface {
+                voiceConversationController.setForegroundActive(true)
+            } else {
+                suspendVoiceConversationForBackground()
+            }
+            // Drop any armed reconnect timer as well: in-flight cycles abort
+            // at their next transportContinuation checkpoint, and foreground
+            // activation re-establishes the transport.
+            cancelScheduledReconnect()
             // Flush any pending coalesced cache writes before the app
             // suspends — iOS may kill the process before the debounce fires.
             flushPendingPresentationCache()
@@ -3723,8 +6565,36 @@ final class AppState: ObservableObject {
             return nil
 
         case .inactive:
+            isSceneActive = false
+            // Same reasoning as .background: a dip through Control Center or a
+            // system overlay can miss turn edges. This never causes a resume —
+            // the foreground path treats staleness as a read-only probe.
+            turnStateIsStale = true
+            // Capture the continuity evidence (an in-flight Conduit turn stays
+            // the same turn across a dip) but do NOT arm the freshness check:
+            // the socket survives overlay dips, so live events kept flowing.
+            preSuspensionTurnRunningSessionIDs = turnState.isRunning
+                ? acceptedIdentitySessionIDs(forRequested: activeSessionId ?? "")
+                : []
+            // Reconnects are suppressed during .inactive too, so an armed
+            // timer would only fire to be discarded. Drop it here; a socket
+            // that dies under a system overlay (incoming call, control
+            // center) is recovered by the .active scene task — the same
+            // moment the user can see the transcript again.
+            cancelScheduledReconnect()
+            // The scene treats .inactive like .background for reconnect
+            // purposes; formally abort the in-flight scene attempt at the
+            // transition too, rather than at its next checkpoint.
+            cancelScenePhaseAttempt()
             chatResumeCoordinator.freezeViewport()
-            voiceConversationController.setForegroundActive(false)
+            messageReadAloudController.setForegroundActive(false)
+            // A transient .inactive dip (Control Center, an incoming-call
+            // banner, the microphone permission prompt) is NOT a lifecycle
+            // suspension: the socket and audio session survive, in-flight
+            // turns keep flowing, and a pending first-listen must survive the
+            // dip. Voice suspension happens only on the actual .background
+            // transition — a descriptor-less suspension here would tear the
+            // runtime down with no restoration path.
             return nil
 
         @unknown default:
@@ -3734,6 +6604,116 @@ final class AppState: ObservableObject {
 
     private func scenePhaseAttemptIsCurrent(_ id: UUID) -> Bool {
         !Task.isCancelled && scenePhaseAttemptID == id
+    }
+
+    /// Background transition for the Voice conversation. An open Voice sheet
+    /// routes through the controller's lifecycle suspension — runtime
+    /// ownership released, logical conversation preserved — and records the
+    /// suspended descriptor for foreground restoration. A closed Voice sheet
+    /// keeps the existing full-stop semantics. Transient .inactive dips never
+    /// reach this: they leave Voice untouched.
+    ///
+    /// Callers guarantee no other legitimate Voice presentation surface is
+    /// active (`hasActiveVoiceSurface == false`): a CarPlay-presented
+    /// conversation skips this path on phone backgrounding, and the CarPlay
+    /// disconnect handler routes through it when the phone scene is inactive
+    /// so both boundaries share exactly one release/restore contract.
+    private func suspendVoiceConversationForBackground() {
+        // Suspension disarms the fresh-open auto-listen intent: the restored
+        // sheet must never hot-start the microphone, even if SwiftUI
+        // recreates the sheet's view identity while the binding stays true.
+        voiceSheetShouldAutoListen = false
+        voiceConversationController.setForegroundActive(false)
+        guard showVoiceSheet else {
+            voiceConversationController.stop()
+            return
+        }
+        voiceConversationController.suspendRuntimeForLifecycle()
+        suspendedVoiceConversation = SuspendedVoiceConversation(
+            profile: activeProfile,
+            sessionID: activeSessionId ?? "",
+            serverIdentity: Self.voiceSuspensionServerIdentity(connection)
+        )
+    }
+
+    /// Consumes the suspended Voice descriptor on foreground return. Called
+    /// ONLY after the foreground reconciliation task has established the
+    /// authoritative transport/session state (or definitively failed) — never
+    /// synchronously at the scene transition, when the socket, bridge, and
+    /// runtime session identity may all still be stale.
+    ///
+    /// Validation is synchronous against that post-reconciliation state: the
+    /// same authoritative predicate as a fresh `openVoiceConversation`
+    /// (`canStartVoiceConversation`: live connection, voice enabled, usable
+    /// transcription AND speech) plus the suspended conversation's identity —
+    /// same active profile, and the active runtime session is still the
+    /// suspended conversation (unchanged, or a legitimate rebind per the
+    /// session catalog/alias machinery). Anything stale fails CLOSED. A valid
+    /// descriptor reinstalls the gateway and settles open-but-NON-listening;
+    /// capture is NEVER started by restoration (Continuous Conversation
+    /// governs turn-to-turn continuation only, not lifecycle transitions).
+    func restoreSuspendedVoiceConversationIfNeeded() {
+        guard let suspended = suspendedVoiceConversation else { return }
+        suspendedVoiceConversation = nil
+        let conversationStillMatches = suspended.sessionID == activeSessionId
+            || knownSessionIDs(for: suspended.sessionID).contains(activeSessionId ?? "")
+        let identityStillValid = suspended.profile == activeProfile
+            && !suspended.sessionID.isEmpty
+            && conversationStillMatches
+            && connection != nil
+            && suspended.serverIdentity == Self.voiceSuspensionServerIdentity(connection)
+            && canStartVoiceConversation
+            && showVoiceSheet
+            && voiceConversationController.hasLiveVoiceSession
+        guard identityStillValid else {
+            if showVoiceSheet {
+                if suspended.profile == activeProfile {
+                    closeVoiceConversation()
+                } else {
+                    // Cross-profile staleness: the suspended controller's
+                    // live mute belongs to the descriptor's profile. Tear
+                    // down directly — closeVoiceConversation would persist
+                    // that mute into the now-active profile's preferences.
+                    voiceConversationController.stop()
+                    voiceSheetShouldAutoListen = false
+                    voiceControllerSessionProfile = nil
+                    showVoiceSheet = false
+                }
+            }
+            return
+        }
+        // Rebuild the gateway from the current bridge/connection; the
+        // controller keeps its preserved conversation identity and
+        // preferences, settled in .idle.
+        refreshVoiceControllerGateway()
+        // The capability checks above passed, so a gateway that still could
+        // not be built (e.g. the bridge rotated under us) is staleness too:
+        // fail closed instead of restoring an open-but-dead sheet.
+        if !voiceConversationController.isGatewayAttached {
+            closeVoiceConversation()
+        }
+    }
+
+    /// Refreshes Voice capability state when a suspended Voice conversation
+    /// is pending, then validates/restores. The pre-background capability
+    /// snapshot cannot be trusted across suspension, so restoration must run
+    /// against a freshly negotiated answer; `isCurrent` is re-checked after
+    /// that await so a superseded attempt never consumes the descriptor.
+    /// Without a pending descriptor this is a no-op — a plain foreground
+    /// return never pays a redundant capability network refresh here.
+    func refreshCapabilitiesAndRestoreSuspendedVoice(isCurrent: @MainActor () -> Bool) async {
+        guard suspendedVoiceConversation != nil else { return }
+        // The central refreshVoiceCapabilities authority preserves the live
+        // in-session mute for the owning profile during this refresh, so the
+        // restored session keeps the user's Mute state.
+        await refreshVoiceCapabilities()
+        guard isCurrent() else { return }
+        restoreSuspendedVoiceConversationIfNeeded()
+    }
+
+    private static func voiceSuspensionServerIdentity(_ connection: HermesConnection?) -> String? {
+        guard let baseURL = connection?.baseUrl else { return nil }
+        return normalizedChatResumeServerIdentity(baseURL)
     }
 
     private func cancelScenePhaseAttempt() {
@@ -3748,6 +6728,1046 @@ final class AppState: ObservableObject {
         scenePhaseAttemptID = nil
         scenePhaseTask = nil
     }
+
+    private var turnStateLogValue: String {
+        switch turnState {
+        case .synchronizing: return "synchronizing"
+        case .idle: return "idle"
+        case .running: return "running"
+        case .reconnecting: return "reconnecting"
+        case .unsupportedGateway: return "unsupportedGateway"
+        }
+    }
+
+    // MARK: - Foreground observational refresh
+
+    /// Outcome of the read-only liveness probe for the active conversation.
+    private enum ForegroundRuntimeProbe {
+        /// A live runtime row matched the active session's identity.
+        case live(LiveSessionStatus)
+        /// The registry answered but listed no runtime for this session: the
+        /// turn ended and its transport went away, or the gateway restarted.
+        case absent
+        /// The registry could not be read (older gateway, transient RPC
+        /// failure). The caller falls back to the resume-based refresh.
+        case unavailable(String)
+    }
+
+    /// Foreground recovery repairs the current conversation whenever one is
+    /// visible. Automatic return is only appropriate when there is no current
+    /// identity to preserve.
+    private var foregroundRecoveryPurpose: ChatResumeSyncPurpose {
+        guard let activeSessionId,
+              !activeSessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .automaticReturn
+        }
+        return .preserveCurrent
+    }
+
+    /// A healthy foreground transition must be observational, not a session
+    /// replacement. `session.resume` is a session SWITCH upstream (switch_
+    /// session), and the full sync path re-derives the target session,
+    /// replaces the transcript, and resets the live reasoning projection — a
+    /// harmless background→foreground cycle must not manufacture a semantic
+    /// turn boundary. So the healthy-socket path first probes the gateway's
+    /// in-memory runtime registry (`session.active_list`), which upstream
+    /// guarantees does not resume, focus, or mutate a session, and only falls
+    /// back to `session.resume` when the registry proves the live runtime is
+    /// gone (or cannot answer).
+    private func refreshForegroundOnHealthyTransport(
+        using client: HermesClient,
+        freshnessCheckArmed: Bool,
+        reconciliationToken token: UUID,
+        automaticWorkToken: ChatResumeAutomaticWorkToken?
+    ) async {
+        guard foregroundRefreshOwnsReconciliation(token),
+              automaticChatResumeWorkIsCurrent(automaticWorkToken) else {
+            settleReconciliation(token)
+            return
+        }
+        let requestedSessionID = activeSessionId
+        // A foreground recovery is repairing the conversation already on
+        // screen. It must never use automatic-return fallback selection while
+        // that conversation still has an identity: a transient catalog gap or
+        // stale saved id would otherwise replace it with an unrelated chat.
+        let recoveryPurpose = foregroundRecoveryPurpose
+        let probe: ForegroundRuntimeProbe
+        if let requestedSessionID {
+            probe = await probeForegroundRuntime(
+                requestedSessionID: requestedSessionID,
+                using: client
+            )
+        } else {
+            probe = .absent
+        }
+        guard foregroundRefreshOwnsReconciliation(token),
+              automaticChatResumeWorkIsCurrent(automaticWorkToken) else {
+            settleReconciliation(token)
+            return
+        }
+        // Scene-transition evidence. The arming flag was consumed at the
+        // `.active` transition itself (one foreground return pays the check;
+        // dips stay observational). The pre-suspension running set is read
+        // but never cleared here: the next real transition overwrites it, so
+        // a token-rotated refresh cannot consume evidence a newer refresh
+        // still needs. A working/waiting row matching the pre-suspension
+        // running set continues a turn Conduit already owns; without that
+        // match, liveness alone says nothing about whether the local
+        // transcript saw the activity, and a real background interval may
+        // have hidden persisted turns from another surface entirely.
+        let preSuspensionRunningIDs = preSuspensionTurnRunningSessionIDs
+        switch probe {
+        case let .live(row):
+            if row.status == "starting" {
+                // Runtime present, liveness inconclusive: "starting" also
+                // covers promptless agent pre-warm (session.create / cold
+                // resume) and transiently masks a running turn during the
+                // build window, so it proves neither busy nor idle. Live
+                // events own the next edge; never manufacture a resume here.
+                // A transitional state (.synchronizing / .reconnecting) left
+                // by an aborted recovery attempt is NOT valid stream-owned
+                // state, though: normalize it to a usable neutral baseline
+                // (starting is never classified as running) so the composer
+                // cannot stay disabled indefinitely — and a newer buffered
+                // busy edge still wins during the boundary replay.
+                lifecycleLog.notice(
+                    "Foreground refresh: probe=starting session=\(requestedSessionID ?? "-", privacy: .public) → observation-only, transitional state normalized"
+                )
+                if turnState == .synchronizing || turnState == .reconnecting {
+                    setRunning(false)
+                }
+                settleForegroundBoundary(token, automaticWorkToken: automaticWorkToken)
+            } else if row.isRunning {
+                let acceptedIDs = acceptedIdentitySessionIDs(
+                    forRequested: requestedSessionID ?? ""
+                )
+                let continuesLocalTurn = !preSuspensionRunningIDs.isDisjoint(with: acceptedIDs)
+                if row.status == "waiting", !Self.hasPendingDecision(in: messages) {
+                    // Waiting is a committed busy state, but it normally
+                    // represents an answerable approval or clarification.
+                    // A registry probe alone cannot restore the missing card,
+                    // so re-resume the current conversation authoritatively.
+                    lifecycleLog.notice(
+                        "Foreground refresh: probe=waiting without visible decision → authoritative resume"
+                    )
+                    await syncSession(
+                        purpose: recoveryPurpose,
+                        using: token,
+                        automaticWorkToken: automaticWorkToken
+                    )
+                } else if !freshnessCheckArmed {
+                    // Overlay-dip semantics: the socket survived the dip and
+                    // live events kept the transcript current, so the
+                    // observational adopt stands without a transcript read.
+                    if !messages.isEmpty {
+                        lifecycleLog.notice(
+                            "Foreground refresh: probe=live status=\(row.status, privacy: .public) session=\(requestedSessionID ?? "-", privacy: .public) → observation-only adopt (unarmed)"
+                        )
+                        adoptForegroundRunningState(
+                            reconciliationToken: token,
+                            automaticWorkToken: automaticWorkToken
+                        )
+                    } else {
+                        // A running runtime over an empty local transcript
+                        // means this surface never hydrated (failed resume,
+                        // or the turn was started from another surface):
+                        // attach through the full refresh, whose resume
+                        // returns the live projection.
+                        lifecycleLog.notice(
+                            "Foreground refresh: probe=live localTranscript=empty → resume refresh (attach live projection)"
+                        )
+                        await syncSession(
+                            purpose: recoveryPurpose,
+                            using: token,
+                            automaticWorkToken: automaticWorkToken
+                        )
+                    }
+                } else if continuesLocalTurn, !messages.isEmpty {
+                    // Same-session working is NOT same-turn proof: Turn A can
+                    // complete and Turn B start in the SAME session while
+                    // Conduit was suspended. One bounded tail read proves
+                    // continuity — an unchanged verdict keeps the zero-resume
+                    // fast path; anything else takes the authoritative
+                    // attach below (which owns the in-flight projection).
+                    await reconcileForegroundCrossSurfaceActivity(
+                        livenessIsRunning: true,
+                        requestedSessionID: requestedSessionID ?? "",
+                        probeRow: row,
+                        reconciliationToken: token,
+                        automaticWorkToken: automaticWorkToken
+                    )
+                } else {
+                    // Working without turn-continuity evidence after a real
+                    // background: a turn this device never owned. Persisted
+                    // history alone cannot supply the in-flight assistant/
+                    // reasoning projection, so attach authoritatively — the
+                    // compact resume fast-path returns the live projection
+                    // and the reconcile merges the persisted prefix.
+                    lifecycleLog.notice(
+                        "Foreground refresh: probe=live status=\(row.status, privacy: .public) session=\(requestedSessionID ?? "-", privacy: .public) → authoritative attach (remote running turn)"
+                    )
+                    await syncSession(
+                        purpose: recoveryPurpose,
+                        using: token,
+                        automaticWorkToken: automaticWorkToken
+                    )
+                }
+            } else if turnState.isRunning {
+                // The turn ended while the app was suspended and the idle edge
+                // was missed. Presentation recovery needs the authoritative
+                // bounded transcript refresh, which is allowed to resume
+                // because nothing is running anymore.
+                lifecycleLog.notice(
+                    "Foreground refresh: probe=idle localTurn=running → resume refresh (turn ended while away)"
+                )
+                await syncSession(
+                    purpose: recoveryPurpose,
+                    using: token,
+                    automaticWorkToken: automaticWorkToken
+                )
+            } else if freshnessCheckArmed {
+                // Authoritative idle after a real background: the runtime
+                // being idle does not prove the local transcript saw
+                // everything persisted while Conduit was away. One bounded
+                // persisted-tail read decides between the observational idle
+                // adoption and merging the missed rows.
+                await reconcileForegroundCrossSurfaceActivity(
+                    livenessIsRunning: false,
+                    requestedSessionID: requestedSessionID ?? "",
+                    probeRow: row,
+                    reconciliationToken: token,
+                    automaticWorkToken: automaticWorkToken
+                )
+            } else {
+                adoptForegroundAuthoritativeIdle(
+                    token: token,
+                    automaticWorkToken: automaticWorkToken
+                )
+            }
+        case .absent:
+            // No live runtime for this session: either the turn completed and
+            // the registry reaped it while the transport was away, or the
+            // gateway restarted and the runtime id is gone. Both need the
+            // resume-based refresh to reattach (or recover completed work).
+            // `session.resume` reuses a live runtime when one exists, so this
+            // cannot create a duplicate runtime for a session that is alive.
+            lifecycleLog.notice(
+                "Foreground refresh: probe=absent → resume refresh (runtime not live)"
+            )
+            await syncSession(
+                purpose: recoveryPurpose,
+                using: token,
+                automaticWorkToken: automaticWorkToken
+            )
+        case let .unavailable(reason):
+            // Older gateway or transient registry failure: keep the proven
+            // resume-based refresh rather than guessing.
+            lifecycleLog.notice(
+                "Foreground refresh: probe unavailable (\(reason, privacy: .private)) → resume refresh"
+            )
+            await syncSession(
+                purpose: recoveryPurpose,
+                using: token,
+                automaticWorkToken: automaticWorkToken
+            )
+        }
+    }
+
+    /// `session.active_list` rows are the gateway's live registry: every row
+    /// naming both a runtime and a stored id is fresh authoritative routing
+    /// evidence (the same authority class as a catalog snapshot), recorded
+    /// through the explicit authoritative rebind. The write is strictly
+    /// OBSERVATIONAL — recording rows never mutates the selected
+    /// conversation, and the healthy-foreground rule (observe the registry,
+    /// never resume without cause) is untouched.
+    func recordActiveListEvidence(_ rows: [LiveSessionStatus], profile: String) {
+        for row in rows {
+            conversationIdentityIndex.recordAuthoritative(
+                runtimeID: row.runtimeSessionId,
+                durableID: row.storedSessionId,
+                profile: profile,
+                source: .activeList
+            )
+        }
+    }
+
+    /// Read-only registry probe for the active conversation. Matches a row by
+    /// ANY identity the conversation is known under (requested, stored, and
+    /// runtime aliases), so a runtime-id rotation cannot be mistaken for a
+    /// dead runtime while the catalog already knows the alias.
+    private func probeForegroundRuntime(
+        requestedSessionID: String,
+        using client: HermesClient
+    ) async -> ForegroundRuntimeProbe {
+        let evidenceProfile = activeProfile
+        let evidenceServerIdentity = defaults.string(forKey: Self.chatResumeServerIdentityKey)
+        do {
+            let rows: [LiveSessionStatus]
+            if let probeActiveSessions = chatResumeLifecycleOperations.probeActiveSessions {
+                rows = try await probeActiveSessions(client)
+            } else {
+                rows = try await client.activeSessions()
+            }
+            // Currency fence: rows observed before a SERVER change must not
+            // repopulate the index scope that change cleared. The fence is
+            // the committed server identity — the exact boundary
+            // prepareChatResumeForConnection uses — so a same-server client
+            // replacement (reconnect, possibly re-addressed) stays valid
+            // while a real server switch discards its in-flight rows.
+            guard evidenceProfile == activeProfile,
+                  defaults.string(forKey: Self.chatResumeServerIdentityKey) == evidenceServerIdentity else {
+                return .unavailable("Probe superseded by connection change")
+            }
+            recordActiveListEvidence(rows, profile: evidenceProfile)
+            let acceptedIDs = acceptedIdentitySessionIDs(forRequested: requestedSessionID)
+            if let row = rows.first(where: {
+                acceptedIDs.contains($0.runtimeSessionId) || acceptedIDs.contains($0.storedSessionId)
+            }) {
+                return .live(row)
+            }
+            return .absent
+        } catch {
+            return .unavailable(error.localizedDescription)
+        }
+    }
+
+    /// Every identity the active conversation answers to: the requested id,
+    /// its canonical stored id, and the catalog's confirmed aliases.
+    private func acceptedIdentitySessionIDs(forRequested requestedSessionID: String) -> Set<String> {
+        var ids = knownSessionIDs(for: requestedSessionID)
+        ids.insert(requestedSessionID)
+        if let canonical = canonicalSessionID(for: requestedSessionID) {
+            ids.insert(canonical)
+        }
+        if let activeSessionId {
+            ids.insert(activeSessionId)
+        }
+        return ids
+    }
+
+    /// Adopts an authoritative running state WITHOUT replacing any
+    /// presentation state: no transcript swap, no streaming-buffer reset, no
+    /// reasoning-segment reset. Ordering: the probe snapshot is the OLDER
+    /// observation, so it establishes the running baseline FIRST; the buffered
+    /// events captured while the foreground reconciliation boundary was open
+    /// are replayed SECOND — they arrived after the snapshot was taken and the
+    /// newest authoritative edge must win (a buffered sessionBusy(false) or
+    /// completion therefore settles the turn instead of being overwritten back
+    /// to running). applyStreamEvent's active-session gate still applies. The
+    /// boundary settles last.
+    private func adoptForegroundRunningState(
+        reconciliationToken token: UUID,
+        automaticWorkToken: ChatResumeAutomaticWorkToken?
+    ) {
+        guard token == reconciliationToken else { return }
+        // Probe baseline (older observation).
+        setRunning(true)
+        turnStateIsStale = false
+        // Newer live edges win over the snapshot.
+        let bufferedEvents = reconciliation?.bufferedEvents ?? []
+        bufferedEvents.forEach { applyStreamEvent($0) }
+        _ = settleReconciliationAndPublish(token, automaticWorkToken: automaticWorkToken)
+    }
+
+    /// Replays the events buffered while the foreground reconciliation
+    /// boundary was open — newer live edges win over any baseline the caller
+    /// just adopted — then settles the boundary. Used when the registry answer
+    /// is inconclusive ("starting", so the local state stays stream-owned) and
+    /// after the authoritative-idle adoption, where the caller establishes the
+    /// idle baseline first.
+    private func settleForegroundBoundary(
+        _ token: UUID,
+        automaticWorkToken: ChatResumeAutomaticWorkToken?
+    ) {
+        guard token == reconciliationToken else { return }
+        let bufferedEvents = reconciliation?.bufferedEvents ?? []
+        bufferedEvents.forEach { applyStreamEvent($0) }
+        _ = settleReconciliationAndPublish(token, automaticWorkToken: automaticWorkToken)
+    }
+
+    /// Adopts an authoritative idle observation: the registry says this
+    /// runtime is idle, so a transitional state (.synchronizing /
+    /// .reconnecting) left behind by an aborted recovery attempt cannot
+    /// survive a healthy-socket foreground cycle — the observational refresh
+    /// must still end with a usable composer. setRunning(false) is idempotent
+    /// for .idle and preserves an unsupportedGateway marker. The adopted idle
+    /// is the OLDER observation: events buffered while the boundary was open
+    /// are newer live edges and must win (a busy edge that raced the probe
+    /// re-owns the state) before the boundary settles and discards them.
+    private func adoptForegroundAuthoritativeIdle(
+        token: UUID,
+        automaticWorkToken: ChatResumeAutomaticWorkToken?
+    ) {
+        lifecycleLog.notice("Foreground refresh: probe=idle → adopt idle")
+        setRunning(false)
+        turnStateIsStale = false
+        settleForegroundBoundary(token, automaticWorkToken: automaticWorkToken)
+    }
+
+    // MARK: - Cross-surface transcript freshness
+
+    /// Ordering baseline a locally-owned turn captured at submit time.
+    private enum PersistedOrderingBaseline {
+        /// The newest durable row positively observed at submit time.
+        case anchored(String)
+        /// A validated read positively proved the persisted transcript EMPTY.
+        /// Valid ordering evidence — distinct from `unknown`, because a
+        /// single new user-turn boundary after a known-empty baseline is
+        /// provably the first turn.
+        case positivelyEmpty
+        /// No usable persisted ordering evidence (never hydrated, legacy
+        /// hydration, invalidated): every comparison stays inconclusive.
+        case unknown
+
+        var isPositivelyEmpty: Bool {
+            if case .positivelyEmpty = self { return true }
+            return false
+        }
+
+        var isUnknown: Bool {
+            if case .unknown = self { return true }
+            return false
+        }
+    }
+
+    /// Derives ordering evidence from a transcript a reconcile or freshness
+    /// read validated: a contract page anchors on its newest durable row
+    /// (contract pages carry durable ids on every row); a positively empty
+    /// page proves emptiness; anything else (legacy one-shot hydration, no
+    /// transcript) leaves the ordering evidence UNKNOWN — never carried over
+    /// from a previous conversation state.
+    private static func orderingFrontier(
+        from transcript: PersistedSessionTranscript?
+    ) -> PersistedOrderingFrontier {
+        guard let transcript,
+              let page = transcript.page,
+              page.honorsTailContract else {
+            return PersistedOrderingFrontier()
+        }
+        // Anchor on the NEWEST row the page positively proves durable: the
+        // page's newest row may normalize without a durable id while older
+        // rows carry theirs, and that older durable row is still the best
+        // positively-observed ordering anchor.
+        if let anchorIndex = transcript.messages.lastIndex(where: {
+            transcript.durableRowIDs.contains($0.id)
+        }) {
+            return PersistedOrderingFrontier(
+                newestObservedDurableRowID: transcript.messages[anchorIndex].id
+            )
+        }
+        // Emptiness is proven on the RAW row view: the server must have
+        // returned ZERO rows (not merely rows that all normalize away as
+        // hidden display_kind scaffolding — those still carry durable ids).
+        if page.rawReturned == 0,
+           transcript.messages.isEmpty,
+           transcript.durableRowIDs.isEmpty,
+           !page.mayHaveOlderRows(fetchedRowCount: 0) {
+            return PersistedOrderingFrontier(isPositivelyEmpty: true)
+        }
+        return PersistedOrderingFrontier()
+    }
+
+    /// Transcript-scoped lifecycle evidence (freshness uncertainty,
+    /// locally-owned turn provenance, persisted ordering evidence) belongs
+    /// to the conversation it was captured for. Call wherever the
+    /// transcript is wholesale reset for a new/different conversation
+    /// identity: sign-out, profile switch, conversation replacement, session
+    /// open.
+    private func resetTranscriptLifecycleEvidence() {
+        transcriptFreshnessIsStale = false
+        locallyOwnedInFlightTurn = nil
+        persistedOrderingFrontier = PersistedOrderingFrontier()
+        pendingLocalOrderingDebt = nil
+    }
+
+    /// Outcome of the bounded persisted-tail freshness comparison against the
+    /// locally adopted durable frontier.
+    private enum ForegroundFreshnessVerdict {
+        /// The newest page overlaps the local durable frontier and contains
+        /// nothing beyond it (or, behind a locally-owned optimistic tail,
+        /// exactly the expected user-turn boundary): the local transcript is
+        /// current. The payload is the persisted ordering evidence this
+        /// validated read positively observed — the caller may advance the
+        /// ordering frontier with it while the visible transcript stays
+        /// untouched.
+        case unchanged(
+            observedOrderingFrontier: PersistedOrderingFrontier,
+            observedNewUserBoundaries: Int?
+        )
+        /// The page overlaps the frontier and holds validated durable rows
+        /// after it: persisted activity the local transcript never saw.
+        case advanced(transcript: PersistedSessionTranscript, newRows: [ChatMessage])
+        /// No durable ordering proof: the frontier rotated out of the newest
+        /// page, the backend has no tail contract, the response belongs to
+        /// another conversation identity, the local tail is not durably
+        /// anchored, or there is no local frontier. Same invariant as the
+        /// ambiguous-delivery verifier — no anchor means "unchanged" can
+        /// never be declared. The bounded resume refresh is the
+        /// authoritative fallback.
+        case inconclusive
+        /// The history source is positively, structurally absent for this
+        /// conversation (no bridge, or the endpoint answered 404/410/501):
+        /// bounded evidence cannot exist, so the authoritative refresh can
+        /// skip its doomed history request and resume non-compact directly.
+        case sourceUnavailable
+        /// The bounded read failed transiently (timeout, 429/5xx, bridge not
+        /// ready). Liveness stays authoritative, but freshness is UNRESOLVED:
+        /// the freshness marker is retained so the next authoritative source
+        /// re-confirms, and no "unchanged" verdict may be claimed.
+        case unresolvedTransient
+    }
+
+    /// Compares one bounded persisted-tail read against the local durable
+    /// frontier. Ordering key: the page is chronological, so the NEWEST local
+    /// durable row present in the page is the anchor and only strictly-later
+    /// page rows are candidates; candidate rows already held (streamed in
+    /// live under any identity) are dropped by id.
+    ///
+    /// The local transcript may end on the locally-owned turn's optimistic
+    /// rows (`locallyOwnedTurn` non-nil). Hermes persists the user row at
+    /// TURN START, so the normal in-flight tail is the pre-submit frontier,
+    /// the durable twin of our optimistic user row, and any Turn A
+    /// output/tool rows; classification there is by canonical USER-turn
+    /// boundaries (see `locallyOwnedTurnFreshnessVerdict`), never raw row
+    /// count. A durably-anchored tail keeps the plain frontier comparison:
+    /// anchor overlap with nothing newer → unchanged; newer durable rows →
+    /// an append-only merge of the advancement.
+    private func foregroundFreshnessVerdict(
+        _ outcome: ForegroundPersistedTailOutcome,
+        localFrontier: Set<String>,
+        localMessageIDs: Set<String>,
+        lastLocalMessageID: String?,
+        requestedSessionID: String,
+        runtimeSessionID: String,
+        livenessIsRunning: Bool,
+        locallyOwnedTurn: LocallyOwnedTurnTailEvidence?
+    ) -> ForegroundFreshnessVerdict {
+        switch outcome {
+        case .failed:
+            return .unresolvedTransient
+        case .unavailable:
+            return .sourceUnavailable
+        case .unsupportedTailContract:
+            // A backend without the tail contract: there is no bounded
+            // evidence and the freshness check deliberately does not escalate
+            // to a full-transcript read — the bounded resume refresh is the
+            // authoritative fallback.
+            return .inconclusive
+        case let .hydrated(transcript):
+            // Defense-in-depth only: foregroundPersistedTailOutcome already
+            // refuses to construct .hydrated for a non-contract page.
+            guard let page = transcript.page, page.honorsTailContract,
+                  transcript.messages.isEmpty || !transcript.durableRowIDs.isEmpty else {
+                return .inconclusive
+            }
+            // Identity first — even an empty page must belong to THIS
+            // conversation before it can prove anything (a page echoing a
+            // foreign session id is never evidence; pages echoing no id at
+            // all match by construction).
+            guard transcriptMatchesSession(
+                transcript,
+                requestedSessionId: requestedSessionID,
+                resumedSessionId: runtimeSessionID
+            ) else {
+                // The endpoint answered for a different conversation
+                // identity: never merge rows from a foreign transcript.
+                return .inconclusive
+            }
+            // A positively empty page with no older rows proves the
+            // conversation has no persisted rows at all: an idle runtime
+            // cannot hide anything behind it, and an empty local transcript
+            // has nothing to diverge from. A visible optimistic tail over a
+            // positively empty page can only be a locally-owned turn whose
+            // rows simply have not persisted yet — still observational; any
+            // other tail has no ordering proof.
+            if transcript.messages.isEmpty {
+                // A page whose raw rows all normalize away (hidden
+                // scaffolding) is not positively empty — positive emptiness
+                // requires the server to have returned zero raw rows.
+                guard page.rawReturned == 0,
+                      transcript.durableRowIDs.isEmpty,
+                      !page.mayHaveOlderRows(fetchedRowCount: 0) else {
+                    return .inconclusive
+                }
+                if lastLocalMessageID == nil {
+                    return .unchanged(
+                        observedOrderingFrontier: Self.orderingFrontier(from: transcript),
+                        observedNewUserBoundaries: nil
+                    )
+                }
+                if let locallyOwnedTurn,
+                   locallyOwnedTurn.baseline.isPositivelyEmpty,
+                   livenessIsRunning {
+                    return .unchanged(
+                        observedOrderingFrontier: Self.orderingFrontier(from: transcript),
+                        observedNewUserBoundaries: 0
+                    )
+                }
+                return .inconclusive
+            }
+            let tailIsDurablyAnchored = lastLocalMessageID.map {
+                localFrontier.contains($0)
+            } ?? false
+            if !tailIsDurablyAnchored, let locallyOwnedTurn {
+                // The tail is Conduit's own optimistic turn: classify by
+                // user-turn boundaries against the pre-submit anchor.
+                return locallyOwnedTurnFreshnessVerdict(
+                    transcript,
+                    owned: locallyOwnedTurn,
+                    localMessageIDs: localMessageIDs,
+                    livenessIsRunning: livenessIsRunning
+                )
+            }
+            // Anchored path: the transcript must END on a row the frontier
+            // vouches for. Trailing optimistic/streaming rows WITHOUT
+            // locally-owned turn evidence keep the strict anchor requirement
+            // — the bounded resume refresh converges this exact shape.
+            guard tailIsDurablyAnchored,
+                  let anchorIndex = transcript.messages.lastIndex(where: {
+                      localFrontier.contains($0.id)
+                  }) else {
+                // No local frontier, unanchored foreign tail, or the frontier
+                // rotated out of the newest page (an accepted turn can push
+                // hundreds of rows past the window): no ordering proof — same
+                // invariant as the ambiguous-delivery verifier.
+                return .inconclusive
+            }
+            let newRows = persistedRowsAfter(
+                anchorIndex,
+                in: transcript,
+                heldIDs: localMessageIDs
+            )
+            if newRows.isEmpty {
+                return .unchanged(
+                    observedOrderingFrontier: Self.orderingFrontier(from: transcript),
+                    observedNewUserBoundaries: nil
+                )
+            }
+            return .advanced(transcript: transcript, newRows: newRows)
+        }
+    }
+
+    /// Classifies the bounded persisted tail behind a locally-owned
+    /// optimistic turn by USER-turn boundaries. Hermes persists the user row
+    /// at turn start (crash resilience), so the normal in-flight shape is:
+    /// the pre-submit durable anchor, the durable twin of our optimistic
+    /// user row, then any Turn A output/tool rows. The normalizer maps raw
+    /// tool results to `.tool` and drops hidden scaffolding before this
+    /// point, so `.user` rows in the page are real canonical prompts.
+    ///
+    /// Exactly ONE new user-turn boundary after the pre-submit anchor, and
+    /// it must be the FIRST row after that anchor (a linear transcript's
+    /// next row after the old frontier is the next turn's user prompt),
+    /// while the runtime is still working/waiting → same locally-owned
+    /// Turn A → observational continuation. A second user boundary — a
+    /// later turn, or a persisted steer/follow-up inside the running turn —
+    /// means the page cannot prove same-turn continuity → authoritative
+    /// attach (the safe direction). The merge stays INELIGIBLE
+    /// in every optimistic case — the twin would duplicate the optimistic
+    /// bubble — so "unchanged" here means transcript untouched and the live
+    /// projection stays authoritative.
+    private func locallyOwnedTurnFreshnessVerdict(
+        _ transcript: PersistedSessionTranscript,
+        owned: LocallyOwnedTurnTailEvidence,
+        localMessageIDs: Set<String>,
+        livenessIsRunning: Bool
+    ) -> ForegroundFreshnessVerdict {
+        guard livenessIsRunning else {
+            // An idle registry behind our optimistic tail cannot prove the
+            // turn landed at all: the authoritative refresh converges it.
+            return .inconclusive
+        }
+        let newRows: [ChatMessage]
+        switch owned.baseline {
+        case .unknown:
+            // No usable ordering evidence was captured at submit time.
+            return .inconclusive
+        case .anchored(let anchorID):
+            guard let anchorIndex = transcript.messages.lastIndex(where: {
+                $0.id == anchorID
+            }) else {
+                // The anchor rotated out of the newest page (a long turn can
+                // push hundreds of rows past the window): no boundary proof —
+                // same invariant as the anchored path.
+                return .inconclusive
+            }
+            newRows = persistedRowsAfter(
+                anchorIndex,
+                in: transcript,
+                heldIDs: localMessageIDs
+            )
+        case .positivelyEmpty:
+            // The whole persisted transcript follows the empty baseline, so
+            // every page row is a candidate — but only when the page is
+            // complete: older rotated-out rows could hide additional user
+            // boundaries and would make the count understate.
+            guard let page = transcript.page,
+                  !page.mayHaveOlderRows(fetchedRowCount: page.rawReturned) else {
+                return .inconclusive
+            }
+            newRows = persistedRowsAfter(
+                nil,
+                in: transcript,
+                heldIDs: localMessageIDs
+            )
+        }
+        if newRows.isEmpty {
+            // Nothing of ours persisted yet — the earliest in-flight shape.
+            return .unchanged(
+                observedOrderingFrontier: Self.orderingFrontier(from: transcript),
+                observedNewUserBoundaries: 0
+            )
+        }
+        let newUserTurnBoundaries = newRows.filter { $0.role == .user }
+        guard let firstRow = newRows.first, firstRow.role == .user,
+              newUserTurnBoundaries.count == 1 else {
+            return .inconclusive
+        }
+        // Exactly the expected twin of our optimistic Turn A user row (plus
+        // any Turn A output/tool rows): our turn is still the only one. The
+        // visible transcript stays untouched, but the ordering frontier may
+        // advance through the newest observed durable row of this proven
+        // Turn A region so the NEXT locally-owned turn anchors past it — and
+        // this read positively observed the turn's persisted boundary, so a
+        // later settle owes no ordering debt.
+        return .unchanged(
+            observedOrderingFrontier: Self.orderingFrontier(from: transcript),
+            observedNewUserBoundaries: newUserTurnBoundaries.count
+        )
+    }
+
+    /// Runs the bounded cross-surface freshness reconciliation for a
+    /// foreground whose probe liveness could hide missed persisted activity
+    /// (real background interval): exactly one TAIL-ONLY persisted read —
+    /// never a full-transcript fallback — decides:
+    ///
+    /// - anchor overlap, nothing newer → observational liveness adoption,
+    ///   transcript untouched, zero `session.resume`. With a locally-owned
+    ///   optimistic tail, EXACTLY ONE new canonical user-turn boundary after
+    ///   the pre-submit anchor (the durable twin Hermes persists at turn
+    ///   start, plus any of our turn's output/tool rows) additionally proves
+    ///   same-turn continuation — still zero `session.resume`;
+    /// - anchor overlap, newer durable rows → the advancement is appended to
+    ///   the local transcript (loaded-earlier prefix untouched, persisted
+    ///   window re-anchored) and the liveness adopted — still zero
+    ///   `session.resume`, because the persisted-history source supplied
+    ///   everything a completed turn needs;
+    /// - inconclusive (rotated anchor, no tail contract, foreign resolved id,
+    ///   unanchored foreign tail, a SECOND user-turn boundary behind an
+    ///   optimistic tail — a later turn exists) → the existing bounded resume
+    ///   refresh, the authoritative fallback that re-anchors the whole
+    ///   conversation (and, for a live runtime, returns the in-flight
+    ///   projection);
+    /// - structurally absent source → the same authoritative refresh, hinted
+    ///   so it skips the doomed history request and resumes non-compact
+    ///   exactly once;
+    /// - transient read failure → the authoritative liveness adoption with
+    ///   the transcript-freshness marker SET: freshness is unresolved, never
+    ///   claimed current, and the next authoritative source re-confirms.
+    private func reconcileForegroundCrossSurfaceActivity(
+        livenessIsRunning: Bool,
+        requestedSessionID: String,
+        probeRow: LiveSessionStatus,
+        reconciliationToken token: UUID,
+        automaticWorkToken: ChatResumeAutomaticWorkToken?
+    ) async {
+        let recoveryPurpose = foregroundRecoveryPurpose
+        let bridge = dashboardTicketBridge
+        let localFrontier = durablePersistedRowIDs
+        let localMessageIDs = Set(messages.map { $0.id })
+        let lastLocalMessageID = messages.last?.id
+        let locallyOwnedTurn = locallyOwnedFreshnessTurnEvidence(
+            forRequested: requestedSessionID
+        )
+        // A bot chat's persisted tail lives in the BOT's store; the scope
+        // must follow the active conversation, not the dashboard default.
+        let profile = botConversationProfile(for: requestedSessionID) ?? activeProfile
+        let outcome = await foregroundPersistedTailOutcome(
+            sessionId: requestedSessionID,
+            profile: profile,
+            using: bridge
+        )
+        guard foregroundRefreshOwnsReconciliation(token),
+              automaticChatResumeWorkIsCurrent(automaticWorkToken) else {
+            settleReconciliation(token)
+            return
+        }
+        // The composer stays enabled during the bounded read: a submit that
+        // landed mid-read appends an optimistic row and would invert the
+        // merge order. The transcript moved, so the append-only merge can no
+        // longer be proven safe — the bounded resume refresh converges it.
+        guard messages.last?.id == lastLocalMessageID,
+              durablePersistedRowIDs == localFrontier else {
+            lifecycleLog.notice(
+                "Foreground freshness: session=\(requestedSessionID, privacy: .public) transcript moved during read → bounded resume refresh"
+            )
+            await syncSession(
+                purpose: recoveryPurpose,
+                using: token,
+                automaticWorkToken: automaticWorkToken
+            )
+            return
+        }
+        switch foregroundFreshnessVerdict(
+            outcome,
+            localFrontier: localFrontier,
+            localMessageIDs: localMessageIDs,
+            lastLocalMessageID: lastLocalMessageID,
+            requestedSessionID: requestedSessionID,
+            runtimeSessionID: probeRow.runtimeSessionId,
+            livenessIsRunning: livenessIsRunning,
+            locallyOwnedTurn: locallyOwnedTurn
+        ) {
+        case let .advanced(transcript, newRows):
+            if livenessIsRunning {
+                // A running turn whose persisted history advanced beyond the
+                // frontier cannot be proven same-turn, and the page cannot
+                // supply its in-flight projection: the authoritative attach
+                // (compact resume + reconcile) owns both the advancement and
+                // the live projection.
+                lifecycleLog.notice(
+                    "Foreground freshness: probe=running session=\(requestedSessionID, privacy: .public) verdict=advanced rows=\(newRows.count, privacy: .public) → authoritative attach"
+                )
+                await syncSession(
+                    purpose: recoveryPurpose,
+                    using: token,
+                    automaticWorkToken: automaticWorkToken
+                )
+                return
+            }
+            lifecycleLog.notice(
+                "Foreground freshness: probe=idle session=\(requestedSessionID, privacy: .public) verdict=advanced rows=\(newRows.count, privacy: .public) → merge persisted advancement"
+            )
+            applyPersistedForegroundAdvancement(
+                requestedSessionID: requestedSessionID,
+                transcript: transcript,
+                newRows: newRows,
+                runtimeSessionID: probeRow.runtimeSessionId,
+                profile: profile
+            )
+            adoptForegroundAuthoritativeIdle(
+                token: token,
+                automaticWorkToken: automaticWorkToken
+            )
+        case let .unchanged(observedOrderingFrontier, observedNewUserBoundaries):
+            lifecycleLog.notice(
+                "Foreground freshness: probe=\(livenessIsRunning ? "running" : "idle", privacy: .public) session=\(requestedSessionID, privacy: .public) verdict=unchanged → observational adopt"
+            )
+            // The bounded read proved the durable conversation current (an
+            // optimistic locally-owned tail is live-turn content, not
+            // divergence). The visible transcript stays untouched, but the
+            // read's validated ordering evidence advances the persisted
+            // ordering frontier — pure metadata the NEXT locally-owned turn
+            // anchors against.
+            transcriptFreshnessIsStale = false
+            // Re-anchor the ordering frontier on this read's own validated
+            // observation (see PersistedOrderingFrontier for the
+            // non-monotonicity rationale).
+            persistedOrderingFrontier = observedOrderingFrontier
+            if let observedNewUserBoundaries, observedNewUserBoundaries > 0 {
+                // The read positively observed the locally-owned turn's
+                // persisted boundary. If the turn is still running this does
+                // NOT prove its final durable tail.
+                locallyOwnedInFlightTurn?.persistedBoundaryObserved = true
+            }
+            adoptForegroundLiveness(
+                livenessIsRunning,
+                token: token,
+                automaticWorkToken: automaticWorkToken
+            )
+        case .unresolvedTransient:
+            lifecycleLog.notice(
+                "Foreground freshness: probe=\(livenessIsRunning ? "running" : "idle", privacy: .public) session=\(requestedSessionID, privacy: .public) verdict=transient-failure → liveness adopt, freshness unresolved"
+            )
+            adoptForegroundLiveness(
+                livenessIsRunning,
+                token: token,
+                automaticWorkToken: automaticWorkToken
+            )
+            // The bounded read failed transiently: transcript freshness is
+            // UNRESOLVED — tracked separately from turn-state staleness
+            // (liveness was just adopted authoritatively above). The
+            // pre-send freshness retry and the next background's freshness
+            // check re-confirm; a registry probe alone can never clear this.
+            transcriptFreshnessIsStale = true
+        case .sourceUnavailable:
+            // Positively structural: the authoritative refresh re-anchors
+            // the conversation, hinted to skip the history request that just
+            // proved absent and resume non-compact exactly once.
+            lifecycleLog.notice(
+                "Foreground freshness: probe=\(livenessIsRunning ? "running" : "idle", privacy: .public) session=\(requestedSessionID, privacy: .public) verdict=source-unavailable → single authoritative resume"
+            )
+            await syncSession(
+                purpose: recoveryPurpose,
+                using: token,
+                automaticWorkToken: automaticWorkToken,
+                historySourceUnavailable: true
+            )
+        case .inconclusive:
+            lifecycleLog.notice(
+                "Foreground freshness: probe=\(livenessIsRunning ? "running" : "idle", privacy: .public) session=\(requestedSessionID, privacy: .public) verdict=inconclusive → bounded resume refresh"
+            )
+            await syncSession(
+                purpose: recoveryPurpose,
+                using: token,
+                automaticWorkToken: automaticWorkToken
+            )
+        }
+    }
+
+    /// Ordering evidence for the locally-owned optimistic tail, captured by
+    /// `locallyOwnedFreshnessTurnEvidence` at freshness time. Non-nil means
+    /// the trailing unpersisted rows belong to this surface's in-flight
+    /// turn; `baseline` is the submit-time ordering anchor the bounded tail
+    /// is classified against.
+    private struct LocallyOwnedTurnTailEvidence {
+        let baseline: PersistedOrderingBaseline
+    }
+
+    /// Non-nil when the transcript's trailing unpersisted rows belong to a
+    /// turn THIS surface submitted and the local turn state still agrees the
+    /// turn is in flight: the recorded optimistic user row is still present
+    /// and unpersisted, and every row after it is unpersisted too.
+    ///
+    /// The residual window this cannot close: a turn this surface submitted
+    /// that never persisted anything server-side (accepted, then lost) is
+    /// indistinguishable from our own twin when exactly ONE `.user` row
+    /// follows the anchor — the app stays observational until the next
+    /// authoritative sync converges and drops the phantom row. Turn A's
+    /// completion, a second user turn, idle liveness, and buffered settle
+    /// edges all still force the authoritative path.
+    private func locallyOwnedFreshnessTurnEvidence(
+        forRequested sessionID: String
+    ) -> LocallyOwnedTurnTailEvidence? {
+        guard turnState.isRunning,
+              let marker = locallyOwnedInFlightTurn,
+              marker.sessionIDs.contains(sessionID),
+              !durablePersistedRowIDs.contains(marker.optimisticUserRowID),
+              let userIndex = messages.lastIndex(where: {
+                  $0.id == marker.optimisticUserRowID
+              }),
+              messages[userIndex...].allSatisfy({
+                  !durablePersistedRowIDs.contains($0.id)
+              }) else {
+            return nil
+        }
+        return LocallyOwnedTurnTailEvidence(
+            baseline: marker.preSubmitOrderingBaseline
+        )
+    }
+
+    /// Chronological page rows strictly after `anchorIndex` whose ids the
+    /// local transcript does not already hold — rows streamed in live under
+    /// any identity dedupe by id, in both verdict paths.
+    private func persistedRowsAfter(
+        _ anchorIndex: Int?,
+        in transcript: PersistedSessionTranscript,
+        heldIDs: Set<String>
+    ) -> [ChatMessage] {
+        var knownIDs = heldIDs
+        var newRows: [ChatMessage] = []
+        let firstCandidateIndex = anchorIndex.map { $0 + 1 }
+            ?? transcript.messages.startIndex
+        for row in transcript.messages[firstCandidateIndex...]
+        where knownIDs.insert(row.id).inserted {
+            newRows.append(row)
+        }
+        return newRows
+    }
+
+    /// Adopts the freshly-decided foreground liveness after a freshness
+    /// verdict: the merged transcript / unchanged snapshot is the OLDER
+    /// observation, so buffered events replay after it (newer edges win) and
+    /// the boundary settles last.
+    private func adoptForegroundLiveness(
+        _ running: Bool,
+        token: UUID,
+        automaticWorkToken: ChatResumeAutomaticWorkToken?
+    ) {
+        if running {
+            adoptForegroundRunningState(
+                reconciliationToken: token,
+                automaticWorkToken: automaticWorkToken
+            )
+        } else {
+            adoptForegroundAuthoritativeIdle(
+                token: token,
+                automaticWorkToken: automaticWorkToken
+            )
+        }
+    }
+
+    /// Appends cross-surface persisted advancement to the live transcript.
+    /// Append-only by construction: the verdict selected rows strictly after
+    /// the newest local durable anchor, deduplicated against every held row
+    /// id, so the loaded-earlier prefix and any durably-anchored tail remain
+    /// exactly as they were. The persisted window is re-anchored to the
+    /// fetched page (same coverage-reset semantics as a reconcile refresh:
+    /// subsequent backfills retrace deduped page-sized increments), keeping
+    /// "Load earlier messages" coherent without a resume.
+    private func applyPersistedForegroundAdvancement(
+        requestedSessionID: String,
+        transcript: PersistedSessionTranscript,
+        newRows: [ChatMessage],
+        runtimeSessionID: String,
+        profile: String
+    ) {
+        var knownIDs = Set(messages.map { $0.id })
+        var merged = messages
+        merged.reserveCapacity(merged.count + newRows.count)
+        for row in newRows where knownIDs.insert(row.id).inserted {
+            merged.append(row)
+        }
+        messages = merged
+        // The bounded read just proved exactly which persisted rows were
+        // missing and merged them: transcript freshness is restored, the
+        // accepted page re-establishes the persisted ordering frontier, and
+        // that page covers any outstanding local ordering debt.
+        transcriptFreshnessIsStale = false
+        persistedOrderingFrontier = Self.orderingFrontier(from: transcript)
+        pendingLocalOrderingDebt = nil
+        // The merge just made the newest persisted page local: adopt its
+        // durable ids as the frontier (same per-hydration replacement
+        // semantics as reconcile) so the next freshness check anchors
+        // against the rows this merge added.
+        durablePersistedRowIDs = transcript.durableRowIDs
+        let priorOwned: PersistedTranscriptWindowState? = priorWindowOwnsThisConversation(
+            persistedTranscriptWindow,
+            requestedSessionId: requestedSessionID,
+            resolvedSessionId: transcript.resolvedSessionId,
+            runtimeSessionId: runtimeSessionID,
+            profile: profile
+        ) ? persistedTranscriptWindow : nil
+        if let page = transcript.page, page.honorsTailContract {
+            persistedTranscriptWindow = PersistedTranscriptWindowState(
+                requestedSessionID: requestedSessionID,
+                profile: profile,
+                pageSize: PersistedTranscriptPagination.pageSize,
+                resolvedSessionID: transcript.resolvedSessionId,
+                runtimeSessionID: runtimeSessionID,
+                nextOffset: page.rawReturned,
+                canLoadEarlier: page.mayHaveOlderRows(fetchedRowCount: page.rawReturned),
+                hasBackfilledPrefix: priorOwned?.hasBackfilledPrefix ?? false
+            )
+        }
+    }
+
+    private func verifyChatResumeTransportHealth(_ client: HermesClient) async throws {
+        if let verifyTransportHealth = chatResumeLifecycleOperations.verifyTransportHealth {
+            try await verifyTransportHealth(client)
+        } else {
+            try await client.healthCheck()
+        }
+    }
+
+    /// Continuation guard for the foreground refresh: the refresh decision may
+    /// only mutate state while its reconciliation token still owns the
+    /// boundary (a newer transition rotates the token and cancels the task).
+    private func foregroundRefreshOwnsReconciliation(_ token: UUID) -> Bool {
+        token == reconciliationToken && !Task.isCancelled
+    }
+
+    // MARK: - Authoritative turn-state correction
 
     // MARK: - Session management
 
@@ -3793,7 +7813,19 @@ final class AppState: ObservableObject {
             )
             sessions = allSessions.filter { $0.source != .cron }
             cronSessions = allSessions.filter { $0.source == .cron }
-            if let activeSessionId { updateActiveSessionTitle(for: activeSessionId) }
+            // Labeled rows are positive identity evidence; commit them so
+            // notification routing survives a later catalog omission.
+            conversationIdentityIndex.recordCatalogIdentity(allSessions, profile: profile)
+            // A canonical Bot Chat's raw catalog row is titled exactly
+            // "Bot Chat": refreshing the ordinary active-title cache from it
+            // would persist the wire title over the bot's display label and
+            // write "Bot Chat" into the dashboard profile's persisted cache
+            // (the cold-restore bug). Ownership comes from the bot
+            // conversation registry, never a title guess.
+            if let activeSessionId,
+               botConversationProfile(for: activeSessionId) == nil {
+                updateActiveSessionTitle(for: activeSessionId)
+            }
             if let activeClient {
                 Task { [weak self] in
                     await self?.loadProjects(using: activeClient, profile: profile)
@@ -3806,7 +7838,7 @@ final class AppState: ObservableObject {
                 guard let activeClient, self.client === activeClient else { return false }
             }
             guard requiredViewportTransitionGeneration.map({ chatViewportTransitionIsCurrent(generation: $0) }) ?? true else { return false }
-            errorMessage = "Failed to load sessions: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Failed to load sessions: \(error.localizedDescription)")
             return false
         }
     }
@@ -3837,7 +7869,7 @@ final class AppState: ObservableObject {
             archivedSessions = uniqueSessions(loaded.filter { sessionBelongsToProfile($0, profile: profile) })
         } catch {
             guard profile == activeProfile else { return }
-            errorMessage = "Could not load archived conversations: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not load archived conversations: \(error.localizedDescription)")
         }
     }
 
@@ -3854,7 +7886,7 @@ final class AppState: ObservableObject {
               sessionBelongsToProfile(session, profile: activeProfile),
               let dashboardTicketBridge else { return false }
         if archived, isBusy, sessionMatchesActiveSession(session) {
-            errorMessage = "Stop the active response before archiving this conversation."
+            errorMessage = AppLocalization.string("Stop the active response before archiving this conversation.")
             return false
         }
 
@@ -3887,7 +7919,8 @@ final class AppState: ObservableObject {
             return true
         } catch {
             guard profile == activeProfile else { return false }
-            errorMessage = "Could not \(archived ? "archive" : "restore") this conversation: \(error.localizedDescription)"
+            let archivedAction = AppLocalization.string(archived ? "archive" : "restore")
+            errorMessage = AppLocalization.string("Could not \(archivedAction) this conversation: \(error.localizedDescription)")
             return false
         }
     }
@@ -3903,7 +7936,11 @@ final class AppState: ObservableObject {
 
         let profile = activeProfile
         let knownIDs = [session.id] + session.alternateIds
-        let titleRecoveryTaskKeys = Set(knownIDs.filter { !$0.isEmpty }.map { "\(profile)|\($0)" })
+        let titleRecoveryTaskKeys = Set(
+            knownIDs.filter { !$0.isEmpty }.map {
+                Self.secondaryTitleRecoveryTaskKey(profile: profile, sessionID: $0)
+            }
+        )
         sessionTitleRecoveryTracker.suppress(titleRecoveryTaskKeys)
         sessionMutationID = session.id
         defer {
@@ -3975,7 +8012,7 @@ final class AppState: ObservableObject {
               sessionBelongsToProfile(session, profile: activeProfile),
               let dashboardTicketBridge else { return false }
         if isBusy, sessionMatchesActiveSession(session) {
-            errorMessage = "Stop the active response before deleting this conversation."
+            errorMessage = AppLocalization.string("Stop the active response before deleting this conversation.")
             return false
         }
 
@@ -3988,9 +8025,14 @@ final class AppState: ObservableObject {
                 method: "DELETE"
             )
             guard profile == activeProfile else { return false }
+            let deletedSessionIDs = Set([session.id] + session.alternateIds)
             sessionYoloStore.clearOverride(
                 for: profile,
                 sessionIDs: [session.id] + session.alternateIds
+            )
+            revokeDeletedConversationIdentity(
+                sessionIDs: deletedSessionIDs,
+                profile: profile
             )
             removeSessionFromLiveCatalog(session)
             archivedSessions.removeAll { sessionMatches($0, session) }
@@ -3999,13 +8041,28 @@ final class AppState: ObservableObject {
             return true
         } catch {
             guard profile == activeProfile else { return false }
-            errorMessage = "Could not delete this conversation: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not delete this conversation: \(error.localizedDescription)")
             return false
         }
     }
 
     func isSessionMutationInFlight(_ session: SessionSummary) -> Bool {
         sessionMutationID == session.id
+    }
+
+    /// Explicit deletion revokes the conversation's identity: index
+    /// mappings, scroll/resume state, and cached presentation (with any
+    /// pending cards) must not survive under any of its aliases.
+    func revokeDeletedConversationIdentity(sessionIDs: Set<String>, profile: String) {
+        conversationIdentityIndex.removeSessionIDs(sessionIDs, profile: profile)
+        chatResumeCoordinator.removeSessions(
+            profile: profile,
+            sessionIDs: Array(sessionIDs)
+        )
+        sessionPresentationCache.removeSessions(
+            profile: profile,
+            sessionIDs: Array(sessionIDs)
+        )
     }
 
     private func encodedSessionID(_ sessionID: String) -> String {
@@ -4025,6 +8082,53 @@ final class AppState: ObservableObject {
             return [sessionID]
         }
         return Set([session.id] + session.alternateIds)
+    }
+
+    /// Captures the complete selected conversation identity from the CURRENT
+    /// catalog and scroll identity. Recovery callers MUST invoke this before
+    /// replacing the catalog: the accepted alias set is positively
+    /// established evidence, and the refreshed catalog that recovery is about
+    /// to publish is allowed to have temporarily forgotten the runtime alias.
+    /// Reconstructing the set from the already-replaced catalog would drop
+    /// the alias for exactly the reconcile window that needs it.
+    private func captureConversationIdentity(
+        for selectedID: String?,
+        scopeProfile: String? = nil
+    ) -> ConversationIdentity? {
+        guard let selectedID, !selectedID.isEmpty else { return nil }
+        var accepted = Set([selectedID])
+        var durableSessionID: String?
+        if let row = (sessions + cronSessions).first(where: {
+            $0.id == selectedID || $0.alternateIds.contains(selectedID)
+        }) {
+            accepted.formUnion([row.id] + row.alternateIds)
+            // The row's stored id is the positively labeled durable identity;
+            // a row without one is represented by its primary id.
+            durableSessionID = row.storedSessionId ?? row.id
+        } else if activeChatScrollSessionIdentity.contains(selectedID) {
+            // Not in the catalog anymore, but the scroll identity still holds
+            // positively confirmed aliases for it (mid-refresh windows).
+            accepted.formUnion(activeChatScrollSessionIdentity.equivalentSessionIDs)
+            // A canonical that DIFFERS from the selected id is positive
+            // durable evidence (the row resolved the alias). A canonical that
+            // EQUALS the selected id is self-referential (runtime-only
+            // conversation) — treating it as durable would turn the first
+            // labeled resume into a false contradiction, so leave durable
+            // unset and let the response establish it.
+            if let canonical = activeChatScrollSessionIdentity.canonicalSessionID,
+               canonical != selectedID {
+                durableSessionID = canonical
+            }
+        }
+        return ConversationIdentity(
+            // Capture metadata for the conversation's owning workspace: a
+            // canonical Bot Chat belongs to the bot's profile, not the
+            // dashboard's. The admission gate never compares this field.
+            profile: scopeProfile ?? activeProfile,
+            durableSessionID: durableSessionID,
+            runtimeSessionID: durableSessionID == selectedID ? nil : selectedID,
+            acceptedSessionIDs: accepted
+        )
     }
 
     private func sessionMatchesActiveSession(_ session: SessionSummary) -> Bool {
@@ -4051,12 +8155,13 @@ final class AppState: ObservableObject {
         guard sessionMatchesActiveSession(session) else { return }
         let transitionGeneration = acceptChatResumeConversationReplacement(replacement)
         markChatViewportReplacement()
-        setActiveSessionState(id: nil, title: "New conversation")
+        setActiveSessionState(id: nil, title: AppLocalization.string("New conversation"))
         messages = []
+        persistedTranscriptWindow = nil
+        resetTranscriptLifecycleEvidence()
         clearStreamingText()
         activeAssistantMessageId = nil
-        activeReasoningMessageId = nil
-        receivedReasoningForCurrentTurn = false
+        resetReasoningTurn()
         turnState = .idle
         finishChatViewportTransition(generation: transitionGeneration)
     }
@@ -4070,9 +8175,399 @@ final class AppState: ObservableObject {
         _ = await (sessionRefresh, jobsRefresh)
     }
 
+    // MARK: - Bot Mode (roster + canonical chat)
+
+    /// Refreshes the roster and the Bot Mode capability phase. Safe to call
+    /// on every Bots-surface appearance: an established roster is refreshed
+    /// in place, an empty one shows the loading phase. Responses fenced
+    /// against the dashboard/profile epoch so a stale async answer can never
+    /// describe the wrong server.
+    func refreshBotRoster() async {
+        if let running = botRosterRefreshFlight {
+            // JOIN the in-flight refresh instead of bailing on the
+            // single-flight guard. A `.task(id:)` identity change cancels
+            // the previous view task while its refresh is in flight; that
+            // holder releases the claim without committing a phase, so a
+            // replacement that merely returned could strand `.loading`.
+            // The work runs unstructured, so the join always sees it run to
+            // completion, and its epoch/dashboard guard still discards
+            // results captured before a server or dashboard transition.
+            await running.task.value
+            if botRosterRefreshFlight === running {
+                botRosterRefreshFlight = nil
+            }
+            // A joined refresh that was superseded by an identity
+            // transition discards its snapshot and commits nothing; fall
+            // through and run once for the current identity instead of
+            // leaving the empty roster stuck on `.loading`.
+            if !(botRoster.isEmpty && botModePhase == .loading) {
+                return
+            }
+        }
+        guard !isRefreshingBotRoster, botRosterRefreshFlight == nil else { return }
+        let flight = BotRosterRefreshFlight(task: Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.performBotRosterRefresh()
+        })
+        botRosterRefreshFlight = flight
+        await flight.task.value
+        if botRosterRefreshFlight === flight {
+            botRosterRefreshFlight = nil
+        }
+    }
+
+    /// The single-flight roster refresh. Runs unstructured (never cancelled
+    /// by a view task identity change) and keeps the token-based claim
+    /// release: only the holder of the CURRENT token may clear
+    /// `isRefreshingBotRoster`, so a superseded or invalidated refresh can
+    /// never clear a newer refresh's claim.
+    private func performBotRosterRefresh() async {
+        let epoch = botRosterEpoch
+        let dashboardID = activeDashboardID
+        guard let client, isConnected else {
+            if botRoster.isEmpty, botModePhase != .gatewayUnsupported {
+                botModePhase = .failed(
+                    message: AppLocalization.string("Connect to Hermes to see your bots.")
+                )
+            }
+            return
+        }
+        isRefreshingBotRoster = true
+        let refreshToken = UUID()
+        botRosterRefreshToken = refreshToken
+        // Ownership-checked release: only the refresh holding the CURRENT
+        // token releases the flag. A refresh superseded by invalidation
+        // (token cleared) or by a newer refresh (token replaced) never
+        // clears someone else's claim, and no identity transition can
+        // strand the flag.
+        defer {
+            if botRosterRefreshToken == refreshToken {
+                botRosterRefreshToken = nil
+                isRefreshingBotRoster = false
+            }
+        }
+        if botRoster.isEmpty {
+            botModePhase = .loading
+        }
+        do {
+            let snapshot: BotRosterSnapshot
+            if let botRoster = chatResumeLifecycleOperations.botRoster {
+                snapshot = try await botRoster(client)
+            } else {
+                snapshot = try await client.botRoster()
+            }
+            guard botModeStateIsCurrent(epoch: epoch, dashboardID: dashboardID) else { return }
+            // The FULL roster is kept: sessions-list hygiene must know every
+            // bot's canonical registry (including meta-hidden bots), while
+            // the roster VIEW hides meta-hidden rows for display only.
+            botRoster = BotProfile.displayOrder(snapshot.bots)
+            botModePhase = .available
+        } catch {
+            guard botModeStateIsCurrent(epoch: epoch, dashboardID: dashboardID),
+                  !Task.isCancelled else { return }
+            if HermesClient.isMissingRPCMethod(error) {
+                botModePhase = .gatewayUnsupported
+            } else if botRoster.isEmpty {
+                botModePhase = .failed(
+                    message: AppLocalization.string("Could not load bots.")
+                )
+            } else {
+                // An established roster stays on screen; the failure renders
+                // as a non-blocking notice above it.
+                botModePhase = .failed(
+                    message: AppLocalization.string("Could not refresh bots.")
+                )
+            }
+        }
+    }
+
+    private func botModeStateIsCurrent(
+        epoch: Int,
+        dashboardID: UUID?
+    ) -> Bool {
+        // The roster is gateway-wide: the epoch (server identity) and the
+        // dashboard fence it; the dashboard's own profile selection is
+        // irrelevant to a profiles.list answer.
+        epoch == botRosterEpoch && dashboardID == activeDashboardID
+    }
+
+    /// Opens a bot's canonical Bot Chat: consult the name-identity registry,
+    /// open the confirmed chat (lineage tip), or — only once absence is
+    /// CONFIRMED — create the one hidden "Bot Chat". Fail-closed throughout:
+    /// a failed or unconfirmable lookup NEVER mints a chat, because that is
+    /// the one remaining way to fork a bot's forever chat. Concurrent opens
+    /// of the same bot share one flight.
+    @discardableResult
+    func openBotChat(for bot: BotProfile) async -> Bool {
+        guard let client, isConnected else {
+            errorMessage = AppLocalization.string("Connect to Hermes to chat with bots.")
+            return false
+        }
+        let flightKey = bot.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let flight = botChatOpenFlights[flightKey] {
+            return await flight.task?.value ?? false
+        }
+        // The closure captures the box WEAKLY: a strong capture would form
+        // a flight<->task retain cycle that outlives the map entry.
+        let flight = BotChatOpenFlight()
+        let task = Task { @MainActor [weak self, weak flight] () -> Bool in
+            // `flight` is retained strongly by the creating scope across
+            // `await task.value`, so the weak capture only breaks the
+            // box<->task cycle — it can never fire nil here.
+            guard let self, let flight else { return false }
+            // Identity-checked cleanup: a flight orphaned by a server switch
+            // (map cleared, then a newer flight for the same bot) must never
+            // evict that newer flight's entry.
+            defer {
+                if self.botChatOpenFlights[flightKey] === flight {
+                    self.botChatOpenFlights.removeValue(forKey: flightKey)
+                }
+            }
+            return await self.resolveAndOpenBotChat(bot, client: client)
+        }
+        flight.task = task
+        botChatOpenFlights[flightKey] = flight
+        return await task.value
+    }
+
+    /// A bot open spans several awaited RPCs. Every step re-validates that
+    /// the server identity this flight captured is still current; a server
+    /// switch mid-flight (invalidation cancels the task AND bumps the epoch)
+    /// abandons the flight silently — the user has moved on.
+    private func botOpenFenceIsCurrent(epoch: Int, client: HermesClient) -> Bool {
+        epoch == botRosterEpoch && client === self.client
+    }
+
+    private func resolveAndOpenBotChat(_ bot: BotProfile, client: HermesClient) async -> Bool {
+        let epoch = botRosterEpoch
+        // THE identity lookup, on the bot's own profile. A failed RPC is not
+        // "no Bot Chat exists" — it is "unknown", and unknown means retry.
+        let rows: [BotChatLookupRow]
+        do {
+            if let findBotChat = chatResumeLifecycleOperations.findBotChat {
+                rows = try await findBotChat(client, bot.name)
+            } else {
+                rows = try await client.findBotChatSession(profile: bot.name)
+            }
+        } catch {
+            guard botOpenFenceIsCurrent(epoch: epoch, client: client) else { return false }
+            return failBotChatOpen(bot, error: error, stage: .lookup)
+        }
+        guard botOpenFenceIsCurrent(epoch: epoch, client: client) else { return false }
+        switch BotChatResolver.resolve(rows: rows, rosterCanonicalID: bot.canonicalSessionID) {
+        case .failure(.unconfirmedAbsence):
+            refuseBotChatConfirmation(bot)
+            return false
+        case .success(.openExisting(let registryID, let resumeID)):
+            return await openCanonicalBotChat(
+                bot,
+                registryID: registryID,
+                resumeID: resumeID,
+                epoch: epoch,
+                client: client
+            )
+        case .success(.create):
+            return await createAndOpenBotChat(bot, client: client, epoch: epoch)
+        }
+    }
+
+    /// Opens an existing canonical chat through the ordinary session
+    /// machinery: `requestOpenSession`'s full path (identity capture,
+    /// admission gate, hydration, reconcile). The resume rides the bot's
+    /// profile scope; nothing bot-specific runs beside it.
+    private func openCanonicalBotChat(
+        _ bot: BotProfile,
+        registryID: String,
+        resumeID: String,
+        epoch: Int,
+        client: HermesClient
+    ) async -> Bool {
+        noteBotChatSession(resumeID, profile: bot.name)
+        noteBotChatSession(registryID, profile: bot.name)
+        let outcome = await performSessionOpen(
+            resumeID,
+            reusing: nil,
+            conversationProfile: bot.name,
+            preferredTitle: bot.displayLabel
+        )
+        // Only a GENUINE failure owned by this invocation may publish: a
+        // superseded open (the user navigated elsewhere, or re-tapped this
+        // same bot so a newer open owns the viewport) is navigation state,
+        // not an error.
+        if outcome == .failed, !Task.isCancelled,
+           botOpenFenceIsCurrent(epoch: epoch, client: client),
+           errorMessage == nil {
+            errorMessage = AppLocalization.string(
+                "Could not open \(bot.displayLabel)'s Bot Chat."
+            )
+        }
+        return outcome == .opened
+    }
+
+    /// Creates the bot's ONE forever chat (lookup confirmed absence): hidden,
+    /// titled "Bot Chat", following the profile's current config. The eager
+    /// `session.title` write materializes the lazy row BEFORE any open, so a
+    /// second click can never mint a duplicate while the first is in flight.
+    /// A title-uniqueness rejection — at the title write, or at `session.create`
+    /// itself on gateways that enforce the canonical name at create time —
+    /// means another writer won the canonical title in between:
+    /// adopt-before-mint. Re-run the authoritative lookup and open the
+    /// winner instead of forking. The in-memory registry is only seeded
+    /// AFTER the canonical title has landed, so an abandoned lazy session
+    /// never leaves a stale entry behind.
+    private func createAndOpenBotChat(_ bot: BotProfile, client: HermesClient, epoch: Int) async -> Bool {
+        let created: (sessionId: String, storedSessionId: String?)
+        do {
+            if let createBotChat = chatResumeLifecycleOperations.createBotChat {
+                created = try await createBotChat(client, bot.name)
+            } else {
+                created = try await client.createBotChatSession(profile: bot.name)
+            }
+        } catch {
+            if BotChatTitleCollision.isError(error) {
+                return await adoptWinningBotChat(bot, client: client, epoch: epoch)
+            }
+            guard botOpenFenceIsCurrent(epoch: epoch, client: client) else { return false }
+            return failBotChatOpen(bot, error: error, stage: .create)
+        }
+        guard botOpenFenceIsCurrent(epoch: epoch, client: client) else { return false }
+        do {
+            if let titleBotChat = chatResumeLifecycleOperations.titleBotChat {
+                try await titleBotChat(client, created.sessionId, BotMode.canonicalChatTitle, bot.name)
+            } else {
+                try await client.setSessionTitle(
+                    created.sessionId,
+                    title: BotMode.canonicalChatTitle,
+                    profile: bot.name
+                )
+            }
+        } catch {
+            if BotChatTitleCollision.isError(error) {
+                return await adoptWinningBotChat(bot, client: client, epoch: epoch)
+            }
+            guard botOpenFenceIsCurrent(epoch: epoch, client: client) else { return false }
+            return failBotChatOpen(bot, error: error, stage: .title)
+        }
+        guard botOpenFenceIsCurrent(epoch: epoch, client: client) else { return false }
+        noteBotChatSession(created.sessionId, profile: bot.name)
+        if let stored = created.storedSessionId {
+            noteBotChatSession(stored, profile: bot.name)
+        }
+        return await openCanonicalBotChat(
+            bot,
+            registryID: created.storedSessionId ?? created.sessionId,
+            resumeID: created.sessionId,
+            epoch: epoch,
+            client: client
+        )
+    }
+
+    /// The canonical title was taken by another writer between our registry
+    /// miss and the eager title. Re-consult the registry; adopt the winner.
+    /// Our abandoned lazy session holds zero messages and the gateway prunes
+    /// it. If the winner cannot be confirmed, fail closed — never open our
+    /// untitled stray, never mint again.
+    private func adoptWinningBotChat(_ bot: BotProfile, client: HermesClient, epoch: Int) async -> Bool {
+        let rows: [BotChatLookupRow]
+        do {
+            if let findBotChat = chatResumeLifecycleOperations.findBotChat {
+                rows = try await findBotChat(client, bot.name)
+            } else {
+                rows = try await client.findBotChatSession(profile: bot.name)
+            }
+        } catch {
+            // A cancelled or server-switched flight abandons silently, like
+            // every other stage; only a current flight speaks.
+            guard botOpenFenceIsCurrent(epoch: epoch, client: client) else { return false }
+            refuseBotChatConfirmation(bot)
+            return false
+        }
+        guard botOpenFenceIsCurrent(epoch: epoch, client: client) else { return false }
+        if case .success(.openExisting(let registryID, let resumeID)) =
+            BotChatResolver.resolve(rows: rows, rosterCanonicalID: bot.canonicalSessionID) {
+            return await openCanonicalBotChat(
+                bot,
+                registryID: registryID,
+                resumeID: resumeID,
+                epoch: epoch,
+                client: client
+            )
+        }
+        refuseBotChatConfirmation(bot)
+        return false
+    }
+
+    private enum BotChatOpenStage {
+        case lookup
+        case create
+        case title
+    }
+
+    private func failBotChatOpen(
+        _ bot: BotProfile,
+        error: Error,
+        stage: BotChatOpenStage
+    ) -> Bool {
+        if HermesClient.isMissingRPCMethod(error) {
+            botModePhase = .gatewayUnsupported
+            errorMessage = AppLocalization.string("Bot Mode requires a newer Hermes gateway.")
+        } else if !Task.isCancelled {
+            switch stage {
+            case .lookup:
+                errorMessage = AppLocalization.string(
+                    "Could not check \(bot.displayLabel)'s Bot Chat — not starting a new chat."
+                )
+            case .create:
+                errorMessage = AppLocalization.string(
+                    "Could not create \(bot.displayLabel)'s Bot Chat."
+                )
+            case .title:
+                errorMessage = AppLocalization.string(
+                    "Could not title \(bot.displayLabel)'s Bot Chat — not starting a new chat."
+                )
+            }
+        }
+        return false
+    }
+
+    private func refuseBotChatConfirmation(_ bot: BotProfile) {
+        errorMessage = AppLocalization.string(
+            "Could not confirm \(bot.displayLabel)'s Bot Chat — not starting a new chat."
+        )
+    }
+
+    private func noteBotChatSession(_ sessionID: String?, profile: String) {
+        guard let sessionID,
+              !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        botChatSessionProfiles[sessionID] = profile
+    }
+
+    #if DEBUG
+    func noteBotChatSessionForTesting(_ sessionID: String, profile: String) {
+        noteBotChatSession(sessionID, profile: profile)
+    }
+    #endif
+
+    /// The bot profile an in-flight or active conversation belongs to, when
+    /// that conversation is a canonical Bot Chat. Nil for ordinary sessions —
+    /// the ordinary dashboard scope applies.
+    private func botConversationProfile(for sessionID: String) -> String? {
+        botChatSessionProfiles[sessionID]
+    }
+
+    /// The presentation-cache namespace for a conversation. Canonical Bot
+    /// Chats are partitioned under their OWN profile so presentation rows
+    /// and pending decision cards survive dashboard-profile switches and
+    /// reconcile under the same key they were written with; ordinary
+    /// conversations resolve to the dashboard profile exactly as before.
+    private func presentationProfile(for sessionID: String?) -> String {
+        guard let sessionID else { return activeProfile }
+        return botConversationProfile(for: sessionID) ?? activeProfile
+    }
+
     @discardableResult
     func openSession(_ sessionId: String) async -> Bool {
-        await openSession(sessionId, reusing: nil)
+        await performSessionOpen(sessionId, reusing: nil) == .opened
     }
 
     @discardableResult
@@ -4098,29 +8593,48 @@ final class AppState: ObservableObject {
         explicitSessionOpenTask = nil
     }
 
-    private func openSession(
+    /// Why an open did not complete. A SUPERSEDED open (a newer navigation
+    /// owns the viewport transition) is navigation state, never a failure:
+    /// callers must not publish failure text for it, even when the newer
+    /// navigation re-opened the SAME session id.
+    enum SessionOpenOutcome {
+        case opened
+        case superseded
+        case failed
+    }
+
+    private func performSessionOpen(
         _ sessionId: String,
-        reusing viewportTransitionGeneration: UInt64?
-    ) async -> Bool {
-        guard let client else { return false }
+        reusing viewportTransitionGeneration: UInt64?,
+        presentationMigrationSessionIDs: Set<String> = [],
+        conversationProfile: String? = nil,
+        preferredTitle: String? = nil
+    ) async -> SessionOpenOutcome {
+        guard let client else { return .failed }
         let previousTurnState = turnState
-        if let session = (sessions + cronSessions).first(where: {
-            $0.id == sessionId || $0.alternateIds.contains(sessionId)
-        }), !sessionBelongsToProfile(session, profile: activeProfile) {
-            errorMessage = "That conversation belongs to another workspace. Switch profiles to open it."
-            return false
+        // The catalog-ownership guard protects ORDINARY opens from another
+        // dashboard profile's rows. A bot open carries the conversation's
+        // profile explicitly (its canonical row may legitimately surface in
+        // the raw catalog as a stray from older server data), so the guard
+        // would only misfire here.
+        if conversationProfile == nil,
+           let session = (sessions + cronSessions).first(where: {
+               $0.id == sessionId || $0.alternateIds.contains(sessionId)
+           }), !sessionBelongsToProfile(session, profile: activeProfile) {
+            errorMessage = AppLocalization.string("That conversation belongs to another workspace. Switch profiles to open it.")
+            return .failed
         }
         let transitionGeneration: UInt64
         if let viewportTransitionGeneration {
             guard chatViewportTransitionIsCurrent(
                 generation: viewportTransitionGeneration
-            ) else { return false }
+            ) else { return .superseded }
             transitionGeneration = viewportTransitionGeneration
         } else {
             transitionGeneration = beginExplicitChatViewportTransition()
         }
         guard chatViewportTransitionIsCurrent(generation: transitionGeneration) else {
-            return false
+            return .superseded
         }
         markChatViewportReplacement()
         // Atomically switch session identity BEFORE clearing the transcript.
@@ -4128,37 +8642,106 @@ final class AppState: ObservableObject {
         // through `eventBelongsToActiveSession` and repopulating the
         // cleared message array while reconciliation is in flight.
         flushPendingPresentationCache()
+        let openedIdentity = captureConversationIdentity(
+            for: sessionId,
+            scopeProfile: conversationProfile
+        )
         let token = beginReconciliation()
         let acceptedSessionIDs = knownSessionIDs(for: sessionId)
-        setActiveSessionState(id: sessionId)
+        // A bot chat is not the dashboard workspace's selected conversation:
+        // it must never seed the cold-restore resume store with a pointer
+        // the ordinary restore path cannot resume (upstream keeps bot tabs
+        // out of the main workspace's selection for the same reason). The
+        // registry conjunct covers a KNOWN bot conversation opened through
+        // the ordinary path, exactly like the title guard below.
+        setActiveSessionState(
+            id: sessionId,
+            recordsResumeSelection: conversationProfile == nil
+                && botConversationProfile(for: sessionId) == nil
+        )
         messages = []
+        persistedTranscriptWindow = nil
+        // Freshness evidence belongs to the conversation it was captured
+        // for; the reconcile below re-establishes it authoritatively.
+        resetTranscriptLifecycleEvidence()
         clearStreamingText()
         activeAssistantMessageId = nil
-        activeReasoningMessageId = nil
-        updateActiveSessionTitle(for: sessionId)
+        resetReasoningTurn()
+        // A canonical Bot Chat carries its own title (the bot's display
+        // label) and must never write the catalog's wire title — or any
+        // title — into the dashboard profile's persisted title cache. Both
+        // conditions are required: the parameter covers the roster's own
+        // open, and the registry covers a KNOWN bot conversation opened
+        // through the ordinary path (`requestOpenSession` and friends,
+        // which pass no conversation profile).
+        if conversationProfile == nil,
+           botConversationProfile(for: sessionId) == nil {
+            updateActiveSessionTitle(for: sessionId)
+        }
+        if let preferredTitle, !preferredTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            activeSessionTitle = preferredTitle
+        }
         let reconciled = await reconcile(
             sessionId: sessionId,
             using: client,
             token: token,
             acceptedSessionIDs: acceptedSessionIDs,
-            requiredViewportTransitionGeneration: transitionGeneration
+            conversationIdentity: openedIdentity,
+            requiredViewportTransitionGeneration: transitionGeneration,
+            presentationMigrationSessionIDs: presentationMigrationSessionIDs,
+            conversationProfile: conversationProfile
         )
         guard chatViewportTransitionIsCurrent(generation: transitionGeneration) else {
-            return false
+            return .superseded
         }
         if !reconciled {
             finishChatViewportTransition(generation: transitionGeneration)
             if Task.isCancelled, turnState == .synchronizing {
                 turnState = previousTurnState
             }
+            // This open still owns the viewport, so the reconcile failure is
+            // genuine (identity rejection and friends set their own message).
+            return .failed
         }
-        return reconciled
+        return .opened
     }
 
     /// Routes a notification to its originating profile/session without
     /// allowing the ordinary cold-start session restoration to win first.
     func openNotificationTarget(_ target: ConduitNotificationTarget) async -> Bool {
-        guard connection != nil else { return false }
+        // Dashboard ownership gate (#148 / B3): a push from dashboard A is
+        // never processed against active dashboard B, even when profile,
+        // session, and request ids all collide. A push belonging to another
+        // KNOWN dashboard switches to it first — the decision card is
+        // recorded only after the owning dashboard is active, so it can
+        // never land in the outgoing dashboard's state. Unknown or unscoped
+        // identities fail closed.
+        switch NotificationDashboardOwnership.resolve(
+            targetDashboardID: target.dashboardID,
+            hasMalformedDashboardID: target.hasMalformedDashboardID,
+            activeDashboardID: activeDashboardID,
+            savedDashboardIDs: savedDashboardRegistry.dashboards.map(\.id)
+        ) {
+        case .route:
+            guard connection != nil else { return false }
+        case .switchFirst(let dashboardID):
+            await switchDashboard(to: dashboardID)
+            guard isConnected, activeDashboardID == dashboardID, client != nil else {
+                // The switch failed: the target stays selected with its
+                // sign-in/repair surface, and the notification routes
+                // nowhere. No other dashboard is auto-connected.
+                errorMessage = AppLocalization.string("Could not connect to that dashboard to open this notification.")
+                return false
+            }
+        case .failClosed(let failure):
+            switch failure {
+            case .unrecognizedDashboard:
+                errorMessage = AppLocalization.string("This notification belongs to a dashboard this device doesn't recognize. Add that dashboard again to continue.")
+            case .unscopedPush:
+                errorMessage = AppLocalization.string("This notification predates multi-dashboard pairing. Update the notifier on the sending gateway and pair it again to continue.")
+            }
+            return false
+        }
         let notificationAttemptID = UUID()
         activeNotificationOpenAttemptID = notificationAttemptID
         isOpeningNotificationSession = true
@@ -4207,27 +8790,101 @@ final class AppState: ObservableObject {
             return false
         }
         let requestedID = target.sessionId
-        let resumableID = NotificationSessionResolver.resumableSessionID(
-            for: requestedID,
-            in: sessions + cronSessions
+        // The fresh catalog was just published (its labeled rows are already
+        // committed to the identity index), so resolution runs through the
+        // evidence hierarchy: explicit durable id from the payload, catalog
+        // alias, confirmed index alias — and only then the legacy raw
+        // runtime resume. An unknown runtime id is never reinterpreted as
+        // some other conversation's durable id.
+        let route = NotificationSessionResolver.route(
+            target: target,
+            catalog: sessions + cronSessions,
+            identityIndex: conversationIdentityIndex,
+            profile: activeProfile
         )
         // A decision raised while the app was backgrounded is delivered as a
         // structured payload on the notification (the one-shot gateway stream
-        // event was missed). Cache it under both the runtime and resolved
-        // stored IDs so the upcoming resume's `merge` restores the card
-        // regardless of which identity the gateway resumes against.
+        // event was missed). The card is recorded BEFORE the open — the
+        // upcoming resume's `merge` restores it into the live transcript —
+        // but persisted ONLY under the identity the push itself named
+        // (`requestedID`): that id provably belonged to the notified
+        // conversation at push time. The payload's durable claim is NOT
+        // written while unproven — a rejected open must not leave a card
+        // under a durable it merely claimed. When the open succeeds, the
+        // admitted resume's consolidation migrates the card to the durable
+        // key and retires the runtime key.
         if let decision = target.decision {
-            recordNotificationDecision(decision, sessionIDs: [resumableID, requestedID])
+            let knownKeys = route.durableSessionID.map { durable in
+                [route.resumeTargetID, requestedID, durable]
+            } ?? [route.resumeTargetID, requestedID]
+            recordNotificationDecision(
+                decision,
+                sessionIDs: knownKeys,
+                cacheSessionIDs: [requestedID]
+            )
         }
-        let opened = await openSession(
-            resumableID,
-            reusing: transitionGeneration
-        )
+        let opened = await performSessionOpen(
+            route.resumeTargetID,
+            reusing: transitionGeneration,
+            // The push-named runtime id is a PRESENTATION MIGRATION SOURCE,
+            // never an identity alias: a pending decision card recorded
+            // under it before the open must be promoted into the admitted
+            // durable conversation now that admission succeeded. On a
+            // rejected open nothing migrates (the hook only runs on
+            // admission success).
+            presentationMigrationSessionIDs: [requestedID]
+        ) == .opened
+        // Commit the payload's dual identity as positive evidence only once
+        // the open actually succeeded — a failed resume (e.g. the durable
+        // conversation was deleted server-side) must not leave a mapping
+        // that dead-routes future notifications.
+        if opened, let durable = route.durableSessionID {
+            if let conflict = conversationIdentityIndex.record(
+                runtimeID: requestedID,
+                durableID: durable,
+                profile: activeProfile,
+                source: .notification
+            ) {
+                sessionCatalogLog.fault(
+                    "Notification identity conflict: runtime \(requestedID, privacy: .public) keeps confirmed durable \(conflict.confirmedDurableID, privacy: .public); payload claimed \(durable, privacy: .public)"
+                )
+            }
+        }
+        if !opened, let decision = target.decision,
+           let evictionKey = Self.pendingDecisionEvictionKey(for: decision) {
+            // The claim was rejected: evict the pre-open card from the
+            // push-named runtime key. Without this, the stale card would
+            // still sit under that runtime id and a LATER legitimate open
+            // of the true owner would promote it into the wrong durable
+            // conversation.
+            sessionPresentationCache.removePendingDecision(
+                key: evictionKey,
+                profile: presentationProfile(for: requestedID),
+                sessionIDs: [requestedID]
+            )
+        }
         guard notificationOpenAttemptIsCurrent(
             id: notificationAttemptID,
             transitionGeneration: transitionGeneration
         ) else { return false }
         return opened
+    }
+
+    /// The stable decision key a push-delivered card was recorded under
+    /// (`approval:<sessionKey>` / `clarify:<requestId>`) — used to evict a
+    /// pre-open card when its open is rejected. Batch clarifies share the
+    /// scalar key shape via their relay request id.
+    private static func pendingDecisionEvictionKey(
+        for decision: PendingDecisionPayload
+    ) -> String? {
+        switch decision {
+        case .approval(let sessionKey, _, _):
+            return "approval:\(sessionKey)"
+        case .clarify(let requestId, _, _):
+            return "clarify:\(requestId)"
+        case .clarifyBatch(let requestId, _):
+            return "clarify:\(requestId)"
+        }
     }
 
     /// Caches a push-delivered decision card so the resume merge can restore
@@ -4237,10 +8894,19 @@ final class AppState: ObservableObject {
     /// The decision's session key must match one of the routed session
     /// identities — a mismatched key could not be answered via
     /// `approval.respond` and would only duplicate or contradict the live card.
+    /// `cacheSessionIDs` is the (durable-owned) key set the card persists
+    /// under; `sessionIDs` remains the answerability guard.
     private func recordNotificationDecision(
         _ decision: PendingDecisionPayload,
-        sessionIDs: [String]
+        sessionIDs: [String],
+        cacheSessionIDs: [String]? = nil
     ) {
+        let persistedIDs = cacheSessionIDs ?? sessionIDs
+        // The notified conversation's own namespace: the live session on
+        // screen is not necessarily the conversation the push named, and
+        // the later open/eviction of the named conversation must find the
+        // card under the same key it was recorded under.
+        let recordProfile = presentationProfile(for: persistedIDs.first ?? activeSessionId)
         switch decision {
         case let .approval(sessionKey, description, choices):
             // Compare trimmed on both sides: the payload parser trims the
@@ -4270,8 +8936,8 @@ final class AppState: ObservableObject {
             )
             sessionPresentationCache.recordPendingDecision(
                 message,
-                profile: activeProfile,
-                sessionIDs: sessionIDs
+                profile: recordProfile,
+                sessionIDs: persistedIDs
             )
         case let .clarify(requestId, question, choices):
             // Relay-delivered clarify: the plugin middleware minted this id and
@@ -4288,14 +8954,31 @@ final class AppState: ObservableObject {
             let message = ChatMessage(
                 id: "clarify-\(requestId)",
                 role: .clarify,
-                content: question,
+                content: activity.displayQuestion,
                 timestamp: Self.localTimestamp(),
                 clarify: activity
             )
             sessionPresentationCache.recordPendingDecision(
                 message,
-                profile: activeProfile,
-                sessionIDs: sessionIDs
+                profile: recordProfile,
+                sessionIDs: persistedIDs
+            )
+        case let .clarifyBatch(requestId, questions):
+            // Batch relay decision (current notifier): the SAME batch
+            // ClarifyActivity/ClarifyCard model as native clarifies — the
+            // transport is the only difference.
+            let activity = ClarifyActivity(requestId: requestId, questions: questions)
+            let message = ChatMessage(
+                id: "clarify-\(requestId)",
+                role: .clarify,
+                content: activity.displayQuestion,
+                timestamp: Self.localTimestamp(),
+                clarify: activity
+            )
+            sessionPresentationCache.recordPendingDecision(
+                message,
+                profile: recordProfile,
+                sessionIDs: persistedIDs
             )
         }
     }
@@ -4328,7 +9011,7 @@ final class AppState: ObservableObject {
     func createNewSession(cwd: String? = nil) async {
         guard !isProfileSwitching, isConnected, !isConnecting, let client else {
             if isProfileSwitching || isConnecting {
-                errorMessage = "Wait for the workspace switch to finish before starting a conversation."
+                errorMessage = AppLocalization.string("Wait for the workspace switch to finish before starting a conversation.")
             }
             return
         }
@@ -4338,7 +9021,7 @@ final class AppState: ObservableObject {
         }
         let profile = activeProfile
         cacheMessagePresentation()
-        activeSessionTitle = "New conversation"
+        activeSessionTitle = AppLocalization.string("New conversation")
         let token = beginReconciliation()
         turnState = .synchronizing
         await createAndReconcileSession(using: client, profile: profile, token: token, cwd: cwd)
@@ -4361,6 +9044,7 @@ final class AppState: ObservableObject {
             using: client,
             token: token,
             acceptedSessionIDs: knownSessionIDs(for: sessionId),
+            conversationIdentity: captureConversationIdentity(for: sessionId),
             requiredViewportTransitionGeneration: transitionGeneration
         )
         if !succeeded || messages == previousMessages {
@@ -4387,7 +9071,7 @@ final class AppState: ObservableObject {
             return SessionBranchMessage(role: message.role, content: trimmed)
         }
         guard !prefix.isEmpty else {
-            errorMessage = "There is no message history to branch from."
+            errorMessage = AppLocalization.string("There is no message history to branch from.")
             return
         }
 
@@ -4396,7 +9080,7 @@ final class AppState: ObservableObject {
         let previousTurnState = turnState
         let profile = activeProfile
         turnState = .synchronizing
-        let title = "Branch of \(activeSessionTitle)"
+        let title = AppLocalization.string("Branch of \(activeSessionTitle)")
         let transitionGeneration = acceptChatResumeConversationReplacement(.branch)
         defer {
             cancelChatViewportTransitionIfNoReplacement(generation: transitionGeneration)
@@ -4426,7 +9110,7 @@ final class AppState: ObservableObject {
             if let returnedProfile = branched.profile,
                !profilesMatch(returnedProfile, profile) {
                 turnState = previousTurnState
-                errorMessage = "Hermes created this branch in \(profileDisplayName(returnedProfile)), not \(profileDisplayName(profile)). It was not opened."
+                errorMessage = AppLocalization.string("Hermes created this branch in \(profileDisplayName(returnedProfile)), not \(profileDisplayName(profile)). It was not opened.")
                 guard await loadSessions(
                     forceRefresh: true,
                     requiredViewportTransitionGeneration: transitionGeneration
@@ -4451,13 +9135,29 @@ final class AppState: ObservableObject {
                     .filter { $0 != branched.storedSessionId ?? branched.sessionId },
                 title: title,
                 model: runtime.model.isEmpty ? "Hermes" : runtime.model,
-                updatedLabel: "now",
+                updatedLabel: AppLocalization.string("now"),
                 profile: activeProfile,
                 source: .chat,
                 isActive: true,
                 isArchived: false,
                 lineageRootId: parentSessionId
             )
+            // A branch is its own durable conversation: its response ids are
+            // fresh authoritative evidence for the BRANCH only (adopted into
+            // the catalog below). They must never alias the source
+            // conversation, and the source keeps its own mappings.
+            if let runtime = ChatScrollIdentityNormalization.sessionID(branched.sessionId),
+               let durable = ChatScrollIdentityNormalization.sessionID(
+                   branched.storedSessionId ?? branched.sessionId
+               ),
+               runtime != durable {
+                conversationIdentityIndex.recordAuthoritative(
+                    runtimeID: runtime,
+                    durableID: durable,
+                    profile: activeProfile,
+                    source: .branch
+                )
+            }
             sessions = [summary] + sessions.map { existing in
                 var updated = existing
                 updated.isActive = false
@@ -4471,6 +9171,7 @@ final class AppState: ObservableObject {
                 using: client,
                 token: token,
                 acceptedSessionIDs: knownSessionIDs(for: branched.sessionId),
+                conversationIdentity: captureConversationIdentity(for: branched.sessionId),
                 requiredViewportTransitionGeneration: transitionGeneration
             )
             guard chatViewportTransitionIsCurrent(generation: transitionGeneration),
@@ -4493,7 +9194,7 @@ final class AppState: ObservableObject {
                   profile == activeProfile,
                   self.client === client else { return }
             turnState = previousTurnState
-            errorMessage = "Could not branch conversation: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not branch conversation: \(error.localizedDescription)")
         }
     }
 
@@ -4503,6 +9204,7 @@ final class AppState: ObservableObject {
         ComposerSubmissionContext(
             profile: activeProfile,
             sessionID: activeSessionId,
+            durableSessionID: activeSessionId.flatMap { canonicalSessionID(for: $0) },
             clientIdentity: client.map(ObjectIdentifier.init),
             clientEpoch: activeClientEpoch,
             viewportTransitionGeneration: chatViewportTransitionGeneration
@@ -4510,11 +9212,29 @@ final class AppState: ObservableObject {
     }
 
     private func isCurrentComposerSubmission(_ context: ComposerSubmissionContext) -> Bool {
-        context.profile == activeProfile
-            && context.sessionID == activeSessionId
-            && context.clientIdentity == client.map(ObjectIdentifier.init)
-            && context.clientEpoch == activeClientEpoch
-            && context.viewportTransitionGeneration == chatViewportTransitionGeneration
+        guard context.profile == activeProfile,
+              context.clientIdentity == client.map(ObjectIdentifier.init),
+              context.clientEpoch == activeClientEpoch,
+              context.viewportTransitionGeneration == chatViewportTransitionGeneration else {
+            return false
+        }
+        // A captured nil session (pristine new-chat canvas) only stays valid
+        // while no session was selected since; any active session means the
+        // canvas was replaced.
+        guard let capturedSessionID = context.sessionID else {
+            return activeSessionId == nil
+        }
+        guard let activeSessionId else { return false }
+        if capturedSessionID == activeSessionId {
+            // Exact routing-string equality alone is not proof the suspended
+            // work still belongs to the same durable conversation — catalog
+            // re-attribution can hand the same runtime string to a different
+            // conversation. The exact path therefore requires durable
+            // ownership proven strictly (see
+            // composerExactMatchDurableIdentityMatches).
+            return composerExactMatchDurableIdentityMatches(context)
+        }
+        return currentComposerSubmissionContextIfOwnedAndAliased(context) != nil
     }
 
     private func composerSubmissionOwnershipIsCurrent(
@@ -4555,16 +9275,65 @@ final class AppState: ObservableObject {
     ) -> ComposerSubmissionContext? {
         guard composerSubmissionOwnershipIsCurrent(context),
               let activeSessionId,
-              composerSessionIDsAreEquivalent(context.sessionID, activeSessionId) else {
+              composerSessionIDsAreEquivalent(context.sessionID, activeSessionId),
+              composerDurableIdentityMatches(context) else {
             return nil
         }
         return ComposerSubmissionContext(
             profile: context.profile,
             sessionID: activeSessionId,
+            durableSessionID: context.durableSessionID,
             clientIdentity: context.clientIdentity,
             clientEpoch: context.clientEpoch,
             viewportTransitionGeneration: context.viewportTransitionGeneration
         )
+    }
+
+    /// Defense-in-depth durable fence for the alias path: the equivalence
+    /// check above admits positively confirmed aliases, and this additionally
+    /// requires the captured submission to belong to the conversation the
+    /// aliases mean. Never overrides the profile/client/epoch/viewport
+    /// generation fences — a navigation handoff (A → B → A) is rejected by
+    /// the viewport generation fence even though the durable id matches
+    /// again on return.
+    private func composerDurableIdentityMatches(_ context: ComposerSubmissionContext) -> Bool {
+        guard let capturedDurable = context.durableSessionID else { return true }
+        guard let activeSessionId,
+              let currentDurable = canonicalSessionID(for: activeSessionId) else {
+            return true
+        }
+        return capturedDurable == currentDurable
+            || composerSessionIDsAreEquivalent(capturedDurable, currentDurable)
+    }
+
+    /// Durable fence for the EXACT session-ID path. Strict on purpose: when
+    /// the routing strings still match, the only way the durable ownership
+    /// could have drifted is catalog re-attribution (the same runtime string
+    /// now resolving to a different row), so the comparison must not bridge
+    /// through scroll-identity alias history — that history is precisely
+    /// what the re-attribution pollutes. Either the durable ids are equal,
+    /// one catalog row POSITIVELY contains both ids (confirming the same
+    /// conversation under its refreshed identity), or the catalog is silent
+    /// on the captured durable id (the expected state of a just-established
+    /// row-less durable key — no positive separation evidence, so no
+    /// rejection). A row that knows the current durable but not the captured
+    /// one is positive separation and fails the fence.
+    private func composerExactMatchDurableIdentityMatches(_ context: ComposerSubmissionContext) -> Bool {
+        guard let capturedDurable = context.durableSessionID else { return true }
+        guard let activeSessionId,
+              let currentDurable = canonicalSessionID(for: activeSessionId) else {
+            return true
+        }
+        if capturedDurable == currentDurable { return true }
+        let rows = sessions + cronSessions
+        if let row = rows.first(where: {
+            $0.id == capturedDurable || $0.alternateIds.contains(capturedDurable)
+        }) {
+            return Set([row.id] + row.alternateIds).contains(currentDurable)
+        }
+        return !rows.contains(where: {
+            $0.id == currentDurable || $0.alternateIds.contains(currentDurable)
+        })
     }
 
     private func recoverComposerSubmission(
@@ -4599,7 +9368,7 @@ final class AppState: ObservableObject {
 
         if isBusy {
             guard attachments.isEmpty else {
-                errorMessage = "Attachments can only be sent in a new message, after the current response finishes."
+                errorMessage = AppLocalization.string("Attachments can only be sent in a new message, after the current response finishes.")
                 return false
             }
 
@@ -4611,11 +9380,513 @@ final class AppState: ObservableObject {
             }
         }
 
+        // A lifecycle/recovery boundary (scene dip, reconnect, ambiguous
+        // submission) may have left the local idle state stale while Hermes
+        // still considers the session running. Submitting blind would enter
+        // Hermes' server-side busy policy with a message the user meant as a
+        // new turn — the queued/steered follow-up the user never asked for.
+        // One authoritative read-only probe corrects the state before the
+        // routing decision. Trusted state never pays for the probe.
+        if turnState == .idle, turnStateIsStale,
+           await correctStaleIdleTurnState(using: submissionContext) {
+            guard attachments.isEmpty else {
+                errorMessage = AppLocalization.string("Attachments can only be sent in a new message, after the current response finishes.")
+                return false
+            }
+            switch busyInputMode {
+            case .steer:
+                lifecycleLog.notice("submitComposer: stale-idle corrected to running → busy steer")
+                return await steer(text, context: submissionContext)
+            case .interrupt:
+                lifecycleLog.notice("submitComposer: stale-idle corrected to running → busy redirect/interrupt")
+                return await redirectOrInterruptAndSend(text, context: submissionContext)
+            }
+        }
+
+        // The stale-idle probe above can lose a race with a live busy edge:
+        // its post-await ownership check refuses to mutate a non-idle state
+        // and returns false, so without this re-route the submission would
+        // fall through to an ordinary prompt.submit into the now-running
+        // turn — the same busy-edge rule the freshness gate enforces.
+        if turnState.isRunning {
+            guard attachments.isEmpty else {
+                errorMessage = AppLocalization.string("Attachments can only be sent in a new message, after the current response finishes.")
+                return false
+            }
+            switch busyInputMode {
+            case .steer:
+                lifecycleLog.notice("submitComposer: busy edge raced the stale-idle probe → busy steer")
+                return await steer(text, context: submissionContext)
+            case .interrupt:
+                lifecycleLog.notice("submitComposer: busy edge raced the stale-idle probe → busy redirect/interrupt")
+                return await redirectOrInterruptAndSend(text, context: submissionContext)
+            }
+        }
+
+        // Transcript freshness is a separate concern from turn-state
+        // staleness: the registry probe above proves whether Hermes is busy,
+        // never whether the visible transcript is missing persisted rows. A
+        // foreground freshness read that failed transiently left that
+        // uncertainty open — resolve it with exactly one bounded tail-only
+        // retry before appending a new-turn prompt into a possibly-reordered
+        // transcript.
+        if turnState == .idle,
+           transcriptFreshnessIsStale || pendingLocalOrderingDebt != nil {
+            switch await confirmTranscriptFreshnessBeforeSend(
+                using: submissionContext
+            ) {
+            case .proceed:
+                break
+            case .routeToBusySubmission:
+                // The authoritative recovery revealed a live turn: the text
+                // routes through the configured busy submission, exactly like
+                // a stale-idle correction to running.
+                guard attachments.isEmpty else {
+                    errorMessage = AppLocalization.string("Attachments can only be sent in a new message, after the current response finishes.")
+                    return false
+                }
+                switch busyInputMode {
+                case .steer:
+                    lifecycleLog.notice(
+                        "submitComposer: freshness recovery found live turn → busy steer"
+                    )
+                    return await steer(text, context: submissionContext)
+                case .interrupt:
+                    lifecycleLog.notice(
+                        "submitComposer: freshness recovery found live turn → busy redirect/interrupt"
+                    )
+                    return await redirectOrInterruptAndSend(text, context: submissionContext)
+                }
+            case .blocked(let message):
+                errorMessage = message
+                return false
+            }
+        }
+
         return await sendMessage(
             text,
             attachments: attachments,
             context: submissionContext
         )
+    }
+
+    /// Read-only authoritative correction of a possibly stale local idle
+    /// state, OWNED BY THIS SUBMISSION. Returns true when the gateway proves
+    /// the session is RUNNING (the caller must use the configured busy
+    /// action); false when the session is idle (safe to send a new turn) or
+    /// the state could not be verified (do not add RPC chatter — fall through
+    /// to the ordinary send, whose typed outcome reconciles). If ownership of
+    /// the submission was lost across the probe's await (session/profile
+    /// handoff), NOTHING is mutated: the session the user switched to keeps
+    /// its own stale marker and will run its own correction.
+    private func correctStaleIdleTurnState(
+        using submissionContext: ComposerSubmissionContext
+    ) async -> Bool {
+        guard let client, let sessionId = activeSessionId else {
+            // Nothing to probe; leave the stale marker for the real owner.
+            return false
+        }
+        // Capture the probe identity BEFORE the await — never re-derive it
+        // from the mutable active session afterwards.
+        let acceptedIDs = acceptedIdentitySessionIDs(forRequested: sessionId)
+        let evidenceProfile = activeProfile
+        let evidenceServerIdentity = defaults.string(forKey: Self.chatResumeServerIdentityKey)
+        let rows: [LiveSessionStatus]
+        do {
+            if let probeActiveSessions = chatResumeLifecycleOperations.probeActiveSessions {
+                rows = try await probeActiveSessions(client)
+            } else {
+                rows = try await client.activeSessions()
+            }
+            // Currency fence (see probeForegroundRuntime): a server change
+            // during the await discards its in-flight rows.
+            guard evidenceProfile == activeProfile,
+                  defaults.string(forKey: Self.chatResumeServerIdentityKey) == evidenceServerIdentity else {
+                lifecycleLog.notice(
+                    "submitComposer: stale-idle probe superseded by connection change; no evidence recorded"
+                )
+                return false
+            }
+            recordActiveListEvidence(rows, profile: evidenceProfile)
+        } catch {
+            // The registry could not be read (older gateway, transient
+            // failure). Proceed with the ordinary send rather than blocking
+            // the user; the submission's own typed outcome will reconcile.
+            // The one-time stale clear is submission-owned so an unsupported
+            // gateway does not turn every later submit into probe chatter.
+            lifecycleLog.notice(
+                "submitComposer: stale-idle probe unavailable; proceeding with send session=\(sessionId, privacy: .public)"
+            )
+            if isCurrentComposerSubmission(submissionContext) {
+                turnStateIsStale = false
+            }
+            return false
+        }
+        // Ownership re-check AFTER the await: if the user switched sessions or
+        // profiles while the probe was suspended, this result belongs to the
+        // OLD conversation and must not mutate the new one's turn state — nor
+        // clear its stale marker.
+        guard isCurrentComposerSubmission(submissionContext),
+              turnState == .idle, turnStateIsStale else {
+            lifecycleLog.notice(
+                "submitComposer: stale-idle probe superseded by session handoff; no state mutation session=\(sessionId, privacy: .public)"
+            )
+            return false
+        }
+        let row = rows.first(where: {
+            acceptedIDs.contains($0.runtimeSessionId) || acceptedIDs.contains($0.storedSessionId)
+        })
+        if let row, row.isRunning {
+            lifecycleLog.notice(
+                "submitComposer: authoritative probe=live status=\(row.status, privacy: .public) corrects stale idle session=\(sessionId, privacy: .public)"
+            )
+            // setRunning also clears the pending-decision restoration guard,
+            // exactly like a live sessionBusy(true) edge would.
+            setRunning(true)
+            turnStateIsStale = false
+            return true
+        }
+        // Authoritative idle/absent/starting for THIS submission: the local
+        // idle state is confirmed and a starting runtime is not committed
+        // busy (pre-warm builds report it too), so send as an ordinary new
+        // turn — the typed prompt.submit outcome catches a genuine busy race.
+        turnStateIsStale = false
+        return false
+    }
+
+    /// Outcome of the pre-send transcript-freshness gate.
+    private enum TranscriptFreshnessGateOutcome {
+        /// Ordering is proven current (or the concern no longer applies):
+        /// proceed with the ordinary new-turn submission.
+        case proceed
+        /// The recovery revealed a live turn: route the text through the
+        /// configured busy submission instead of a new-turn prompt.
+        case routeToBusySubmission
+        /// Freshness could not be restored; do not append into an unresolved
+        /// ordering. Associated value is the user-facing message.
+        case blocked(String)
+    }
+
+    /// Exactly one bounded tail-only persisted read before an ordinary
+    /// NEW-TURN submit while `transcriptFreshnessIsStale` (a foreground
+    /// freshness read failed transiently on a real background return) OR
+    /// local ordering debt is outstanding (foreground-only settled turns
+    /// whose persisted boundaries no read has observed). Debt reconciliation
+    /// runs first; both concerns consume this one read. Never polls: a
+    /// transient failure blocks the send rather than silently appending
+    /// into an unresolved ordering (for debt, on the FIRST failure — debt is
+    /// a positive claim about persisted content, not a suspicion worth a
+    /// second chance), and structural absence takes the existing
+    /// authoritative recovery (a non-compact resume needs no history
+    /// endpoint) before the send proceeds.
+    private func confirmTranscriptFreshnessBeforeSend(
+        using submissionContext: ComposerSubmissionContext
+    ) async -> TranscriptFreshnessGateOutcome {
+        guard client != nil, let sessionId = activeSessionId else {
+            // Nothing to verify against; the ordinary send path owns the
+            // no-client outcome.
+            return .proceed
+        }
+        // A bot chat's persisted tail lives in the BOT's store (see the
+        // cross-surface freshness path); scope to the active conversation.
+        let profile = botConversationProfile(for: sessionId) ?? activeProfile
+        let bridge = dashboardTicketBridge
+        let localFrontier = durablePersistedRowIDs
+        let localMessageIDs = Set(messages.map { $0.id })
+        let lastLocalMessageID = messages.last?.id
+        lifecycleLog.notice(
+            "submitComposer: pre-send persisted evidence unresolved (freshness or local ordering debt); one bounded retry session=\(sessionId, privacy: .public)"
+        )
+        let outcome = await foregroundPersistedTailOutcome(
+            sessionId: sessionId,
+            profile: profile,
+            using: bridge
+        )
+        // Ownership re-check after the await, SPLIT from the turn state. A
+        // session/profile/viewport handoff SUPERSEDES this gate: the old
+        // operation must mutate nothing in the newly selected conversation,
+        // and the ordinary flow's own ownership guards own that outcome. But
+        // a turn-state change on the SAME conversation is this submission's
+        // business: a busy edge that raced the read must route through the
+        // configured busy submission — never fall through to an ordinary
+        // new-turn prompt.submit into an already-running turn.
+        guard isCurrentComposerSubmission(submissionContext),
+              activeSessionId == sessionId else {
+            return .proceed
+        }
+        if turnState.isRunning {
+            lifecycleLog.notice(
+                "submitComposer: conversation turned busy during pre-send freshness read → busy submission session=\(sessionId, privacy: .public)"
+            )
+            return .routeToBusySubmission
+        }
+        guard turnState == .idle else {
+            // A recovery boundary (.synchronizing/.reconnecting) or an
+            // unsupported gateway is in flight: neither proves the
+            // transcript ordering, and neither may blind-send.
+            lifecycleLog.notice(
+                "submitComposer: pre-send freshness read superseded by \(self.turnStateLogValue, privacy: .public); blocking send session=\(sessionId, privacy: .public)"
+            )
+            return .blocked(AppLocalization.string("Unable to refresh this conversation. Try again."))
+        }
+        switch outcome {
+        case .failed:
+            // Second transient failure: no loop, no escalation, no silently
+            // claimed freshness — block the new-turn prompt instead.
+            return .blocked(AppLocalization.string("Unable to refresh this conversation. Try again."))
+        case .unavailable:
+            // Positively structural: the authoritative reconcile is the
+            // recovery path that still converges the transcript (a
+            // non-compact resume needs no history endpoint), hinted to skip
+            // the doomed history request.
+            await syncSession(
+                purpose: .preserveCurrent,
+                using: nil,
+                automaticWorkToken: nil,
+                historySourceUnavailable: true
+            )
+            return postRecoveryFreshnessGateOutcome(
+                submissionContext: submissionContext,
+                sessionID: sessionId
+            )
+        case .unsupportedTailContract:
+            // A shapeless page: no comparable evidence either way — the
+            // authoritative reconcile re-classifies the source itself.
+            await syncSession(
+                purpose: .preserveCurrent,
+                using: nil,
+                automaticWorkToken: nil
+            )
+            return postRecoveryFreshnessGateOutcome(
+                submissionContext: submissionContext,
+                sessionID: sessionId
+            )
+        case .hydrated(let transcript):
+            // The transcript moved under the gate (a stream edge landed):
+            // the comparison evidence is stale — converge authoritatively.
+            guard messages.last?.id == lastLocalMessageID,
+                  durablePersistedRowIDs == localFrontier else {
+                await syncSession(
+                    purpose: .preserveCurrent,
+                    using: nil,
+                    automaticWorkToken: nil
+                )
+                return postRecoveryFreshnessGateOutcome(
+                    submissionContext: submissionContext,
+                    sessionID: sessionId
+                )
+            }
+            // Identity first: a page echoing a foreign conversation id is
+            // never evidence — for the freshness verdict or debt
+            // reconciliation alike. (Pages echoing no session id at all
+            // match by construction.)
+            guard transcriptMatchesSession(
+                transcript,
+                requestedSessionId: sessionId,
+                resumedSessionId: canonicalSessionID(for: sessionId)
+                    ?? persistedTranscriptWindow?.runtimeSessionID
+                    ?? sessionId
+            ) else {
+                lifecycleLog.notice(
+                    "submitComposer: pre-send read answered for a different conversation → authoritative reconcile session=\(sessionId, privacy: .public)"
+                )
+                await syncSession(
+                    purpose: .preserveCurrent,
+                    using: nil,
+                    automaticWorkToken: nil
+                )
+                return postRecoveryFreshnessGateOutcome(
+                    submissionContext: submissionContext,
+                    sessionID: sessionId
+                )
+            }
+            // Debt reconciliation FIRST: ordering metadata is counted
+            // against the frontier the settled turns were recorded against,
+            // and both concerns consume this one read.
+            if let debt = pendingLocalOrderingDebt {
+                switch localOrderingDebtOutcome(transcript, debt: debt) {
+                case .satisfied:
+                    pendingLocalOrderingDebt = nil
+                    persistedOrderingFrontier = Self.orderingFrontier(from: transcript)
+                case .exceeded, .notCaughtUp, .unprovable:
+                    lifecycleLog.notice(
+                        "submitComposer: pre-send ordering debt not reconcilable → authoritative reconcile session=\(sessionId, privacy: .public)"
+                    )
+                    await syncSession(
+                        purpose: .preserveCurrent,
+                        using: nil,
+                        automaticWorkToken: nil
+                    )
+                    return postRecoveryFreshnessGateOutcome(
+                        submissionContext: submissionContext,
+                        sessionID: sessionId
+                    )
+                }
+            }
+            if transcriptFreshnessIsStale {
+                let verdict = foregroundFreshnessVerdict(
+                    outcome,
+                    localFrontier: localFrontier,
+                    localMessageIDs: localMessageIDs,
+                    lastLocalMessageID: lastLocalMessageID,
+                    requestedSessionID: sessionId,
+                    runtimeSessionID: canonicalSessionID(for: sessionId)
+                        ?? persistedTranscriptWindow?.runtimeSessionID
+                        ?? sessionId,
+                    livenessIsRunning: false,
+                    locallyOwnedTurn: nil
+                )
+                switch verdict {
+                case let .unchanged(observedOrderingFrontier, _):
+                    transcriptFreshnessIsStale = false
+                    // Re-anchor the ordering frontier on the read's validated
+                    // observation (non-monotonic by design).
+                    persistedOrderingFrontier = observedOrderingFrontier
+                    return .proceed
+                case let .advanced(transcript, newRows):
+                    applyPersistedForegroundAdvancement(
+                        requestedSessionID: sessionId,
+                        transcript: transcript,
+                        newRows: newRows,
+                        runtimeSessionID: persistedTranscriptWindow?.runtimeSessionID
+                            ?? transcript.resolvedSessionId
+                            ?? sessionId,
+                        profile: profile
+                    )
+                    return .proceed
+                case .inconclusive:
+                    await syncSession(
+                        purpose: .preserveCurrent,
+                        using: nil,
+                        automaticWorkToken: nil
+                    )
+                    return postRecoveryFreshnessGateOutcome(
+                        submissionContext: submissionContext,
+                        sessionID: sessionId
+                    )
+                case .sourceUnavailable, .unresolvedTransient:
+                    // Unreachable for a `.hydrated` outcome (both are produced
+                    // only from the fetch-level cases above); kept as defensive
+                    // exhaustiveness. Blocking is the safe direction regardless.
+                    return .blocked(AppLocalization.string("Unable to refresh this conversation. Try again."))
+                }
+            }
+            return .proceed
+        }
+    }
+
+    /// Outcome of reconciling outstanding local ordering debt against one
+    /// validated bounded page.
+    private enum LocalOrderingDebtOutcome {
+        /// Exactly the expected number of canonical user-turn boundaries
+        /// follow the frontier: the debt is satisfied and the frontier may
+        /// re-anchor on this page.
+        case satisfied
+        /// More user boundaries than outstanding locally-owned turns:
+        /// foreign activity exists — authoritative reconcile before any
+        /// local send.
+        case exceeded
+        /// Fewer boundaries than expected (or an anomalous leading row):
+        /// persisted state has not caught up — conservative recovery.
+        case notCaughtUp
+        /// No ordering anchor to count against (unknown frontier, or it
+        /// rotated out of the page).
+        case unprovable
+        // notCaughtUp and unprovable deliberately share the conservative
+        // recovery routing at the caller; the split exists for field triage
+        // in the logs only.
+    }
+
+    /// Counts canonical user-turn boundaries after the ordering frontier and
+    /// compares them with the outstanding locally-owned settled-turn count.
+    /// Never advances anything: the caller owns frontier/debt mutation.
+    private func localOrderingDebtOutcome(
+        _ transcript: PersistedSessionTranscript,
+        debt: PendingLocalOrderingDebt
+    ) -> LocalOrderingDebtOutcome {
+        let heldIDs = Set(messages.map { $0.id })
+        switch persistedOrderingFrontier.baseline {
+        case .unknown:
+            return .unprovable
+        case .positivelyEmpty:
+            // The whole transcript follows the empty baseline; the page must
+            // be complete or the boundary count understates.
+            guard let page = transcript.page,
+                  !page.mayHaveOlderRows(fetchedRowCount: page.rawReturned) else {
+                return .unprovable
+            }
+            return Self.classifyDebtCandidates(
+                persistedRowsAfter(nil, in: transcript, heldIDs: heldIDs),
+                expected: debt.expectedUserTurnCount,
+                allowTrailingRowsWithoutNewUserBoundary: debt.allowTrailingRowsWithoutNewUserBoundary
+            )
+        case .anchored(let anchorID):
+            guard let anchorIndex = transcript.messages.lastIndex(where: {
+                $0.id == anchorID
+            }) else {
+                return .unprovable
+            }
+            return Self.classifyDebtCandidates(
+                persistedRowsAfter(anchorIndex, in: transcript, heldIDs: heldIDs),
+                expected: debt.expectedUserTurnCount,
+                allowTrailingRowsWithoutNewUserBoundary: debt.allowTrailingRowsWithoutNewUserBoundary
+            )
+        }
+    }
+
+    private static func classifyDebtCandidates(
+        _ candidates: [ChatMessage],
+        expected: Int,
+        allowTrailingRowsWithoutNewUserBoundary: Bool = false
+    ) -> LocalOrderingDebtOutcome {
+        let boundaries = candidates.filter { $0.role == .user }
+        if expected == 0, allowTrailingRowsWithoutNewUserBoundary {
+            // Settled-tail debt: trailing assistant/tool rows (or no rows at
+            // all) are exactly what the bounded read is meant to absorb. A
+            // canonical user boundary cannot belong to that already-settled
+            // turn and therefore proves foreign/new activity.
+            return boundaries.isEmpty ? .satisfied : .exceeded
+        }
+        if allowTrailingRowsWithoutNewUserBoundary {
+            if boundaries.count == expected { return .satisfied }
+            return boundaries.count > expected ? .exceeded : .notCaughtUp
+        }
+        guard let firstRow = candidates.first, firstRow.role == .user else {
+            // Nothing after the frontier yet, or an assistant/tool row
+            // precedes the first boundary: the persisted state has not
+            // caught up (or ordering is anomalous) — conservative.
+            return boundaries.isEmpty ? .notCaughtUp : .unprovable
+        }
+        if boundaries.count == expected { return .satisfied }
+        return boundaries.count > expected ? .exceeded : .notCaughtUp
+    }
+
+    /// Shared post-recovery checks for the freshness gate: a converged
+    /// authoritative reconcile cleared `transcriptFreshnessIsStale` (via
+    /// `applyChatResume`); anything else means recovery did not converge and
+    /// the send must not proceed into an unresolved ordering.
+    private func postRecoveryFreshnessGateOutcome(
+        submissionContext: ComposerSubmissionContext,
+        sessionID: String
+    ) -> TranscriptFreshnessGateOutcome {
+        guard isCurrentComposerSubmission(submissionContext),
+              activeSessionId == sessionID else {
+            return .proceed
+        }
+        if turnState.isRunning {
+            return .routeToBusySubmission
+        }
+        if transcriptFreshnessIsStale || pendingLocalOrderingDebt != nil {
+            // Either recovery was superseded (a newer boundary owns the
+            // conversation) or it genuinely failed to converge; both must
+            // not send into an unresolved ordering — freshness and local
+            // ordering debt alike.
+            lifecycleLog.notice(
+                "submitComposer: pre-send freshness recovery did not converge; blocking send session=\(sessionID, privacy: .public)"
+            )
+            return .blocked(AppLocalization.string("Unable to refresh this conversation. Try again."))
+        }
+        return .proceed
     }
 
     func sendMessage(
@@ -4628,6 +9899,25 @@ final class AppState: ObservableObject {
         guard let client, let sessionId = activeSessionId else { return false }
         cancelChatResumeRestoration()
         resetResponseHapticTurn()
+        // Durable before/after identity for ambiguous-delivery recovery:
+        // positively-proven persisted row ids (from the latest accepted
+        // hydration) plus whether the conversation holds rows whose persisted
+        // identity is unproven, so a later bounded tail read can decide
+        // whether the submitted turn landed even when the registry has gone
+        // idle/absent.
+        let submissionBaseline = PromptTranscriptBaseline(
+            durableIDs: durablePersistedRowIDs,
+            holdsUnprovenRows: messages.contains { !durablePersistedRowIDs.contains($0.id) }
+        )
+        // The locally-owned turn marker's ordering baseline, frozen BEFORE
+        // the optimistic append changes the transcript below: the persisted
+        // ordering FRONTIER, which may already run past the visible durable
+        // tail (a prior freshness read can have positively observed the
+        // previous turn's durable twins without adopting them visibly).
+        let preSubmitOrderingBaseline = persistedOrderingFrontier.baseline
+        // The identity under probe must be captured BEFORE any await — never
+        // re-derived from the mutable active session afterwards.
+        let submissionSessionIDs = acceptedIdentitySessionIDs(forRequested: sessionId)
 
         let userMessage = ChatMessage(
             id: "local-\(Date().timeIntervalSince1970)",
@@ -4638,6 +9928,9 @@ final class AppState: ObservableObject {
             author: nil,
             attachments: attachments.isEmpty ? nil : attachments
         )
+        // Mid-turn ordering rule: the outgoing bubble must not land below a
+        // still-live reasoning card's eventual commit.
+        settleReasoningSegmentIntoTranscript()
         messages.append(userMessage)
         requestChatScrollToLatest()
         cacheMessagePresentation(for: [sessionId])
@@ -4665,29 +9958,619 @@ final class AppState: ObservableObject {
                 guard isCurrentComposerSubmission(submissionContext) else { return false }
             } catch {
                 guard isCurrentComposerSubmission(submissionContext) else { return false }
-                errorMessage = "Attachment failed: \(error.localizedDescription)"
+                errorMessage = AppLocalization.string("Attachment failed: \(error.localizedDescription)")
                 await recoverComposerSubmission(using: submissionContext)
                 return false
             }
         }
 
         do {
+            let outcome: PromptSubmissionOutcome
             if let sendPrompt = chatResumeLifecycleOperations.sendPrompt {
-                try await sendPrompt(client, sessionId, text)
+                outcome = try await sendPrompt(client, sessionId, text)
             } else {
-                try await client.sendPrompt(sessionId, text: text)
+                outcome = try await client.sendPrompt(sessionId, text: text)
             }
             // The gateway accepted the prompt. A session handoff may have
             // happened while the RPC was suspended, but that does not turn a
-            // remotely successful send into a local draft failure. There are
-            // no current-session mutations after this point.
+            // remotely successful send into a local draft failure. All local
+            // state writes below are submission-owned: an operation started
+            // for session A must never mutate turn state that now belongs to
+            // session B.
+            lifecycleLog.notice(
+                "prompt.submit outcome=\(Self.promptOutcomeLogValue(outcome), privacy: .public) session=\(sessionId, privacy: .public)"
+            )
+            if isCurrentComposerSubmission(submissionContext) {
+                if outcome.isBusySubmission {
+                    // Hermes applied its busy policy, which proves THIS
+                    // session was RUNNING when the prompt landed — the local
+                    // state was stale. Adopt the authoritative busy state so
+                    // the composer keeps offering the configured busy action
+                    // and the next submission is routed correctly.
+                    turnLifecycleEvidence = TurnLifecycleEvidence(
+                        revision: turnLifecycleEvidence.revision &+ 1,
+                        running: true
+                    )
+                    turnState = .running
+                }
+                turnStateIsStale = false
+                switch outcome {
+                case .accepted:
+                    // The turn in flight is now provably Conduit's own: record
+                    // the optimistic user row so a later foreground freshness
+                    // check can prove same-turn continuity WITHOUT demanding a
+                    // durable id for a row the gateway has not persisted yet.
+                    locallyOwnedInFlightTurn = LocallyOwnedInFlightTurn(
+                        sessionIDs: submissionSessionIDs,
+                        optimisticUserRowID: userMessage.id,
+                        preSubmitOrderingBaseline: preSubmitOrderingBaseline
+                    )
+                case .queued:
+                    // Hermes normally drains queued input as a later full turn,
+                    // but `_enqueue_prompt` may drop an in-flight self-duplicate
+                    // or coalesce several text submissions into one envelope.
+                    // Therefore the typed outcome proves no exact boundary
+                    // count. Require one later bounded observation: no new user
+                    // row clears it; any user row is adopted authoritatively.
+                    locallyOwnedInFlightTurn = nil
+                    recordLocalOrderingDebt(
+                        sessionIDs: submissionSessionIDs,
+                        baseline: preSubmitOrderingBaseline,
+                        expectedUserTurnIncrement: 0,
+                        allowTrailingRowsWithoutNewUserBoundary: true
+                    )
+                case .redirected:
+                    // Hermes replaces/corrects the current live model request;
+                    // it does not create an independent canonical user turn —
+                    // so ZERO new user boundaries are expected. But the
+                    // mutated turn can keep persisting assistant/tool rows
+                    // AFTER the current ordering frontier, so a redirect still
+                    // owes one final-tail observation (the settled-tail shape):
+                    // the next operation freezing a new-turn baseline performs
+                    // one bounded read — a non-user-only suffix advances the
+                    // frontier and clears the obligation, while any canonical
+                    // user boundary proves a later/new turn exists and forces
+                    // an authoritative reconcile before the send.
+                    locallyOwnedInFlightTurn = nil
+                    recordLocalOrderingDebt(
+                        sessionIDs: submissionSessionIDs,
+                        baseline: preSubmitOrderingBaseline,
+                        expectedUserTurnIncrement: 0,
+                        allowTrailingRowsWithoutNewUserBoundary: true
+                    )
+                case .steered:
+                    // Hermes normally injects this into the current run without
+                    // a canonical user row. A steer arriving after the final
+                    // tool batch is returned as `pending_steer`, however, and
+                    // requeued as a full next turn. As with `.queued`, the typed
+                    // outcome proves no exact boundary count, so observe once
+                    // before the next ordinary local turn and reconcile if a
+                    // promoted steer produced a user boundary.
+                    locallyOwnedInFlightTurn = nil
+                    recordLocalOrderingDebt(
+                        sessionIDs: submissionSessionIDs,
+                        baseline: preSubmitOrderingBaseline,
+                        expectedUserTurnIncrement: 0,
+                        allowTrailingRowsWithoutNewUserBoundary: true
+                    )
+                }
+            }
             return true
         } catch {
             guard isCurrentComposerSubmission(submissionContext) else { return false }
-            errorMessage = "Failed to send: \(error.localizedDescription)"
+            if Self.isAmbiguousPromptDelivery(error) {
+                lifecycleLog.notice(
+                    "prompt.submit ambiguous (\(error.localizedDescription, privacy: .private)); querying authoritative state session=\(sessionId, privacy: .public)"
+                )
+                let (resolution, reconnected, recoveryEvidence) = await reconcileAmbiguousPromptSubmission(
+                    requestedSessionID: sessionId,
+                    acceptedSessionIDs: submissionSessionIDs,
+                    baseline: submissionBaseline,
+                    submittedText: text,
+                    submissionContext: submissionContext
+                )
+                // Ordering guard for the recovery STATE stamps: the recovery
+                // captured the lifecycle revision at its registry
+                // observation. A changed revision proves an authoritative
+                // live edge (sessionBusy, settlement, interruption, error,
+                // resume snapshot) arrived while the recovery awaited — that
+                // evidence is NEWER and owns the UI. Plain turnState equality
+                // cannot prove this: sendMessage stamped .running before
+                // prompt.submit, so a newer sessionBusy(true) leaves the
+                // value equal.
+                //
+                // Stamp authority and accepted-turn provenance are SEPARATE
+                // facts. A changed revision suppresses the lifecycle stamps
+                // but does NOT by itself erase this recovery's positive
+                // proof that the submitted turn was accepted and is ours:
+                // newer busy/running evidence leaves that ownership live,
+                // while newer settled/idle evidence ends it (the evidence's
+                // running half). Only the lifecycle stamps below are
+                // revision-guarded; the acceptance decisions stay
+                // authoritative either way.
+                let recoveryMayStampLifecycle = turnLifecycleEvidence.revision == recoveryEvidence.revision
+                // Whether the NEWEST authoritative lifecycle edge still
+                // reports the turn as running (a newest-edge bit, not
+                // per-turn tracking — see TurnLifecycleEvidence). Only
+                // decisive when the revision changed (newer evidence owns
+                // the lifecycle state): a newer busy edge keeps the accepted
+                // turn's local ownership live, a newer settled edge ends it.
+                let newestEdgeReportsRunning = turnLifecycleEvidence.running
+                // Every write below is submission-owned: the guard is
+                // re-checked inside each branch so a handoff during the
+                // recovery awaits cannot leak state into the new session.
+                switch resolution {
+                case .acceptedRunning:
+                    // Hermes accepted the submission and the turn is still
+                    // live: keep the optimistic user row and the running turn,
+                    // and never re-send the prompt.
+                    if isCurrentComposerSubmission(submissionContext) {
+                        if recoveryMayStampLifecycle {
+                            turnState = .running
+                            turnStateIsStale = false
+                        }
+                        // Provenance is independent of stamp authority:
+                        // acceptedRunning POSITIVELY proves this submission
+                        // was accepted and is the active turn. A newer busy
+                        // edge that raced the probe owns the lifecycle state
+                        // but does not erase that ownership — the marker must
+                        // still be installed so a later foreground can prove
+                        // same-turn continuity without a resume. Only newer
+                        // settled/idle evidence ends live ownership.
+                        if recoveryMayStampLifecycle || newestEdgeReportsRunning {
+                            // Same proof as the ordinary success path: the
+                            // turn in flight is provably Conduit's own
+                            // submission. The anchor is intentionally the
+                            // PRE-SEND capture even though ambiguity recovery
+                            // may have re-hydrated the transcript in between:
+                            // validation at use plus the anchor lookup at use
+                            // neutralize any staleness.
+                            locallyOwnedInFlightTurn = LocallyOwnedInFlightTurn(
+                                sessionIDs: submissionSessionIDs,
+                                optimisticUserRowID: userMessage.id,
+                                preSubmitOrderingBaseline: preSubmitOrderingBaseline
+                            )
+                        }
+                    }
+                    return true
+                case .acceptedUnsettled:
+                    // The durable transcript proves Hermes accepted the
+                    // submission, but the registry reported `starting` —
+                    // runtime present, liveness inconclusive (the agent build
+                    // may still be arming around a committed turn). The
+                    // submission stays accepted: never re-send, the optimistic
+                    // row remains. But settlement is NOT proven: keep the turn
+                    // running-like for composer routing, leave
+                    // `turnStateIsStale` exactly as it stands (uncertainty is
+                    // not cleared as though settlement were proven), and let
+                    // the next authoritative registry/stream edge settle it.
+                    lifecycleLog.notice(
+                        "prompt.submit accepted (durable transcript); registry starting — liveness unresolved session=\(sessionId, privacy: .public)"
+                    )
+                    if isCurrentComposerSubmission(submissionContext) {
+                        if recoveryMayStampLifecycle {
+                            turnState = .running
+                        }
+                        // Same provenance split as acceptedRunning: the
+                        // durable row proves the submission was accepted. A
+                        // newer busy edge keeps that ownership live; a newer
+                        // settled edge ends it.
+                        if recoveryMayStampLifecycle || newestEdgeReportsRunning {
+                            locallyOwnedInFlightTurn = LocallyOwnedInFlightTurn(
+                                sessionIDs: submissionSessionIDs,
+                                optimisticUserRowID: userMessage.id,
+                                preSubmitOrderingBaseline: preSubmitOrderingBaseline
+                            )
+                        }
+                    }
+                    return true
+                case .acceptedSettled:
+                    // The durable transcript proves the submitted turn landed
+                    // and settled (the registry had already gone idle/absent
+                    // by the time recovery looked). The submission stays
+                    // accepted: the composer remains cleared, nothing is
+                    // restored, and the transcript converges on the next
+                    // bounded refresh. That verification proved the turn
+                    // persisted but did not re-anchor the ordering frontier,
+                    // so an unobserved boundary leaves debt.
+                    lifecycleLog.notice(
+                        "prompt.submit accepted (durable transcript); turn settled session=\(sessionId, privacy: .public)"
+                    )
+                    if isCurrentComposerSubmission(submissionContext) {
+                        if recoveryMayStampLifecycle {
+                            turnState = .idle
+                            turnStateIsStale = false
+                        }
+                        // The marker is nil here (prompt.submit threw), but
+                        // the durable transcript PROVED this submission's
+                        // turn persisted: record its ordering debt from the
+                        // frame-captured baseline so the next local turn
+                        // anchors past it. Retained even when a newer edge
+                        // owns the lifecycle state — the boundary was never
+                        // positively observed, which stays true regardless of
+                        // which edge is newest.
+                        recordLocalOrderingDebt(
+                            sessionIDs: submissionSessionIDs,
+                            baseline: preSubmitOrderingBaseline
+                        )
+                        locallyOwnedInFlightTurn = nil
+                    }
+                    return true
+                case .notAccepted:
+                    // Authoritative evidence shows Hermes did not accept the
+                    // prompt: restore the unsent state exactly once below.
+                    lifecycleLog.notice(
+                        "prompt.submit not accepted (authoritative); restoring unsent state session=\(sessionId, privacy: .public)"
+                    )
+                    if isCurrentComposerSubmission(submissionContext),
+                       recoveryMayStampLifecycle {
+                        turnStateIsStale = false
+                    }
+                case .unresolved:
+                    // Acceptance could be neither proven nor disproven. Be
+                    // conservative about duplicate delivery: restore rather
+                    // than re-send blindly.
+                    lifecycleLog.notice(
+                        "prompt.submit state unresolved; restoring unsent state session=\(sessionId, privacy: .public)"
+                    )
+                }
+                // Presentation writes below are submission-owned too: A's
+                // failed send must not paint an error onto the session the
+                // user switched to while recovery was suspended.
+                if isCurrentComposerSubmission(submissionContext) {
+                    errorMessage = AppLocalization.string("Failed to send: \(error.localizedDescription)")
+                }
+                if !reconnected, isCurrentComposerSubmission(submissionContext) {
+                    await recoverComposerSubmission(using: submissionContext)
+                }
+                // A reconnect inside the recovery already synced the
+                // authoritative transcript, so the restoration happened there.
+                return false
+            }
+            if isCurrentComposerSubmission(submissionContext) {
+                errorMessage = AppLocalization.string("Failed to send: \(error.localizedDescription)")
+            }
             await recoverComposerSubmission(using: submissionContext)
             return false
         }
+    }
+
+    private static func promptOutcomeLogValue(_ outcome: PromptSubmissionOutcome) -> String {
+        switch outcome {
+        case .accepted: return "accepted"
+        case .steered: return "steered"
+        case .redirected: return "redirected"
+        case .queued: return "queued"
+        }
+    }
+
+    /// Which failures leave it genuinely unknown whether Hermes received the
+    /// prompt. Two classes are DEFINITIVE rejections: a structured `RpcError`
+    /// (the gateway answered, so the prompt was not accepted) and
+    /// `notConnected` (`rpc` throws before any bytes leave the device). The
+    /// remaining transport failures are ambiguous — the bytes may have
+    /// reached Hermes and the turn may already be running — so the
+    /// authoritative registry probe decides, and unknown future `HermesError`
+    /// cases fail toward the probe rather than toward a blind retry.
+    private static func isAmbiguousPromptDelivery(_ error: Error) -> Bool {
+        switch error {
+        case HermesError.notConnected:
+            return false
+        case is RpcError:
+            return false
+        case is HermesError:
+            return true
+        case is URLError, is CancellationError:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Recovery for a `prompt.submit` whose acknowledgement was lost. Reconnects
+    /// the transport if needed, then consults the authoritative runtime
+    /// registry: a live turn for this session means the prompt was accepted and
+    /// must never be re-sent; an idle/absent session means it was not.
+    /// `reconnected` reports whether a transport recovery (with its own full
+    /// transcript sync) ran, so the caller can skip a duplicate restoration.
+    /// `lifecycleEvidence` is the `TurnLifecycleEvidence` captured at the
+    /// registry observation — the baseline the caller's stamp/provenance
+    /// guards compare.
+    /// Internal (not private) so the classification contract is directly
+    /// testable.
+    enum AmbiguousPromptResolution {
+        /// Accepted and still running on the current transport.
+        case acceptedRunning
+        /// Accepted — the durable transcript holds the submitted row — but
+        /// the registry reported `starting`: runtime present, liveness
+        /// inconclusive. Settlement is UNPROVEN; the next authoritative
+        /// registry/stream edge settles the turn.
+        case acceptedUnsettled
+        /// Accepted and proven settled by the durable transcript: the turn ran
+        /// to completion before recovery looked (the registry had already gone
+        /// idle/absent, which alone cannot prove non-acceptance).
+        case acceptedSettled
+        /// Authoritative evidence (registry idle/absent AND the durable
+        /// transcript advanced without the submitted turn) that the prompt was
+        /// not accepted.
+        case notAccepted
+        /// Neither acceptance nor non-acceptance could be established.
+        case unresolved
+    }
+
+    /// The ambiguous-recovery registry status, split beyond
+    /// `LiveSessionStatus.isRunning`. `isRunning` deliberately excludes
+    /// `starting` because Hermes arms `starting` for plain session.create /
+    /// cold-resume pre-warm with no prompt involved — but in an ambiguous
+    /// submission recovery, that same mask can cover a COMMITTED turn during
+    /// the submit → agent-ready window. `starting` is therefore its own
+    /// classification: runtime present, liveness inconclusive — never settled,
+    /// never committed-busy. Internal for the classification-contract tests.
+    enum AmbiguousRegistryLiveness {
+        /// `working` | `waiting` — authoritative committed-busy state.
+        case committedBusy
+        /// `starting` — runtime present, liveness inconclusive.
+        case starting
+        /// An explicit `idle` row (or any unrecognized non-running status).
+        case idle
+        /// No matching runtime row for the submitted session.
+        case absent
+    }
+
+    /// The classification contract for an ambiguous submission's
+    /// authoritative evidence pair. Pure and total so the status × evidence
+    /// matrix is pinned directly by tests:
+    ///
+    /// - `committedBusy` ALWAYS classifies `.acceptedRunning`, before the
+    ///   transcript is consulted and regardless of which client performed the
+    ///   probe — a running registry row is never settled (client
+    ///   replacement/submission ownership is a separate concern).
+    /// - `starting` NEVER classifies `.acceptedSettled`: a `.present` durable
+    ///   row proves acceptance, not settlement (`.acceptedUnsettled`), and
+    ///   `.absent`/`.indeterminate` prove nothing — the committed turn may not
+    ///   have reached the durable verification point yet, so the outcome is
+    ///   conservative `.unresolved` (restore; never a blind resend), never
+    ///   `.notAccepted` merely because `starting` was present.
+    /// - `idle`/`absent` fall through to the durable transcript: present →
+    ///   `.acceptedSettled`, absent → `.notAccepted`, indeterminate →
+    ///   `.unresolved`.
+    static func classifyAmbiguousSubmission(
+        registryLiveness: AmbiguousRegistryLiveness,
+        transcript: SubmittedTurnEvidence
+    ) -> AmbiguousPromptResolution {
+        switch registryLiveness {
+        case .committedBusy:
+            // Ignoring `transcript` here is the contract: a working/waiting
+            // row settles the acceptance question on the registry alone.
+            return .acceptedRunning
+        case .starting:
+            switch transcript {
+            case .present: return .acceptedUnsettled
+            case .absent, .indeterminate: return .unresolved
+            }
+        case .idle, .absent:
+            switch transcript {
+            case .present: return .acceptedSettled
+            case .absent: return .notAccepted
+            case .indeterminate: return .unresolved
+            }
+        }
+    }
+
+    private func reconcileAmbiguousPromptSubmission(
+        requestedSessionID: String,
+        acceptedSessionIDs: Set<String>,
+        baseline: PromptTranscriptBaseline,
+        submittedText: String,
+        submissionContext: ComposerSubmissionContext
+    ) async -> (resolution: AmbiguousPromptResolution, reconnected: Bool, lifecycleEvidence: TurnLifecycleEvidence) {
+        var reconnected = false
+        var probeClient = client
+        if probeClient?.isConnected != true {
+            // The transport died around the submission. A reconnect here is a
+            // real recovery, and its sync may already surface the accepted
+            // turn's persisted rows.
+            await reconnectForRetry(purpose: .preserveCurrent)
+            probeClient = self.client
+            // Only a SUCCESSFUL reconnect (whose sync already restored the
+            // authoritative transcript) may skip the caller's restoration; a
+            // failed reconnect must fall back to it.
+            reconnected = probeClient?.isConnected == true
+        }
+        guard isCurrentOrAliasedComposerSubmission(submissionContext),
+              let probeClient else {
+            return (.unresolved, reconnected, turnLifecycleEvidence)
+        }
+        // The evidence baseline for the caller's guards, captured at the
+        // registry observation: the probe result already includes every edge
+        // processed up to this point, so any later revision increment is
+        // strictly newer evidence. Capturing BEFORE the probe (not after) is
+        // deliberate: an edge processed DURING the probe await may postdate
+        // the registry snapshot server-side, so it must keep winning.
+        let lifecycleEvidence = turnLifecycleEvidence
+        // The alias set was captured from the ORIGINAL submission before any
+        // await; it is never re-derived from the mutable active session here.
+        let evidenceProfile = activeProfile
+        let evidenceServerIdentity = defaults.string(forKey: Self.chatResumeServerIdentityKey)
+        let rows: [LiveSessionStatus]
+        do {
+            if let probeActiveSessions = chatResumeLifecycleOperations.probeActiveSessions {
+                rows = try await probeActiveSessions(probeClient)
+            } else {
+                rows = try await probeClient.activeSessions()
+            }
+            // Currency fence (see probeForegroundRuntime): a server change
+            // during the await discards its in-flight rows.
+            guard evidenceProfile == activeProfile,
+                  defaults.string(forKey: Self.chatResumeServerIdentityKey) == evidenceServerIdentity else {
+                return (.unresolved, reconnected, lifecycleEvidence)
+            }
+            recordActiveListEvidence(rows, profile: evidenceProfile)
+        } catch {
+            return (.unresolved, reconnected, lifecycleEvidence)
+        }
+        let matchedRow = rows.first(where: {
+            acceptedSessionIDs.contains($0.runtimeSessionId) || acceptedSessionIDs.contains($0.storedSessionId)
+        })
+        // Registry liveness split: `working`/`waiting` are committed-busy,
+        // `starting` is runtime-present but liveness-inconclusive, and only a
+        // genuine `idle`/absent runtime lets the durable transcript decide
+        // between settled and not-accepted.
+        let registryLiveness: AmbiguousRegistryLiveness
+        if let matchedRow {
+            if matchedRow.isRunning {
+                registryLiveness = .committedBusy
+            } else if matchedRow.status == "starting" {
+                registryLiveness = .starting
+            } else {
+                registryLiveness = .idle
+            }
+        } else {
+            // No runtime for this conversation anymore: current liveness is
+            // gone, but that alone cannot prove non-acceptance — the accepted
+            // turn may have completed and been reaped. Verify durably below.
+            registryLiveness = .absent
+        }
+        // A committed-busy row classifies on the registry alone; the bounded
+        // durable verifier is only consulted when liveness alone cannot
+        // classify.
+        let transcript: SubmittedTurnEvidence = registryLiveness == .committedBusy
+            ? .indeterminate
+            : await verifySubmittedTurnInTranscript(
+                requestedSessionID: requestedSessionID,
+                profile: submissionContext.profile,
+                baseline: baseline,
+                submittedText: submittedText
+            )
+        return (
+            Self.classifyAmbiguousSubmission(
+                registryLiveness: registryLiveness,
+                transcript: transcript
+            ),
+            reconnected,
+            lifecycleEvidence
+        )
+    }
+
+    /// Durable before/after identity captured BEFORE the optimistic append.
+    ///
+    /// Only rows with POSITIVE durable provenance may serve as baseline
+    /// evidence: ids adopted from validated persisted-transcript hydration.
+    /// Visible `ChatMessage.id` values for optimistic or locally synthesized
+    /// rows (`local-…`, live tool/reasoning/review projections, positional
+    /// fallbacks, streaming completions) are presentation identities — Hermes
+    /// persists those rows under fresh database ids — so id shape can never
+    /// establish that a persisted row is new, and no prefix list can be
+    /// complete. The baseline therefore consumes only the positively adopted
+    /// durable id set and flags whether the conversation holds any visible
+    /// row whose persisted identity is unproven.
+    struct PromptTranscriptBaseline {
+        /// Positively known durable persisted row ids for this conversation,
+        /// usable as overlap anchors against a persisted tail.
+        let durableIDs: Set<String>
+        /// Whether some pre-submit conversation content exists only as a
+        /// row without durable provenance (e.g. an earlier optimistic send
+        /// that was never re-hydrated). If so, a matching persisted row after
+        /// the anchor could belong to THAT content, and acceptance is
+        /// unprovable.
+        let holdsUnprovenRows: Bool
+
+        init(durableIDs: Set<String>, holdsUnprovenRows: Bool) {
+            self.durableIDs = durableIDs
+            self.holdsUnprovenRows = holdsUnprovenRows
+        }
+    }
+
+    /// Internal (not private) so `classifyAmbiguousSubmission`'s contract is
+    /// directly testable.
+    enum SubmittedTurnEvidence {
+        case present
+        case absent
+        case indeterminate
+    }
+
+    /// Bounded tail read (the PR #118 `order=latest` page via the existing
+    /// persisted-transcript source) to decide whether an ambiguously
+    /// acknowledged prompt actually landed. `profile` comes from the owning
+    /// submission context, captured before any await.
+    private func verifySubmittedTurnInTranscript(
+        requestedSessionID: String,
+        profile: String,
+        baseline: PromptTranscriptBaseline,
+        submittedText: String
+    ) async -> SubmittedTurnEvidence {
+        let outcome = await persistedTranscriptOutcome(
+            sessionId: requestedSessionID,
+            profile: profile,
+            using: dashboardTicketBridge
+        )
+        let tail: [ChatMessage]
+        let idsAreDurable: Bool
+        switch outcome {
+        case .hydrated(let persisted):
+            tail = persisted.messages
+            // A paginated page only comes back when the echo honored the
+            // tail contract AND the rows carried durable identity; the
+            // legacy one-shot re-read makes no such guarantee.
+            idsAreDurable = persisted.page != nil
+        case .unavailable, .failed:
+            // No usable durable source: acceptance stays unproven.
+            return .indeterminate
+        }
+
+        let wanted = submittedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let contentMatches: (ChatMessage) -> Bool = { message in
+            message.role == .user
+                && message.content.trimmingCharacters(in: .whitespacesAndNewlines) == wanted
+        }
+
+        if idsAreDurable {
+            // Overlap anchor: the NEWEST tail row the pre-submit durable
+            // evidence already held. Only rows strictly after that anchor are
+            // candidates for the submitted turn — a matching row at or before
+            // the anchor belongs to an OLDER identical send.
+            //
+            // A bounded `order=latest` page carries only the newest rows: an
+            // accepted turn can persist hundreds of rows after the
+            // submission, pushing BOTH the anchor and the submitted row out
+            // of this window. Without the anchor in the tail, ordering
+            // evidence is unavailable and content absence from the window
+            // proves nothing — the outcome is indeterminate, never
+            // notAccepted and never acceptedSettled.
+            guard let anchorIndex = tail.lastIndex(where: {
+                baseline.durableIDs.contains($0.id)
+            }) else {
+                return .indeterminate
+            }
+            let candidates = tail[tail.index(after: anchorIndex)...]
+
+            if candidates.contains(where: contentMatches) {
+                if baseline.holdsUnprovenRows {
+                    // The conversation held visible rows whose persisted
+                    // twins are unknown: the matching candidate could be an
+                    // older identical send re-homed under a new id.
+                    return .indeterminate
+                }
+                // Every pre-submit row was durably identified, so the anchor
+                // proves everything up to it; a matching user row after the
+                // anchor can only be the new submission.
+                return .present
+            }
+            // The tail advanced past the durable anchor without any matching
+            // user row. The anchor's presence in this window bounds the
+            // search: the submitted row, if it had landed, would be newer
+            // than the anchor and therefore inside the window too.
+            return .absent
+        }
+
+        // Positional-id fallback (legacy one-shot transcript): this response
+        // IS the entire persisted transcript, so content absence proves
+        // non-acceptance — but row identity cannot distinguish new from old
+        // rows, so a matching row is never proof of acceptance.
+        if tail.contains(where: contentMatches) {
+            return .indeterminate
+        }
+        return .absent
     }
 
     func toggleYolo(context: ComposerSubmissionContext? = nil) async {
@@ -4712,8 +10595,16 @@ final class AppState: ObservableObject {
         }
         guard let client, let sessionId = activeSessionId else { return false }
         let persistedSessionID = canonicalSessionID(for: sessionId) ?? sessionId
-        beginSessionYoloWrite(for: [sessionId, persistedSessionID])
-        defer { endSessionYoloWrite(for: [sessionId, persistedSessionID]) }
+        // Ownership is captured ONCE, before the await, from the originating
+        // submission profile. begin and the deferred cleanup therefore touch
+        // the exact same keys even if the active profile/session changes
+        // while the RPC is suspended (profile-switch bookkeeping leak).
+        let writeKeys = sessionYoloKeys(
+            profile: submissionContext.profile,
+            sessionIDs: [sessionId, persistedSessionID]
+        )
+        beginSessionYoloWrite(keys: writeKeys)
+        defer { endSessionYoloWrite(keys: writeKeys) }
         do {
             if let setSessionYolo = chatResumeLifecycleOperations.setSessionYolo {
                 try await setSessionYolo(client, sessionId, enabled)
@@ -4734,7 +10625,7 @@ final class AppState: ObservableObject {
             return true
         } catch {
             guard isCurrentComposerSubmission(submissionContext) else { return false }
-            errorMessage = "Unable to change YOLO mode: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Unable to change YOLO mode: \(error.localizedDescription)")
             return false
         }
     }
@@ -4795,31 +10686,34 @@ final class AppState: ObservableObject {
     /// Keep the common Hermes commands discoverable even when an older gateway
     /// returns only skill entries from `commands.catalog`. Commands Conduit
     /// does not own locally still run through slash.exec / command.dispatch.
-    private static let builtInSlashCommands: [SlashCommand] = [
-        SlashCommand(name: "new", aliases: ["reset"], description: "Start a new conversation", category: "Session"),
-        SlashCommand(name: "branch", aliases: ["fork"], description: "Branch this conversation into a new chat", category: "Session"),
-        SlashCommand(name: "model", description: "Open the model and run settings", category: "Session"),
-        SlashCommand(name: "yolo", description: "Toggle automatic tool approval", category: "Session"),
-        SlashCommand(name: "help", aliases: ["commands"], description: "Show available slash commands", category: "Session"),
-        SlashCommand(name: "approvals", description: "Show or set approval mode", category: "Hermes"),
-        SlashCommand(name: "agents", aliases: ["tasks"], description: "Show active sessions and tasks", category: "Hermes"),
-        SlashCommand(name: "background", aliases: ["bg", "btw"], description: "Run a prompt in the background", category: "Hermes"),
-        SlashCommand(name: "compress", aliases: ["compact"], description: "Compress this conversation context", category: "Hermes"),
-        SlashCommand(name: "debug", description: "Create a debug report", category: "Hermes"),
-        SlashCommand(name: "goal", description: "Manage this session's standing goal", category: "Hermes"),
-        SlashCommand(name: "personality", description: "Switch the session personality", category: "Hermes"),
-        SlashCommand(name: "queue", aliases: ["q"], description: "Queue a prompt for the next turn", category: "Hermes"),
-        SlashCommand(name: "retry", description: "Retry the last user message", category: "Hermes"),
-        SlashCommand(name: "rollback", description: "List or restore filesystem checkpoints", category: "Hermes"),
-        SlashCommand(name: "save", description: "Save the current transcript", category: "Hermes"),
-        SlashCommand(name: "status", description: "Show current session status", category: "Hermes"),
-        SlashCommand(name: "steer", description: "Steer the current run", category: "Hermes"),
-        SlashCommand(name: "stop", description: "Stop running background processes", category: "Hermes"),
-        SlashCommand(name: "tools", description: "List or toggle agent tools", category: "Hermes"),
-        SlashCommand(name: "undo", description: "Remove the last user and assistant exchange", category: "Hermes"),
-        SlashCommand(name: "usage", description: "Show this session's token usage", category: "Hermes"),
-        SlashCommand(name: "version", description: "Show the Hermes Agent version", category: "Hermes")
+    /// Internal so localization tests can pin the protocol-value invariants
+    /// (raw name/aliases, localized display copy) across every App Language.
+    static var builtInSlashCommands: [SlashCommand] { [
+        SlashCommand(name: "new", aliases: ["reset"], description: AppLocalization.string("Start a new conversation"), category: AppLocalization.string("Session")),
+        SlashCommand(name: "branch", aliases: ["fork"], description: AppLocalization.string("Branch this conversation into a new chat"), category: AppLocalization.string("Session")),
+        SlashCommand(name: "model", description: AppLocalization.string("Open the model and run settings"), category: AppLocalization.string("Session")),
+        SlashCommand(name: "yolo", description: AppLocalization.string("Toggle automatic tool approval"), category: AppLocalization.string("Session")),
+        SlashCommand(name: "help", aliases: ["commands"], description: AppLocalization.string("Show available slash commands"), category: AppLocalization.string("Session")),
+        SlashCommand(name: "approvals", description: AppLocalization.string("Show or set approval mode"), category: "Hermes"),
+        SlashCommand(name: "agents", aliases: ["tasks"], description: AppLocalization.string("Show active sessions and tasks"), category: "Hermes"),
+        SlashCommand(name: "background", aliases: ["bg", "btw"], description: AppLocalization.string("Run a prompt in the background"), category: "Hermes"),
+        SlashCommand(name: "compress", aliases: ["compact"], description: AppLocalization.string("Compress this conversation context"), category: "Hermes"),
+        SlashCommand(name: "debug", description: AppLocalization.string("Create a debug report"), category: "Hermes"),
+        SlashCommand(name: "goal", description: AppLocalization.string("Manage this session's standing goal"), category: "Hermes"),
+        SlashCommand(name: "personality", description: AppLocalization.string("Switch the session personality"), category: "Hermes"),
+        SlashCommand(name: "queue", aliases: ["q"], description: AppLocalization.string("Queue a prompt for the next turn"), category: "Hermes"),
+        SlashCommand(name: "retry", description: AppLocalization.string("Retry the last user message"), category: "Hermes"),
+        SlashCommand(name: "rollback", description: AppLocalization.string("List or restore filesystem checkpoints"), category: "Hermes"),
+        SlashCommand(name: "save", description: AppLocalization.string("Save the current transcript"), category: "Hermes"),
+        SlashCommand(name: "status", description: AppLocalization.string("Show current session status"), category: "Hermes"),
+        SlashCommand(name: "steer", description: AppLocalization.string("Steer the current run"), category: "Hermes"),
+        SlashCommand(name: "stop", description: AppLocalization.string("Stop running background processes"), category: "Hermes"),
+        SlashCommand(name: "tools", description: AppLocalization.string("List or toggle agent tools"), category: "Hermes"),
+        SlashCommand(name: "undo", description: AppLocalization.string("Remove the last user and assistant exchange"), category: "Hermes"),
+        SlashCommand(name: "usage", description: AppLocalization.string("Show this session's token usage"), category: "Hermes"),
+        SlashCommand(name: "version", description: AppLocalization.string("Show the Hermes Agent version"), category: "Hermes")
     ]
+    }
 
     private static func normalizedSlashCatalog(_ payload: AnyCodable) -> [SlashCommand] {
         let object = payload.objectValue ?? [:]
@@ -4843,7 +10737,7 @@ final class AppState: ObservableObject {
         }
 
         for pair in object["pairs"]?.arrayValue ?? [] {
-            if let command = slashCommand(from: pair, category: "Skills & extensions") {
+            if let command = slashCommand(from: pair, category: AppLocalization.string("Skills & extensions")) {
                 add(command)
             }
         }
@@ -4875,7 +10769,7 @@ final class AppState: ObservableObject {
             let name = normalizedSlashName(rawName)
             guard !name.isEmpty else { return nil }
             let description = pair.dropFirst().first?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return SlashCommand(name: name, description: description?.isEmpty == false ? description! : "Hermes command", category: category)
+            return SlashCommand(name: name, description: description?.isEmpty == false ? description! : AppLocalization.string("Hermes command"), category: category)
         }
         guard let object = value.objectValue else { return nil }
         let name = normalizedSlashName(object["name"]?.stringValue ?? object["command"]?.stringValue ?? "")
@@ -4886,7 +10780,7 @@ final class AppState: ObservableObject {
                 .compactMap { $0.stringValue }
                 .map { normalizedSlashName($0) }
                 .filter { !$0.isEmpty },
-            description: object["description"]?.stringValue ?? object["desc"]?.stringValue ?? "Hermes command",
+            description: object["description"]?.stringValue ?? object["desc"]?.stringValue ?? AppLocalization.string("Hermes command"),
             category: category,
             argsHint: object["args_hint"]?.stringValue ?? object["argsHint"]?.stringValue
         )
@@ -4916,9 +10810,24 @@ final class AppState: ObservableObject {
         do {
             let result = try await client.commandsCatalog(sessionId: sessionID)
             guard profile == activeProfile, self.client === client else { return }
+            lastSlashCatalogPayload = result
             slashCommands = Self.normalizedSlashCatalog(result)
         } catch {
             // Non-fatal — keep whatever we have
+        }
+    }
+
+    private var lastSlashCatalogPayload: AnyCodable?
+
+    /// Re-resolves the slash command list after an in-app App Language
+    /// change. Built-in descriptions/categories localize per call; the
+    /// server catalog is a stored protocol payload (descriptions are server
+    /// data and stay raw), so only the merge is re-run — no refetch.
+    func appLanguageDidChange() {
+        if let payload = lastSlashCatalogPayload {
+            slashCommands = Self.normalizedSlashCatalog(payload)
+        } else {
+            slashCommands = Self.builtInSlashCommands
         }
     }
 
@@ -4993,7 +10902,7 @@ final class AppState: ObservableObject {
         case "new", "reset":
             guard !isProfileSwitching, isConnected, !isConnecting else {
                 if isProfileSwitching || isConnecting {
-                    errorMessage = "Wait for the workspace switch to finish before starting a conversation."
+                    errorMessage = AppLocalization.string("Wait for the workspace switch to finish before starting a conversation.")
                 }
                 return
             }
@@ -5002,12 +10911,12 @@ final class AppState: ObservableObject {
             return
         case "branch", "fork":
             guard !isBusy else {
-                errorMessage = "Stop the active response before branching this conversation."
+                errorMessage = AppLocalization.string("Stop the active response before branching this conversation.")
                 return
             }
             guard !isBranchingChat, !isProfileSwitching else { return }
             guard let assistantMessage = messages.last(where: { $0.role == .assistant }) else {
-                errorMessage = "There is no assistant response to branch from yet."
+                errorMessage = AppLocalization.string("There is no assistant response to branch from yet.")
                 return
             }
             guard let messageIndex = messages.firstIndex(where: { $0.id == assistantMessage.id }),
@@ -5019,7 +10928,7 @@ final class AppState: ObservableObject {
                           ?? message.content
                       return !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                   }) else {
-                errorMessage = "There is no message history to branch from."
+                errorMessage = AppLocalization.string("There is no message history to branch from.")
                 return
             }
             cancelChatResumeRestoration()
@@ -5040,6 +10949,22 @@ final class AppState: ObservableObject {
         case "help":
             cancelChatResumeRestoration()
             appendSlashOutput(Self.formatSlashHelp(), context: submissionContext)
+            return
+        case "compress", "compact":
+            // Dedicated `session.compress` RPC (upstream Desktop parity). Must
+            // not ride the generic slash path: compression legitimately
+            // outlives the request timeout, and the gateway rejects it while
+            // a turn runs (4009), so unlike `branch` there is no busy guard —
+            // the gateway's own answer is the accurate one.
+            guard !isBranchingChat, !isProfileSwitching else { return }
+            cancelChatResumeRestoration()
+            await compressActiveSession(
+                focusTopic: command.argument,
+                legacyCommand: command.cleaned,
+                client: client,
+                sessionID: sessionId,
+                context: submissionContext
+            )
             return
         default:
             break
@@ -5186,6 +11111,9 @@ final class AppState: ObservableObject {
         if let context {
             guard isCurrentComposerSubmission(context) else { return }
         }
+        // Mid-turn ordering rule: slash output must not land below the live
+        // reasoning card's eventual commit.
+        settleReasoningSegmentIntoTranscript()
         messages.append(ChatMessage(
             id: "slash-\(Date().timeIntervalSince1970)",
             role: .system,
@@ -5199,6 +11127,589 @@ final class AppState: ObservableObject {
 
     private static func formatSlashHelp() -> String {
         return "**Slash Commands**\n\nType `/` followed by a command name.\n\n**Built-in:**\n• `/new` — Start a new conversation\n• `/model` — Open the model picker\n• `/yolo` — Toggle auto-approve mode\n• `/help` — Show this help\n\nUse the suggestions list to discover gateway commands."
+    }
+
+    // MARK: - Session compression (`session.compress`)
+
+    /// Dedicated `/compress` handler (upstream Desktop parity): the
+    /// `session.compress` RPC with its LLM-scale timeout, transcript adoption
+    /// from the response, and the `slash.exec` fallback only for gateways
+    /// that predate the dedicated method.
+    private func compressActiveSession(
+        focusTopic: String,
+        legacyCommand: String,
+        client: HermesClient,
+        sessionID: String,
+        context: ComposerSubmissionContext
+    ) async {
+        guard isCurrentComposerSubmission(context) else { return }
+        if compressingSessionIDs.contains(where: { composerSessionIDsAreEquivalent($0, sessionID) }) {
+            errorMessage = AppLocalization.string("Compression is already in progress for this conversation.")
+            return
+        }
+        var activeClaimID = sessionID
+        compressingSessionIDs.insert(activeClaimID)
+        defer { compressingSessionIDs.remove(activeClaimID) }
+        let trimmedTopic = focusTopic.trimmingCharacters(in: .whitespacesAndNewlines)
+        let focusTopicParam = trimmedTopic.isEmpty ? nil : trimmedTopic
+        // The conversation's terminal-compaction generation at RPC
+        // invocation: a `pending` response may only establish the server-side
+        // claim when no terminal edge landed during the await.
+        let invocationGeneration = terminalServerCompactionGeneration(for: sessionID)
+        do {
+            let outcome = try await compressSessionWithRecovery(
+                client: client,
+                sessionID: sessionID,
+                focusTopic: focusTopicParam,
+                invocationGeneration: invocationGeneration,
+                context: context,
+                // A stale-runtime recovery rebound the conversation to a
+                // fresh runtime: move the in-flight claim with it so
+                // coalescing and the spinner follow the recovered identity
+                // for the whole retry window (no orphaned old-id entry).
+                onRecover: { recoveredSessionID in
+                    compressingSessionIDs.remove(activeClaimID)
+                    activeClaimID = recoveredSessionID
+                    compressingSessionIDs.insert(activeClaimID)
+                }
+            )
+            guard isCurrentComposerSubmission(outcome.context) else { return }
+            let disposition = applySessionCompressionResult(
+                outcome.result,
+                sessionID: outcome.sessionID,
+                invocationGeneration: invocationGeneration,
+                context: outcome.context
+            )
+            if disposition == .adopted {
+                // Fence: a reconcile whose transcript fetch resolved before
+                // the server-side compression committed would otherwise
+                // write pre-compression rows and offsets over the freshly
+                // re-established invariants. Rotating the token makes every
+                // reconcile that predates the compression fail its
+                // commit-time ownership check; reconciles that start after
+                // this point fetch post-compression state and legitimately
+                // own the fence.
+                invalidateReconciliation()
+                await reestablishPersistedHistoryAfterCompression(
+                    requestedSessionID: outcome.sessionID,
+                    context: outcome.context
+                )
+            }
+        } catch {
+            // A recovery that rebound the session carries the REBASED
+            // context: classification, fences, and the legacy fallback must
+            // evaluate against the recovered identity, not the dead runtime.
+            let errorForReporting: Error
+            let reportingContext: ComposerSubmissionContext
+            if let recoveryFailure = error as? CompressionRecoveryContextError {
+                errorForReporting = recoveryFailure.underlying
+                reportingContext = recoveryFailure.context
+            } else {
+                errorForReporting = error
+                reportingContext = context
+            }
+            guard isCurrentComposerSubmission(reportingContext) else { return }
+            if HermesClient.isMissingRPCMethod(errorForReporting) {
+                await runLegacyCompressionFallback(
+                    legacyCommand: legacyCommand,
+                    aliasArgument: focusTopic,
+                    client: client,
+                    sessionID: activeClaimID,
+                    context: reportingContext
+                )
+            } else {
+                appendSlashOutput(
+                    AppLocalization.string(
+                        "⚠️ Compression failed: \(errorForReporting.localizedDescription)"
+                    ),
+                    context: reportingContext
+                )
+            }
+        }
+    }
+
+    /// One `session.compress` call with upstream Desktop's stale-runtime
+    /// recovery (`withSessionNotFoundResume`, minus the runtime cache): if —
+    /// and only if — the gateway answers `4001 "session not found"` for a
+    /// reaped/detached runtime, resume the conversation's durable stored id
+    /// once, rebind the active runtime through the canonical state helper,
+    /// and retry ONCE against the fresh runtime. Timeouts (compression is
+    /// legitimately LLM-bound), busy rejections, connection loss, and
+    /// compression errors are never recovery signals; a resume failure
+    /// rethrows the ORIGINAL compression error, which is the more meaningful
+    /// one. The returned context is re-based onto the recovered runtime so
+    /// the caller's post-retry fences validate the NEW identity.
+    /// A stale-runtime recovery rebound the submission to a fresh runtime;
+    /// failures after that rebind fence against the RECOVERED identity, so
+    /// reporters must unwrap `underlying` and fence with `context`.
+    private struct CompressionRecoveryContextError: Error {
+        let underlying: Error
+        let context: ComposerSubmissionContext
+    }
+
+    private func compressSessionWithRecovery(
+        client: HermesClient,
+        sessionID: String,
+        focusTopic: String?,
+        invocationGeneration: Int,
+        context: ComposerSubmissionContext,
+        onRecover: @MainActor (String) -> Void
+    ) async throws -> (result: SessionCompressResult, sessionID: String, context: ComposerSubmissionContext) {
+        do {
+            let result = try await performCompressSession(
+                client: client,
+                sessionID: sessionID,
+                focusTopic: focusTopic
+            )
+            return (result, sessionID, context)
+        } catch {
+            // Bind the ORIGINAL error first: the recovery steps below have
+            // their own failure modes, and the original compression error is
+            // the one that stays meaningful. (An inner `catch { throw error }`
+            // would rethrow the RESUME failure instead.)
+            let originalError = error
+            guard HermesClient.isSessionNotFoundError(originalError) else { throw originalError }
+            // Recovery needs the durable stored id the conversation's
+            // identity anchors. A canonical Bot Chat has no catalog row
+            // (hidden, another profile): its anchor is the accepted scroll
+            // identity, and the recovery resume must ride the BOT profile —
+            // otherwise the re-resume would address the dashboard store and
+            // never find the session.
+            let botScope = botConversationProfile(for: sessionID)
+            let storedSessionID: String
+            let acceptedIDs: Set<String>
+            let recoveryProfile: String?
+            if let botScope {
+                let canonical = activeChatScrollSessionIdentity.canonicalSessionID ?? sessionID
+                storedSessionID = canonical
+                acceptedIDs = activeChatScrollSessionIdentity.equivalentSessionIDs
+                    .union([sessionID, canonical])
+                recoveryProfile = botScope
+            } else {
+                guard let catalogRow = (sessions + cronSessions).first(where: {
+                    $0.id == sessionID || $0.alternateIds.contains(sessionID)
+                }) else { throw originalError }
+                storedSessionID = catalogRow.storedSessionId ?? catalogRow.id
+                acceptedIDs = Set(
+                    [catalogRow.id, storedSessionID, sessionID] + catalogRow.alternateIds
+                )
+                recoveryProfile = nil
+            }
+            // Drift fence BEFORE the resume side effect: a resume mints a
+            // fresh runtime — never mint one for a submission the user has
+            // already abandoned.
+            guard isCurrentComposerSubmission(context) else { throw originalError }
+            let resumed: SessionResumeResult
+            do {
+                resumed = try await openChatResumeSession(
+                    storedSessionID,
+                    using: client,
+                    compact: true,
+                    profile: recoveryProfile
+                )
+            } catch {
+                // Resume failure: surface the ORIGINAL compression error
+                // (upstream Desktop rethrows it too).
+                throw originalError
+            }
+            let recoveredSessionID = resumed.sessionId
+            // A blank runtime id cannot be rebound or retried.
+            guard !recoveredSessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw originalError
+            }
+            // Identity admission — the same gate the resume reconciliation
+            // runs: the recovered runtime must belong to the stored
+            // conversation this recovery intended. A contradictory durable
+            // claim or a runtime positively owned by another catalog row is
+            // rejected without rebind or retry.
+            // Accept everything the conversation's identity positively
+            // anchors — the same seeding breadth the resume reconciliation
+            // uses.
+            let selectedIdentity = ConversationIdentity(
+                profile: recoveryProfile ?? activeProfile,
+                durableSessionID: storedSessionID,
+                runtimeSessionID: sessionID,
+                acceptedSessionIDs: acceptedIDs
+            )
+            let claim = ResumeIdentityClaim(
+                runtimeSessionID: recoveredSessionID,
+                durableSessionID: resumed.storedSessionId
+            )
+            guard case .success = ConversationIdentityGate.admit(
+                claim: claim,
+                selected: selectedIdentity,
+                catalog: sessions + cronSessions
+            ) else {
+                sessionCatalogLog.notice(
+                    "Rejected contradictory recovery resume; requested=\(sessionID, privacy: .public), recovered=\(recoveredSessionID, privacy: .public)"
+                )
+                throw originalError
+            }
+            // Record the authoritative runtime → durable mappings BEFORE the
+            // retry: the recovered runtime becomes a positively confirmed
+            // alias of the stored conversation, and the superseded runtime's
+            // mapping keeps late alias-addressed lifecycle signals on the
+            // same compaction generation.
+            conversationIdentityIndex.recordAuthoritative(
+                runtimeID: recoveredSessionID,
+                durableID: storedSessionID,
+                profile: recoveryProfile ?? activeProfile,
+                source: .resume
+            )
+            conversationIdentityIndex.recordAuthoritative(
+                runtimeID: sessionID,
+                durableID: storedSessionID,
+                profile: recoveryProfile ?? activeProfile,
+                source: .resume
+            )
+            // Migrate the invocation generation onto the recovered
+            // conversation's durable key: the pending fence compares against
+            // this counter, and without the migration a terminal edge that
+            // landed under the superseded runtime's key during the recovery
+            // await would be invisible to it.
+            let recoveredKey = serverCompactionGenerationKey(for: recoveredSessionID)
+            let supersededKey = serverCompactionGenerationKey(for: sessionID)
+            serverCompactionTerminalGenerations[recoveredKey] = max(
+                serverCompactionTerminalGenerations[recoveredKey] ?? 0,
+                serverCompactionTerminalGenerations[supersededKey] ?? 0,
+                invocationGeneration
+            )
+            // Drift fence after the resume await (must remain): identity must
+            // still own this submission. If the user navigated away, do not
+            // rebind and do not send compression to the recovered runtime.
+            guard isCurrentComposerSubmission(context) else { throw originalError }
+            // Rebind through the canonical state helper: updates
+            // `activeSessionId` and re-anchors the persisted identity. A
+            // bot chat rebind never seeds the dashboard's cold-restore
+            // selection, exactly like its open.
+            setActiveSessionState(
+                id: recoveredSessionID,
+                recordsResumeSelection: recoveryProfile == nil
+            )
+            // Re-register the recovered runtime: every later scope
+            // resolution (reconnect reconcile, backfill ownership,
+            // post-compress rehydration) resolves through this registry.
+            if let recoveryProfile {
+                noteBotChatSession(recoveredSessionID, profile: recoveryProfile)
+                noteBotChatSession(storedSessionID, profile: recoveryProfile)
+            }
+            onRecover(recoveredSessionID)
+            // Re-base the submission onto the recovered runtime: the old
+            // context describes the dead runtime and would fail every
+            // post-retry ownership fence.
+            let reboundContext = composerSubmissionContext()
+            do {
+                let result = try await performCompressSession(
+                    client: client,
+                    sessionID: recoveredSessionID,
+                    focusTopic: focusTopic
+                )
+                return (result, recoveredSessionID, reboundContext)
+            } catch {
+                // A second failure is a real error (upstream Desktop), but it
+                // belongs to the RECOVERED identity: fence and report there,
+                // never against the dead runtime.
+                throw CompressionRecoveryContextError(underlying: error, context: reboundContext)
+            }
+        }
+    }
+
+    private func performCompressSession(
+        client: HermesClient,
+        sessionID: String,
+        focusTopic: String?
+    ) async throws -> SessionCompressResult {
+        if let compressSession = chatResumeLifecycleOperations.compressSession {
+            return try await compressSession(client, sessionID, focusTopic)
+        }
+        return try await client.compressSession(sessionId: sessionID, focusTopic: focusTopic)
+    }
+
+    /// Older gateways predate `session.compress`; keep today's generic slash
+    /// path working there, mirroring upstream Desktop. Only a missing-method
+    /// failure routes here — a timeout means the gateway IS compressing, and
+    /// re-running `/compress` through the legacy route would start a second
+    /// server-side compression. On those legacy gateways today's failure mode
+    /// survives unchanged (a slow `slash.exec` can still cascade into
+    /// `command.dispatch`); preserving that is the point of the fallback.
+    private func runLegacyCompressionFallback(
+        legacyCommand: String,
+        aliasArgument: String,
+        client: HermesClient,
+        sessionID: String,
+        context: ComposerSubmissionContext
+    ) async {
+        do {
+            let legacyResult = try await executeGatewaySlash(
+                client: client,
+                sessionID: sessionID,
+                command: legacyCommand,
+                context: context
+            )
+            guard isCurrentComposerSubmission(context) else { return }
+            await handleSlashResult(
+                legacyResult,
+                depth: 0,
+                aliasArgument: aliasArgument,
+                client: client,
+                sessionID: sessionID,
+                context: context
+            )
+        } catch {
+            guard isCurrentComposerSubmission(context) else { return }
+            appendSlashOutput(
+                AppLocalization.string(
+                    "⚠️ Compression failed: \(error.localizedDescription)"
+                ),
+                context: context
+            )
+        }
+    }
+
+    /// What the compression result did to the visible transcript — the
+    /// caller re-establishes persisted-history invariants only after an
+    /// adoption actually replaced it.
+    private enum CompressionTranscriptDisposition {
+        case adopted
+        /// A turn started while the RPC was in flight; adoption was deferred.
+        case deferred
+        case untouched
+    }
+
+    private func applySessionCompressionResult(
+        _ result: SessionCompressResult,
+        sessionID: String,
+        invocationGeneration: Int,
+        context: ComposerSubmissionContext
+    ) -> CompressionTranscriptDisposition {
+        if result.lockHeld {
+            // Another compression — this device, another client, or an
+            // automatic one — already holds the compression lock. Not an
+            // error, and never retried from here.
+            appendSlashOutput(
+                result.message ?? AppLocalization.string("Compression is already in progress."),
+                context: context
+            )
+            return .untouched
+        }
+        if result.isPending {
+            // The gateway's bounded compute-host wait expired while the host
+            // is still compressing; it pushes `session.info` plus a
+            // `compacted` status.update edge when the host finishes. Not an
+            // error, and never retried (upstream #97948). The RPC ending is
+            // NOT the compression finishing: record the server-side
+            // compaction so the spinner stays truthful until the `compacted`
+            // edge (or an authoritative reconnect) clears it.
+            //
+            // Pending-resurrection fence: if a terminal `compacted` edge
+            // landed while this RPC was in flight, it already processed the
+            // completion — the stale continuation must not resurrect the
+            // claim. Conversation-level generation cost: another client's
+            // terminal edge during our await also suppresses this row (the
+            // transcript still refreshes via that edge's own handling).
+            if terminalServerCompactionGeneration(for: sessionID) == invocationGeneration {
+                establishServerCompactionClaim(
+                    sessionId: sessionID,
+                    generation: invocationGeneration
+                )
+                appendSlashOutput(
+                    result.message ?? AppLocalization.string("Compression continues in the background; the transcript will refresh when it finishes."),
+                    context: context
+                )
+            }
+            return .untouched
+        }
+        // Any authoritative terminal result ends the server-side claim.
+        clearServerCompactionClaim(sessionId: sessionID)
+        let record = Self.compressionRecord(for: result)
+        guard result.hasMessagesPayload else {
+            appendSlashOutput(record, context: context)
+            return .untouched
+        }
+        // Upstream Desktop adopts the returned transcript whenever the
+        // `messages` array is present — including an aborted compression,
+        // whose payload is the gateway's authoritative (unchanged) history.
+        // Abort only suppresses the success record above.
+        //
+        // A turn that started while the compression RPC was in flight owns
+        // the transcript now; replacing it here would erase the live turn's
+        // rows and streaming text (Desktop decouples this via per-runtime
+        // session state). Mark the window stale so the next authoritative
+        // sync converges, and leave the in-flight turn alone.
+        //
+        // Leave `locallyOwnedInFlightTurn` alone: the live turn still owns
+        // the transcript, and settlement records its ordering debt.
+        if turnState == .running || locallyOwnedInFlightTurn != nil {
+            transcriptFreshnessIsStale = true
+            // Compression rewrote the persisted history server-side even
+            // though adoption is deferred: a pre-compression backfill window
+            // must not stay usable — "Load earlier" would page offsets from
+            // a row universe that no longer exists. Invalidate here and do
+            // NOT rehydrate: the live turn is why adoption was deferred, and
+            // the next authoritative reconcile (or pre-send freshness gate)
+            // re-establishes pagination and provenance.
+            invalidatePersistedHistoryInvariants()
+            appendSlashOutput(record, context: context)
+            return .deferred
+        }
+        adoptCompressedTranscript(result.messages, sessionID: sessionID)
+        appendSlashOutput(record, context: context)
+        return .adopted
+    }
+
+    /// The chat record a finished compression leaves behind: summary lines on
+    /// success; a warning note instead when the compression aborted (upstream
+    /// Desktop keeps an aborted run out of the success path); the host's own
+    /// feedback or the removed-count text as the remaining fallbacks.
+    private static func compressionRecord(for result: SessionCompressResult) -> String {
+        if result.isAborted {
+            let detail = result.summaryHeadline ?? result.summaryNote ?? result.message
+            return detail.map { "⚠️ \($0)" }
+                ?? AppLocalization.string("⚠️ Context compression was aborted; the transcript is unchanged.")
+        }
+        let summaryLines = [result.summaryHeadline, result.summaryTokenLine, result.summaryNote]
+            .compactMap { $0 }
+        if !summaryLines.isEmpty {
+            return summaryLines.joined(separator: "\n\n")
+        }
+        if let hostOutput = result.hostOutput, !hostOutput.isEmpty {
+            return hostOutput
+        }
+        let removed = result.removed ?? 0
+        return removed > 0
+            ? AppLocalization.string("Compressed \(Int(removed)) messages.")
+            : AppLocalization.string("Nothing to compress.")
+    }
+
+    /// The persisted-history invariants that describe "which persisted rows
+    /// the local transcript covers". A server-side compression rewrites that
+    /// row universe, so any pre-compression window offset, durable-row
+    /// provenance, and ordering frontier is obsolete the moment the rewrite
+    /// lands — they are re-established only by a fresh validated hydration.
+    private func invalidatePersistedHistoryInvariants() {
+        persistedTranscriptWindow = nil
+        durablePersistedRowIDs = []
+        persistedOrderingFrontier = PersistedOrderingFrontier()
+    }
+
+    /// Adopt the gateway's post-compress transcript for the current
+    /// conversation. Mirrors the invariant set of `applyChatResume` for an
+    /// in-place replacement — viewport replacement bookkeeping,
+    /// presentation-cache enrichment, review-card reattachment, and the
+    /// authoritative clears of local turn/ordering state — without touching
+    /// session identity (compression never switches conversations).
+    private func adoptCompressedTranscript(
+        _ compressed: [ChatMessage],
+        sessionID: String
+    ) {
+        settleReasoningSegmentIntoTranscript()
+        clearStreamingText()
+        activeAssistantMessageId = nil
+        resetReasoningTurn()
+        markChatViewportReplacement()
+        // Locally restored-but-unanswered decision cards survive a
+        // compression: the compressed gateway transcript can no longer carry
+        // them. Reattach the ones the gateway rows do not already include
+        // (same dedup rule as applyChatResume).
+        let gatewayDecisionKeys = Set(compressed.compactMap(SessionPresentationCache.decisionKey(for:)))
+        let retainedDecisionMessages = pendingDecisionRestorationMessages(for: sessionID).filter { message in
+            guard let key = SessionPresentationCache.decisionKey(for: message) else { return false }
+            return !gatewayDecisionKeys.contains(key)
+        }
+        let merged = sessionPresentationCache.merge(
+            compressed + retainedDecisionMessages,
+            // The compressed conversation's own namespace: for a bot chat
+            // this must agree with the reconcile/open writes, or retained
+            // decision cards and presentation land in a foreign partition.
+            profile: presentationProfile(for: sessionID),
+            sessionIDs: [sessionID],
+            includePendingClarifications: false,
+            includePendingApprovals: false
+        )
+        messages = mergeCachedReviews(into: merged, sessionId: sessionID)
+        // The gateway's authoritative response just replaced the transcript:
+        // no local turn/ordering debt can outlive it (applyChatResume's rule).
+        transcriptFreshnessIsStale = false
+        locallyOwnedInFlightTurn = nil
+        pendingLocalOrderingDebt = nil
+        // Compression rewrote the persisted history server-side: window
+        // offsets, durable-row provenance, and the ordering frontier from
+        // BEFORE the compression describe history that no longer exists.
+        // They are re-established only from a fresh validated hydration
+        // (reestablishPersistedHistoryAfterCompression); until
+        // that succeeds, backfill stays disabled.
+        invalidatePersistedHistoryInvariants()
+        noteChatViewportTranscriptReplacement()
+        cacheMessagePresentation()
+    }
+
+    /// Re-establishes the persisted-history invariants the compression
+    /// adoption invalidated. The only trustworthy source is a fresh
+    /// validated `order=latest offset=0` hydration — the same bounded read
+    /// the resume path performs — so the window's next offset, the durable
+    /// row provenance, and the ordering frontier are rebuilt from that
+    /// response alone. A stale pre-compression nextOffset must never
+    /// survive: the compressed history's offsets count from a different
+    /// row universe. If the hydration fails (or no history source exists),
+    /// the window stays nil and "Load earlier messages" stays disabled
+    /// until the next authoritative resume/reconcile rebuilds it.
+    private func reestablishPersistedHistoryAfterCompression(
+        requestedSessionID: String,
+        context: ComposerSubmissionContext
+    ) async {
+        guard isCurrentComposerSubmission(context) else { return }
+        // A bot chat's post-compress rehydration must read the BOT's store
+        // and stamp the window with the bot scope, exactly like the initial
+        // hydration did.
+        let profile = botConversationProfile(for: requestedSessionID) ?? activeProfile
+        let outcome = await persistedTranscriptOutcome(
+            sessionId: requestedSessionID,
+            profile: profile,
+            using: dashboardTicketBridge
+        )
+        guard isCurrentComposerSubmission(context) else { return }
+        let transcript: PersistedSessionTranscript
+        switch outcome {
+        case .hydrated(let hydrated):
+            transcript = hydrated
+        case .unavailable:
+            sessionCatalogLog.debug("No persisted-history source after /compress; backfill stays disabled for \(requestedSessionID, privacy: .public)")
+            return
+        case .failed(let error):
+            sessionCatalogLog.notice("Persisted-history rehydration after /compress failed; backfill stays disabled until the next sync: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+        // Identity gate, same rule as the resume path: a response the
+        // backend addressed to another conversation must not seed this
+        // conversation's ordering evidence.
+        guard transcriptMatchesSession(
+            transcript,
+            requestedSessionId: requestedSessionID,
+            resumedSessionId: requestedSessionID
+        ) else {
+            sessionCatalogLog.debug("Persisted-history page after /compress addressed to another conversation; backfill stays disabled for \(requestedSessionID, privacy: .public)")
+            return
+        }
+        persistedOrderingFrontier = Self.orderingFrontier(from: transcript)
+        durablePersistedRowIDs = transcript.durableRowIDs
+        if let page = transcript.page, page.honorsTailContract {
+            persistedTranscriptWindow = PersistedTranscriptWindowState(
+                requestedSessionID: requestedSessionID,
+                profile: profile,
+                pageSize: PersistedTranscriptPagination.pageSize,
+                resolvedSessionID: transcript.resolvedSessionId,
+                // No resume transaction ran, so the window vouches for the
+                // requested + resolved identities only.
+                runtimeSessionID: nil,
+                nextOffset: page.rawReturned,
+                canLoadEarlier: page.mayHaveOlderRows(fetchedRowCount: page.rawReturned),
+                hasBackfilledPrefix: false
+            )
+        } else {
+            // Legacy one-shot hydration: the whole persisted history is on
+            // screen; no older page exists to fetch.
+            persistedTranscriptWindow = nil
+        }
     }
 
     private func steer(
@@ -5215,9 +11726,30 @@ final class AppState: ObservableObject {
             } else {
                 try await client.steer(sessionId, text: text)
             }
+            // A successful steer proves Hermes applied the session's busy
+            // policy — the session was RUNNING when the steer landed. That is
+            // authoritative live liveness evidence for the recovery stamp
+            // guard, even though steer writes no local turn state. It is
+            // evidence about the ORIGINATING conversation only: the RPC may
+            // complete after the user switched conversations, and a late
+            // Session-A steer must never contaminate Session B's global
+            // evidence — a stale running claim here would let B's older
+            // ambiguous recovery resurrect ownership over B's newer settled
+            // edge. Alias rotation within the same conversation still counts;
+            // a genuine handoff does not.
+            // Bool test only — the re-homed context it computes internally is
+            // not needed, because steer performs no further session-scoped
+            // writes after this point.
+            if isCurrentOrAliasedComposerSubmission(submissionContext) {
+                turnLifecycleEvidence = TurnLifecycleEvidence(
+                    revision: turnLifecycleEvidence.revision &+ 1,
+                    running: true
+                )
+            }
             // A successful steer is accepted by Hermes even if the user
-            // switched sessions while the RPC was suspended. It has no local
-            // post-await mutation, so preserve success for draft handling.
+            // switched sessions while the RPC was suspended. Apart from the
+            // ownership-gated evidence write above it has no local post-await
+            // mutation, so preserve success for draft handling.
             return true
         } catch {
             guard isCurrentOrAliasedComposerSubmission(submissionContext) else { return false }
@@ -5306,12 +11838,12 @@ final class AppState: ObservableObject {
                 return false
             }
 
-            errorMessage = "Could not redirect the active response: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not redirect the active response: \(error.localizedDescription)")
             await recoverComposerSubmission(using: submissionContext)
             return false
         } catch {
             guard isCurrentOrAliasedComposerSubmission(submissionContext) else { return false }
-            errorMessage = "Could not redirect the active response: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not redirect the active response: \(error.localizedDescription)")
             await recoverComposerSubmission(using: submissionContext)
             return false
         }
@@ -5340,6 +11872,11 @@ final class AppState: ObservableObject {
                 == text.trimmingCharacters(in: .whitespacesAndNewlines) {
             return
         }
+        // Mid-turn ordering rule: a steer/redirect correction bubble must sit
+        // above the live reasoning card's eventual commit. Reasoning that
+        // resumes after the correction mounts a fresh segment below it,
+        // matching the tool-boundary precedent.
+        settleReasoningSegmentIntoTranscript()
         messages.append(ChatMessage(
             id: "local-correction-\(Date().timeIntervalSince1970)",
             role: .user,
@@ -5382,30 +11919,51 @@ final class AppState: ObservableObject {
             return true
         } catch {
             guard isCurrentOrAliasedComposerSubmission(currentContext) else { return false }
-            errorMessage = "Could not interrupt the active response: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not interrupt the active response: \(error.localizedDescription)")
             await recoverComposerSubmission(using: currentContext)
             return false
         }
     }
 
-    func cancelCurrent() async {
-        guard isBusy else { return }
+    /// Cancels the authoritative Hermes turn, reporting whether the
+    /// cancellation succeeded. "Success" also covers nothing being left to
+    /// cancel (the turn already settled server-side).
+    @discardableResult
+    func cancelCurrent() async -> Bool {
+        guard isBusy else { return true }
         let submissionContext = composerSubmissionContext()
-        guard await interruptForReplacement(context: submissionContext) else { return }
-        guard let currentContext = currentComposerSubmissionContextIfOwnedAndAliased(submissionContext) else { return }
+        guard await interruptForReplacement(context: submissionContext) else { return false }
+        guard let currentContext = currentComposerSubmissionContextIfOwnedAndAliased(submissionContext) else { return true }
         await recoverComposerSubmission(using: currentContext)
+        return true
     }
 
-    func respondToClarify(requestId: String, answer: String) async {
+    /// Answers one question of a clarification request. Batch questions route
+    /// per question (`question_id` + the gateway's authoritative `remaining`
+    /// list); a `nil` questionId targets the card's single question — the
+    /// shape every push-relay card and legacy gateway produces.
+    func respondToClarify(requestId: String, questionId: String? = nil, answer: String) async {
         let trimmedAnswer = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedAnswer.isEmpty,
               let index = messages.firstIndex(where: { $0.clarify?.requestId == requestId }),
-              let current = messages[index].clarify,
-              current.status == .pending || current.status == .error else { return }
+              var activity = messages[index].clarify,
+              !activity.isExpired else { return }
 
-        messages[index].clarify?.status = .submitting
-        messages[index].clarify?.answer = trimmedAnswer
-        messages[index].clarify?.error = nil
+        let questionIndex: Int?
+        if let questionId {
+            questionIndex = activity.questions.firstIndex { $0.id == questionId }
+        } else {
+            // Request-level answer: only valid while exactly one question is
+            // open; a batch must always answer through its qids.
+            questionIndex = activity.questions.count == 1 ? 0 : activity.questions.firstIndex { $0.status == .pending || $0.status == .error }
+        }
+        guard let questionIndex,
+              activity.questions[questionIndex].status == .pending
+                  || activity.questions[questionIndex].status == .error else { return }
+
+        activity.questions[questionIndex].status = .submitting
+        activity.questions[questionIndex].error = nil
+        messages[index].clarify = activity
         setRunning(true)
         cacheMessagePresentation()
 
@@ -5415,32 +11973,168 @@ final class AppState: ObservableObject {
         // Routed BEFORE the gateway-client guard: the relay answer needs only
         // the relay registration, and answering from a freshly-resumed push
         // is exactly when the gateway client may still be reconnecting.
+        // Batch relay decisions answer per question; the legacy scalar relay
+        // card keeps the whole-decision response shape.
         if requestId.hasPrefix(PendingDecisionPayload.relayRequestPrefix) {
-            await respondToRelayClarify(requestId: requestId, answer: trimmedAnswer)
+            let target = activity.questions[questionIndex]
+            if target.isSyntheticID {
+                await respondToRelayClarify(requestId: requestId, answer: trimmedAnswer)
+            } else {
+                await respondToRelayClarifyQuestion(
+                    requestId: requestId,
+                    questionId: target.id,
+                    answer: trimmedAnswer
+                )
+            }
             return
         }
         guard let client else {
-            messages[index].clarify?.status = .error
-            messages[index].clarify?.answer = nil
-            messages[index].clarify?.error = "Gateway connection is unavailable."
-            cacheMessagePresentation()
+            markClarifyQuestionError(
+                requestId: requestId,
+                questionId: activity.questions[questionIndex].id,
+                message: AppLocalization.string("Gateway connection is unavailable.")
+            )
             return
         }
+        let question = activity.questions[questionIndex]
+        // Ownership snapshot for the gateway-owned respond below — same fence
+        // as `respondToApproval`: a completion (success or failure) from a
+        // replaced client must not touch whatever decision state is current,
+        // even under colliding ids. The relay branch above is deliberately
+        // NOT fenced: it is owned by the relay registration, not by this
+        // HermesClient (push server identity is a separate prerequisite).
+        let profile = activeProfile
+        // The wire answer for a multi-select question must be the array form
+        // Hermes' batch parser accepts; typed custom text arrives as a bare
+        // string and is wrapped here so every multi-select path is uniform.
+        let wireAnswer: String
+        if question.multiSelect,
+           (try? JSONSerialization.jsonObject(with: Data(trimmedAnswer.utf8))) as? [String] == nil {
+            wireAnswer = ClarifyQuestion.multiSelectAnswer([trimmedAnswer])
+        } else {
+            wireAnswer = trimmedAnswer
+        }
         do {
-            try await client.respondToClarification(requestId: requestId, answer: trimmedAnswer)
-            guard let updatedIndex = messages.firstIndex(where: { $0.clarify?.requestId == requestId }) else { return }
-            messages[updatedIndex].clarify?.status = .answered
+            let outcome = try await client.respondToClarification(
+                requestId: requestId,
+                answer: wireAnswer,
+                // Only gateway-minted qids may address a question. A locally
+                // synthesized id (legacy scalar card) rides the request-level
+                // respond shape every gateway generation accepts.
+                questionId: question.isSyntheticID ? nil : question.id
+            )
+            guard profile == activeProfile, self.client === client else { return }
+            applyClarifyResponseOutcome(
+                outcome,
+                requestId: requestId,
+                questionId: question.id,
+                answer: wireAnswer
+            )
+        } catch {
+            guard profile == activeProfile, self.client === client else { return }
+            if Self.isExpiredPromptError(error) {
+                // Older gateways report expiry as RPC 4009 instead of the
+                // typed `expired` status — same teardown either way.
+                expireClarifyRequest(requestId: requestId)
+            } else {
+                markClarifyQuestionError(
+                    requestId: requestId,
+                    questionId: question.id,
+                    message: AppLocalization.string("Hermes did not accept that answer."),
+                    globalMessage: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    /// Restores exactly one question to an answerable/error state after a
+    /// failed respond; answered and in-flight-free sibling questions keep
+    /// their state.
+    private func markClarifyQuestionError(
+        requestId: String,
+        questionId: String,
+        message: String,
+        globalMessage: String? = nil
+    ) {
+        guard let index = messages.firstIndex(where: { $0.clarify?.requestId == requestId }),
+              var activity = messages[index].clarify,
+              let questionIndex = activity.questions.firstIndex(where: { $0.id == questionId }) else {
+            return
+        }
+        activity.questions[questionIndex].status = .error
+        activity.questions[questionIndex].answer = nil
+        activity.questions[questionIndex].error = message
+        messages[index].clarify = activity
+        if let globalMessage {
+            errorMessage = globalMessage
+        }
+        cacheMessagePresentation()
+    }
+
+    /// Answers ONE question of a batch relay decision. First-answer-wins per
+    /// question: only the targeted qid locks; sibling questions stay open
+    /// until their own answers land.
+    private func respondToRelayClarifyQuestion(
+        requestId: String,
+        questionId: String,
+        answer: String
+    ) async {
+        do {
+            let outcome = try await relayQuestionResponder(requestId, questionId, answer)
+            guard let index = messages.firstIndex(where: { $0.clarify?.requestId == requestId }),
+                  var activity = messages[index].clarify,
+                  let questionIndex = activity.questions.firstIndex(where: { $0.id == questionId }) else {
+                return
+            }
+            switch outcome {
+            case .locked(let remaining):
+                activity.questions[questionIndex].status = .answered
+                activity.questions[questionIndex].answer = answer
+                activity.questions[questionIndex].error = nil
+                // An explicit remaining list is authoritative about what is
+                // still open, exactly like the native gateway's contract.
+                if let remaining {
+                    let open = Set(remaining)
+                    for sibling in activity.questions.indices
+                    where sibling != questionIndex
+                        && activity.questions[sibling].status == .pending
+                        && !open.contains(activity.questions[sibling].id) {
+                        activity.questions[sibling].status = .answered
+                        activity.questions[sibling].answer = nil
+                    }
+                }
+            case .questionAlreadyLocked:
+                // Another device locked this qid first; settle it without
+                // displaying this device's rejected text. Sibling questions
+                // keep their state — a locked qid never retires the batch.
+                activity.questions[questionIndex].status = .answered
+                activity.questions[questionIndex].answer = nil
+            case .decisionReleased, .noLongerActive:
+                // Released (the native gateway path resolved the whole
+                // clarify) and timed-out/gone decisions are different relay
+                // reasons for the same card outcome: unanswered questions go
+                // inactive, answered history stays locked, and no sibling
+                // remains answerable.
+                activity.isExpired = true
+                for questionIndex in activity.questions.indices
+                where activity.questions[questionIndex].status != .answered {
+                    activity.questions[questionIndex].status = .expired
+                    activity.questions[questionIndex].error = nil
+                }
+                activity.error = Self.clarifyExpiredNotice(for: activity.questions.count)
+            }
+            messages[index].clarify = activity
             cacheMessagePresentation()
         } catch {
-            guard let updatedIndex = messages.firstIndex(where: { $0.clarify?.requestId == requestId }) else { return }
-            messages[updatedIndex].clarify?.status = .error
-            messages[updatedIndex].clarify?.answer = nil
-            if Self.isExpiredPromptError(error) {
-                messages[updatedIndex].clarify?.error = "This question is no longer active — Hermes timed it out and continued."
-            } else {
-                messages[updatedIndex].clarify?.error = "Hermes did not accept that answer."
-                errorMessage = error.localizedDescription
+            guard let index = messages.firstIndex(where: { $0.clarify?.requestId == requestId }),
+                  var activity = messages[index].clarify,
+                  let questionIndex = activity.questions.firstIndex(where: { $0.id == questionId }) else {
+                return
             }
+            activity.questions[questionIndex].status = .error
+            activity.questions[questionIndex].answer = nil
+            activity.questions[questionIndex].error = error.localizedDescription
+            messages[index].clarify = activity
             cacheMessagePresentation()
         }
     }
@@ -5451,28 +12145,36 @@ final class AppState: ObservableObject {
                 requestId: requestId,
                 answer: answer
             )
-            guard let updatedIndex = messages.firstIndex(where: { $0.clarify?.requestId == requestId }) else { return }
+            guard let updatedIndex = messages.firstIndex(where: { $0.clarify?.requestId == requestId }),
+                  var activity = messages[updatedIndex].clarify,
+                  !activity.questions.isEmpty else { return }
+            // Relay cards are single-question by construction: the notifier
+            // mints one request per pushed decision.
             switch outcome {
             case .answered:
-                messages[updatedIndex].clarify?.status = .answered
-                messages[updatedIndex].clarify?.answer = answer
+                activity.questions[0].status = .answered
+                activity.questions[0].answer = answer
             case .alreadyAnsweredElsewhere:
                 // Another device resolved the decision with its own answer;
                 // settle the card but do not display this device's rejected
                 // text as if it were what Hermes received.
-                messages[updatedIndex].clarify?.status = .answered
-                messages[updatedIndex].clarify?.answer = nil
+                activity.questions[0].status = .answered
+                activity.questions[0].answer = nil
             case .noLongerActive:
-                messages[updatedIndex].clarify?.status = .error
-                messages[updatedIndex].clarify?.answer = nil
-                messages[updatedIndex].clarify?.error = "This question is no longer active — it was timed out or already resolved."
+                activity.questions[0].status = .error
+                activity.questions[0].answer = nil
+                activity.questions[0].error = AppLocalization.string("This question is no longer active — it was timed out or already resolved.")
             }
+            messages[updatedIndex].clarify = activity
             cacheMessagePresentation()
         } catch {
-            guard let updatedIndex = messages.firstIndex(where: { $0.clarify?.requestId == requestId }) else { return }
-            messages[updatedIndex].clarify?.status = .error
-            messages[updatedIndex].clarify?.answer = nil
-            messages[updatedIndex].clarify?.error = error.localizedDescription
+            guard let updatedIndex = messages.firstIndex(where: { $0.clarify?.requestId == requestId }),
+                  var activity = messages[updatedIndex].clarify,
+                  !activity.questions.isEmpty else { return }
+            activity.questions[0].status = .error
+            activity.questions[0].answer = nil
+            activity.questions[0].error = error.localizedDescription
+            messages[updatedIndex].clarify = activity
             cacheMessagePresentation()
         }
     }
@@ -5623,42 +12325,589 @@ final class AppState: ObservableObject {
             .caseInsensitiveCompare(rhs.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
     }
 
-    /// Mirrors Hermes Desktop's `/api/sessions/{id}/messages` prefetch. The
-    /// dashboard server returns `messages`; the API-server variant returns
-    /// `data`, so accept both public Hermes response shapes.
-    private func dashboardSessionTranscript(
+    /// Mirrors Hermes Desktop's `/api/sessions/{id}/messages` prefetch:
+    /// fetches the session's persisted transcript through the dashboard
+    /// history route (or the test seam standing in for it) and parses it with
+    /// the production normalizer path. The typed outcome lets the resume
+    /// reconciliation distinguish a missing history source — which triggers
+    /// the legacy full-transcript resume — from an unrelated failure, which
+    /// must surface instead of silently degrading.
+    ///
+    /// The request is explicitly bounded (tail-anchored page of
+    /// `PersistedTranscriptPagination.pageSize` rows) so the transport and
+    /// normalization cost of opening a conversation is bounded no matter how
+    /// large the session grew. A response that carries the `order=latest`
+    /// pagination echo answers under the paginated tail contract; one
+    /// without it is a legacy one-shot full transcript and hydrates as
+    /// before.
+    /// Result of the foreground freshness tail read. Only the newest bounded
+    /// `order=latest` page is ever requested. Unlike `persistedTranscriptOutcome`
+    /// this deliberately has NO legacy one-shot fallback: a freshness check
+    /// must never escalate into a full-transcript transfer just to prove
+    /// currency — a backend that cannot serve the tail contract yields
+    /// inconclusive evidence instead, and the authoritative resume/reconcile
+    /// path owns any full hydration. (Gateway-only deployments without any
+    /// history source therefore re-attach authoritatively on each armed
+    /// return — the designed fallback, not a regression to optimize away.)
+    private enum ForegroundPersistedTailOutcome {
+        /// Validated tail page with positively durable row ids.
+        case hydrated(PersistedSessionTranscript)
+        /// The response did not honor the `order=latest` + durable-identity
+        /// contract — including a body with no message-rows array at all,
+        /// which the authoritative resume path re-classifies and SURFACES as
+        /// `HermesError.invalidResponse` (never silently absorbed here).
+        case unsupportedTailContract
+        /// The history source is structurally absent (no bridge/endpoint, or
+        /// the endpoint answered 404/410/501): no bounded capability exists.
+        case unavailable
+        /// Transient trouble (timeout, 429/5xx, bridge not ready, network).
+        case failed(Error)
+    }
+
+    /// Bounded tail-only read for the foreground freshness check: exactly one
+    /// `order=latest offset=0` page request, parsed with the shared
+    /// extraction/pagination/identity helpers, and stopping deliberately
+    /// before `persistedTranscriptOutcome`'s legacy one-shot re-read.
+    private func foregroundPersistedTailOutcome(
         sessionId: String,
         profile: String,
         using bridge: DashboardTicketBridge?
-    ) async -> PersistedSessionTranscript? {
-        guard let bridge else { return nil }
-
-        do {
-            let response = try await bridge.requestJSON(
-                path: sessionMessagesPath(sessionId: sessionId, profile: profile)
-            )
-            let rawMessages = ["messages", "data", "_array"]
-                .compactMap { response[$0] as? [Any] }
-                .first
-            guard let rawMessages else { return nil }
-
-            let resolvedSessionId = (response["session_id"] as? String)
-                ?? (response["sessionId"] as? String)
-            return PersistedSessionTranscript(
-                resolvedSessionId: resolvedSessionId,
-                messages: MessageNormalizer.normalizeMessages(rawMessages.map(AnyCodable.from))
-            )
-        } catch {
-            // Older gateways can omit the endpoint. The compact resume path and
-            // presentation cache remain a safe fallback in that case.
-            sessionCatalogLog.debug("Persisted transcript unavailable for \(sessionId, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            return nil
+    ) async -> ForegroundPersistedTailOutcome {
+        let fetchOutcome = await fetchPersistedHistoryPayload(
+            sessionId: sessionId,
+            profile: profile,
+            query: PersistedTranscriptPagination.tailQuery(offset: 0),
+            using: bridge
+        )
+        switch fetchOutcome {
+        case .unavailable:
+            return .unavailable
+        case .failed(let error):
+            if Self.historySourceIsUnavailable(error) {
+                // Structural endpoint absence: no bounded capability exists.
+                return .unavailable
+            }
+            return .failed(error)
+        case .payload(let response):
+            guard let rawMessages = Self.persistedMessageRows(in: response) else {
+                return .unsupportedTailContract
+            }
+            guard let page = PersistedTranscriptPagination.parse(response, rawRowCount: rawMessages.count),
+                  page.honorsTailContract,
+                  PersistedTranscriptWindow.rowsHaveDurableIdentity(rawMessages) else {
+                return .unsupportedTailContract
+            }
+            return .hydrated(PersistedSessionTranscript(
+                resolvedSessionId: Self.resolvedSessionId(in: response),
+                messages: MessageNormalizer.normalizeMessages(rawMessages.map(AnyCodable.from)),
+                page: page,
+                durableRowIDs: Set(rawMessages.compactMap(Self.durablePersistedRowID(from:)))
+            ))
         }
     }
 
-    private func sessionMessagesPath(sessionId: String, profile: String) -> String {
+    private func persistedTranscriptOutcome(
+        sessionId: String,
+        profile: String,
+        using bridge: DashboardTicketBridge?
+    ) async -> PersistedTranscriptOutcome {
+        let fetchOutcome = await fetchPersistedHistoryPayload(
+            sessionId: sessionId,
+            profile: profile,
+            query: PersistedTranscriptPagination.tailQuery(offset: 0),
+            using: bridge
+        )
+
+        switch fetchOutcome {
+        case .unavailable:
+            return .unavailable
+        case .failed(let error):
+            // Only STRUCTURAL endpoint absence degrades to the single legacy
+            // resume. Transient trouble (429, 5xx, status-0 WebKit/network
+            // failures, request timeouts, a bridge that never became ready)
+            // surfaces instead: a slow or failing BOUNDED read must never
+            // silently become a full-transcript WebSocket transport (the
+            // giant-payload path compact resume exists to eliminate).
+            if Self.historySourceIsUnavailable(error) {
+                sessionCatalogLog.debug("Persisted transcript unavailable for \(sessionId, privacy: .public): \(error.localizedDescription, privacy: .private)")
+                return .unavailable
+            }
+            sessionCatalogLog.debug("Persisted transcript failed for \(sessionId, privacy: .public): \(error.localizedDescription, privacy: .private)")
+            return .failed(error)
+        case .payload(let response):
+            guard let rawMessages = Self.persistedMessageRows(in: response) else {
+                return .failed(HermesError.invalidResponse)
+            }
+            let page = PersistedTranscriptPagination.parse(response, rawRowCount: rawMessages.count)
+
+            // A pagination echo WITHOUT the `order=latest` tail contract
+            // describes a backend that pages from the oldest end: honoring
+            // its offsets would walk the transcript forward from row zero
+            // and never reach the newest rows. A paginated-contract page
+            // whose rows lack durable identity is equally unpageable —
+            // overlap dedup and the graft key on the persisted row ID, and
+            // id-less rows would normalize to page-local positional IDs.
+            // Either way, re-read one-shot — the exact request
+            // pre-pagination Conduit made — and treat the response as the
+            // legacy full transcript. Shape-detected from the response,
+            // never version-sniffed, and performed at most once.
+            if let page, !(page.honorsTailContract
+                && PersistedTranscriptWindow.rowsHaveDurableIdentity(rawMessages)) {
+                let oneShotOutcome = await fetchPersistedHistoryPayload(
+                    sessionId: sessionId,
+                    profile: profile,
+                    query: PersistedTranscriptPagination.legacyQuery,
+                    using: bridge
+                )
+                switch oneShotOutcome {
+                case .payload(let fullResponse):
+                    guard let fullRows = Self.persistedMessageRows(in: fullResponse) else {
+                        return .failed(HermesError.invalidResponse)
+                    }
+                    return .hydrated(PersistedSessionTranscript(
+                        resolvedSessionId: Self.resolvedSessionId(in: fullResponse) ?? Self.resolvedSessionId(in: response),
+                        messages: MessageNormalizer.normalizeMessages(fullRows.map(AnyCodable.from)),
+                        page: nil
+                    ))
+                case .unavailable:
+                    return .unavailable
+                case .failed(let error):
+                    if case DashboardTicketBridgeError.oversizedResponse = error {
+                        // The legacy one-shot transcript outgrew the safe
+                        // bound: an old backend attempted the entire
+                        // transcript. Surface the transcript-specific
+                        // compatibility copy.
+                        return .failed(LegacyTranscriptOversizedError(limit: DataURLLimits.maxJSONResponseBytes))
+                    }
+                    if Self.historySourceIsUnavailable(error) {
+                        return .unavailable
+                    }
+                    return .failed(error)
+                }
+            }
+
+            // The dashboard server returns `messages`; the API-server variant
+            // returns `data`, so accept both public Hermes response shapes.
+            return .hydrated(PersistedSessionTranscript(
+                resolvedSessionId: Self.resolvedSessionId(in: response),
+                messages: MessageNormalizer.normalizeMessages(rawMessages.map(AnyCodable.from)),
+                page: page,
+                durableRowIDs: Set(rawMessages.compactMap(Self.durablePersistedRowID(from:)))
+            ))
+        }
+    }
+
+    private func fetchPersistedHistoryPayload(
+        sessionId: String,
+        profile: String,
+        query: String,
+        using bridge: DashboardTicketBridge?
+    ) async -> PersistedTranscriptFetchOutcome {
+        if let persistedTranscript = chatResumeLifecycleOperations.persistedTranscript {
+            return await persistedTranscript(sessionId, profile, query)
+        }
+        guard let bridge else { return .unavailable }
+        do {
+            return .payload(try await bridge.requestJSON(
+                path: Self.sessionMessagesPath(sessionId: sessionId, profile: profile, query: query)
+            ))
+        } catch {
+            // requestJSON's readiness poll is the bounded wait for a cold
+            // or reloading bridge; whatever it raises is classified with
+            // the seam-sourced failures below. Note the bridge caps REST
+            // response size (DataURLLimits.maxJSONResponseBytes), so an
+            // oversized transcript also lands here rather than silently
+            // degrading the resume.
+            return .failed(error)
+        }
+    }
+
+    /// The dashboard server returns `messages`; the API-server variant
+    /// returns `data`, so accept both public Hermes response shapes.
+    nonisolated static func persistedMessageRows(in response: [String: Any]) -> [Any]? {
+        ["messages", "data", "_array"]
+            .compactMap { response[$0] as? [Any] }
+            .first
+    }
+
+    /// Positively extracts the durable persisted row id from a raw `/messages`
+    /// row — the id the row actually persisted under — or nil when the row
+    /// carries no durable identity (the normalizer would fall back to a
+    /// positional index, which is presentation identity, not provenance).
+    ///
+    /// Keep the envelope merge and id-key order in sync with
+    /// `MessageNormalizer.normalizeMessages`, which consumes the same rows.
+    nonisolated static func durablePersistedRowID(from rawRow: Any) -> String? {
+        guard let envelope = rawRow as? [String: Any] else { return nil }
+        // Same envelope merge as normalizeMessages: `message` / `payload` /
+        // message-shaped `data` override the envelope, nested values win.
+        let dataMessage = envelope["data"] as? [String: Any]
+        let dataMessageIsCarrier = dataMessage.map { $0["role"] != nil || $0["type"] != nil } ?? false
+        let nested = (envelope["message"] as? [String: Any])
+            ?? (envelope["payload"] as? [String: Any])
+            ?? (dataMessageIsCarrier ? dataMessage : nil)
+            ?? [:]
+        var obj = envelope
+        for (key, value) in nested {
+            obj[key] = value
+        }
+        for key in ["id", "message_id"] {
+            switch obj[key] {
+            case let string as String where !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+                return string
+            case let number as NSNumber where number.doubleValue != 0:
+                // Match AnyCodable's number rendering so the extracted id is
+                // byte-identical to the normalized ChatMessage.id.
+                return String(number.doubleValue)
+            default:
+                continue
+            }
+        }
+        return nil
+    }
+
+    nonisolated static func resolvedSessionId(in response: [String: Any]) -> String? {
+        (response["session_id"] as? String) ?? (response["sessionId"] as? String)
+    }
+
+    /// Classifies a history-fetch failure as STRUCTURAL ENDPOINT ABSENCE —
+    /// the only condition that degrades the initial hydration to the single
+    /// legacy full-transcript resume, and the only one that retires the
+    /// backfill affordance:
+    ///
+    ///  - 404/410 — the gateway predates the messages route (or the session
+    ///    is gone from it);
+    ///  - 501 — the endpoint is explicitly unimplemented.
+    ///
+    /// Everything else must NOT silently escalate to the unbounded legacy
+    /// transport: transient trouble (408/429, any other 5xx, status-0
+    /// WebKit/network failures), a bridge that did not become ready or a
+    /// request that outlived its deadline (both `.notReady`), an oversized
+    /// response, authentication, and every unlisted error surfaces instead.
+    /// This is the giant-session safety property: current Hermes can serve
+    /// the bounded `include_compacted=true` page slowly for heavily
+    /// compacted sessions until upstream bounding lands (#97440), so a slow
+    /// bounded read must fail boundedly and retry through reconnect — never
+    /// silently become "load the entire transcript over the WebSocket".
+    nonisolated static func historySourceIsUnavailable(_ error: Error) -> Bool {
+        guard case let DashboardTicketBridgeError.http(status, _) = error else { return false }
+        switch status {
+        case 404, 410, 501: return true
+        default: return false
+        }
+    }
+
+    nonisolated static func sessionMessagesPath(
+        sessionId: String,
+        profile: String,
+        query: String
+    ) -> String {
         let encodedSessionId = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionId
-        return dashboardPath("/api/sessions/\(encodedSessionId)/messages", profile: profile)
+        return DashboardPath.withProfile(
+            "/api/sessions/\(encodedSessionId)/messages\(query)",
+            profile: profile
+        )
+    }
+
+    /// Whether a persisted-history window from the previous reconciliation
+    /// belongs to the conversation this reconcile just accepted. Identity is
+    /// compared through the ONE centralized rule with the new transaction's
+    /// full identity set (requested, resolved stored, runtime), so a
+    /// reconnect keeps the backfilled prefix even when the catalog is
+    /// temporarily stale about the stored↔runtime alias.
+    private func priorWindowOwnsThisConversation(
+        _ window: PersistedTranscriptWindowState?,
+        requestedSessionId: String,
+        resolvedSessionId: String?,
+        runtimeSessionId: String?,
+        profile: String
+    ) -> Bool {
+        guard let window else { return false }
+        let conversationIds = PersistedTranscriptWindow.normalizingSessionIDs([
+            requestedSessionId, resolvedSessionId, runtimeSessionId
+        ])
+        return PersistedTranscriptWindow.ownershipHolds(
+            window: window,
+            conversationSessionIds: conversationIds,
+            profile: profile,
+            windowAliasIds: catalogAliasIDs(for: window.trustedSessionIDs),
+            conversationAliasIds: catalogAliasIDs(for: conversationIds)
+        )
+    }
+
+    /// Fetches the next older persisted-history page for the active
+    /// conversation and prepends it, keeping the user's visible position
+    /// stable (ChatView anchors the prepend through the viewport controller).
+    /// Strictly user-driven and single-flight: one explicit request at a
+    /// time, owned by the window identity captured at request time, and a
+    /// response from a session/profile that is no longer current is
+    /// discarded without touching state.
+    ///
+    /// Returns whether a prepend actually published — the view discharges
+    /// its viewport anchor when nothing landed, so an armed anchor can never
+    /// re-pin on some later unrelated transcript change.
+    @discardableResult
+    func loadEarlierMessages() async -> Bool {
+        guard let window = persistedTranscriptWindow,
+              window.canLoadEarlier,
+              !window.isLoadingEarlier else {
+            return false
+        }
+        guard persistedTranscriptWindowOwnershipIsCurrent(window) else {
+            // No user-facing error for an already-departed conversation —
+            // and normally unreachable from a tap, because the affordance
+            // exposes this exact ownership truth. The debug capture below
+            // is purely diagnostic (it also fires on the legitimate
+            // render-to-tap race during a session switch).
+            sessionCatalogLog.debug("""
+                Older-page backfill rejected ownership of an otherwise-actionable window: \
+                requested=\(window.requestedSessionID, privacy: .public) \
+                resolved=\(window.resolvedSessionID ?? "none", privacy: .public) \
+                runtime=\(window.runtimeSessionID ?? "none", privacy: .public) \
+                active=\(self.activeSessionId ?? "none", privacy: .public) \
+                windowProfile=\(window.profile, privacy: .public) \
+                activeProfile=\(self.activeProfile, privacy: .public)
+                """)
+            return false
+        }
+        // Older pages are persisted transcript history: continue against
+        // the durable stored identity the hydration resolved (Desktop's
+        // `BackfillRequest.storedSessionId` contract) — never the runtime
+        // WebSocket ID, and never re-derived from a later catalog refresh.
+        let wireSessionId = window.resolvedSessionID ?? window.requestedSessionID
+        let requestedSessionId = window.requestedSessionID
+        let profile = window.profile
+        let offset = window.nextOffset
+        var arming = window
+        arming.isLoadingEarlier = true
+        persistedTranscriptWindow = arming
+
+        let outcome = await fetchOlderTranscriptPage(
+            sessionId: wireSessionId,
+            profile: profile,
+            offset: offset
+        )
+
+        // Stale-response guard: the window must still be this exact
+        // request's window (same session, same profile, still loading, and
+        // no other fetch advanced it meanwhile). Anything else — session
+        // switch, profile switch, disconnect re-home — discards the page.
+        // The first four conditions identify THIS armed window; only then
+        // may the bookkeeping below touch it.
+        guard var current = persistedTranscriptWindow,
+              current.requestedSessionID == requestedSessionId,
+              current.profile == profile,
+              current.nextOffset == offset,
+              current.isLoadingEarlier else {
+            return false
+        }
+        guard persistedTranscriptWindowOwnershipIsCurrent(current) else {
+            // The armed window survived untouched but the conversation
+            // moved on underneath it (e.g. activeSessionId cleared by a
+            // disconnect). Discard the response whole AND release the
+            // single-flight flag so the affordance can re-arm later — a
+            // replaced window never reaches this branch.
+            current.isLoadingEarlier = false
+            persistedTranscriptWindow = current
+            return false
+        }
+        current.isLoadingEarlier = false
+        defer { persistedTranscriptWindow = current }
+
+        switch outcome {
+        case .payload(let response):
+            guard let rawRows = Self.persistedMessageRows(in: response) else {
+                // A malformed page is a backfill dead end, not a chat
+                // failure: stop offering older pages rather than erroring
+                // the already-hydrated conversation.
+                sessionCatalogLog.debug("Older-page backfill for \(wireSessionId, privacy: .public) returned a malformed payload; retiring the affordance")
+                current.canLoadEarlier = false
+                return false
+            }
+            // Response ownership: the page must still describe THIS
+            // conversation. The SAME centralized identity rule decides —
+            // the echoed session_id plays the role of the checked
+            // conversation — so an echo is accepted exactly when it is a
+            // transaction-captured identity of this window or a
+            // catalog-proven alias of one. Never a foreign session's rows;
+            // a foreign response neither normalizes into the transcript
+            // nor advances coverage.
+            if let returnedId = Self.resolvedSessionId(in: response),
+               !returnedId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !PersistedTranscriptWindow.ownershipHolds(
+                 window: current,
+                 conversationSessionIds: [returnedId],
+                 profile: current.profile,
+                 windowAliasIds: catalogAliasIDs(for: current.trustedSessionIDs),
+                 conversationAliasIds: knownSessionIDs(for: returnedId)
+               ) {
+                sessionCatalogLog.debug("Older-page backfill for \(wireSessionId, privacy: .public) returned foreign session \(returnedId, privacy: .public); discarding and retiring the affordance")
+                current.canLoadEarlier = false
+                return false
+            }
+            let fetchedRowCount = rawRows.count
+            let page = PersistedTranscriptPagination.parse(response, rawRowCount: fetchedRowCount)
+            // Only pages still answering under the tail contract may splice
+            // into the transcript: a response whose echo lost `order=latest`
+            // carries oldest-anchored rows with unknown window semantics,
+            // and prepending them would break chronology. That response
+            // retires the affordance instead.
+            guard let page, page.honorsTailContract else {
+                sessionCatalogLog.debug("Older-page backfill for \(wireSessionId, privacy: .public) lost the tail contract; retiring the affordance")
+                current.canLoadEarlier = false
+                return false
+            }
+            // Overlap dedup keys on the durable persisted row ID. A page
+            // whose rows lack one would normalize to page-local positional
+            // IDs that cannot survive across pages — refuse it before it can
+            // silently corrupt dedup.
+            guard PersistedTranscriptWindow.rowsHaveDurableIdentity(rawRows) else {
+                sessionCatalogLog.debug("Older-page backfill for \(wireSessionId, privacy: .public) returned rows without durable IDs; retiring the affordance")
+                current.canLoadEarlier = false
+                return false
+            }
+            var didPrepend = false
+            if fetchedRowCount > 0 {
+                let normalizedPage = MessageNormalizer.normalizeMessages(rawRows.map(AnyCodable.from))
+                // A page boundary can split a tool call from its result row.
+                // Fold any trailing call cards back together with the
+                // matching held result cards by durable tool-call identity
+                // before prepending, so one logical tool run never renders
+                // as an orphan call card plus a duplicate standalone result.
+                let (olderPage, foldedFromHeld) = PersistedTranscriptWindow.reconcilingToolCallsAcrossBoundary(
+                    olderPage: normalizedPage,
+                    held: messages
+                )
+                let merged: [ChatMessage]?
+                if foldedFromHeld > 0 {
+                    let remainingHeld = messages.dropFirst(foldedFromHeld)
+                    if remainingHeld.isEmpty {
+                        // Every held row folded into the adjusted page (the
+                        // stale-response guard already proved this window is
+                        // current): the folded page itself is the whole
+                        // transcript. Never fall back to the unfolded page
+                        // here — that would resurrect the duplicate the fold
+                        // just removed.
+                        merged = olderPage.isEmpty ? nil : olderPage
+                    } else {
+                        merged = PersistedTranscriptWindow.prepending(olderPage, onto: Array(remainingHeld))
+                    }
+                } else {
+                    merged = nil
+                }
+                if let merged {
+                    messages = merged
+                    didPrepend = true
+                } else if let plain = PersistedTranscriptWindow.prepending(normalizedPage, onto: messages) {
+                    messages = plain
+                    didPrepend = true
+                }
+            }
+            if didPrepend {
+                // The visible transcript now starts with backfilled rows.
+                // The reconcile graft relies on this explicit fact to keep
+                // preserving the prefix across repeated reconciles — the
+                // network coverage reset below erases the offset evidence
+                // after the first one.
+                current.hasBackfilledPrefix = true
+            }
+            // A full page means older history may still exist; a short or
+            // empty page marks the transcript fully backfilled and retires
+            // the affordance. The offset advances by the fetched row count
+            // either way, which self-corrects drift: a page that deduped to
+            // nothing still moves the next request past the already-held
+            // rows.
+            current.nextOffset = offset + fetchedRowCount
+            current.canLoadEarlier = fetchedRowCount > 0
+                && page.mayHaveOlderRows(fetchedRowCount: fetchedRowCount)
+            return didPrepend
+        case .unavailable:
+            // The history source went away mid-conversation; there is no
+            // older page to offer.
+            current.canLoadEarlier = false
+            return false
+        case .failed(let error):
+            // Only a structurally gone history source retires the
+            // affordance; transient trouble — rate limits, slow bounded
+            // reads, a temporarily cold bridge — stays retryable through
+            // another explicit tap. A failed backfill never loops on its
+            // own.
+            sessionCatalogLog.debug("Older-page backfill failed for \(wireSessionId, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            current.canLoadEarlier = !Self.historySourceIsUnavailable(error)
+            return false
+        }
+    }
+
+    private func fetchOlderTranscriptPage(
+        sessionId: String,
+        profile: String,
+        offset: Int
+    ) async -> PersistedTranscriptFetchOutcome {
+        if let loadEarlierTranscriptPage = chatResumeLifecycleOperations.loadEarlierTranscriptPage {
+            return await loadEarlierTranscriptPage(sessionId, profile, offset)
+        }
+        // Backfill never falls through to the initial-hydration seam: that
+        // seam cannot carry the offset, and a test wiring mistake would
+        // otherwise become a silent always-duplicate affordance.
+        guard let bridge = dashboardTicketBridge else { return .unavailable }
+        do {
+            return .payload(try await bridge.requestJSON(path: Self.sessionMessagesPath(
+                sessionId: sessionId,
+                profile: profile,
+                query: PersistedTranscriptPagination.tailQuery(offset: offset)
+            )))
+        } catch {
+            return .failed(error)
+        }
+    }
+
+    /// Catalog alias knowledge for a set of session identities: every ID
+    /// the live catalog groups with any of them (an unknown ID expands to
+    /// just itself).
+    private func catalogAliasIDs(for sessionIds: Set<String>) -> Set<String> {
+        sessionIds.reduce(into: Set<String>()) { expanded, sessionId in
+            expanded.formUnion(knownSessionIDs(for: sessionId))
+        }
+    }
+
+    /// Ownership gate for the persisted-history window: the window must
+    /// belong to the conversation that is actually active. The window's
+    /// transaction-captured identities (requested, resolved stored, runtime)
+    /// are the primary truth — `applyChatResume` re-homes `activeSessionId`
+    /// to the runtime ID long before the catalog learns the alias — while
+    /// catalog alias knowledge remains a compatibility source only.
+    private func persistedTranscriptWindowOwnershipIsCurrent(
+        _ window: PersistedTranscriptWindowState
+    ) -> Bool {
+        guard let activeId = activeSessionId else { return false }
+        // The ownership comparison uses the ACTIVE CONVERSATION's profile
+        // scope, not the dashboard's: a canonical Bot Chat's window is
+        // stamped with the bot profile, and must stay actionable (for
+        // "Load earlier messages") while that chat is on screen.
+        return PersistedTranscriptWindow.ownershipHolds(
+            window: window,
+            conversationSessionIds: [activeId],
+            profile: botConversationProfile(for: activeId) ?? activeProfile,
+            windowAliasIds: catalogAliasIDs(for: window.trustedSessionIDs),
+            conversationAliasIds: knownSessionIDs(for: activeId)
+        )
+    }
+
+    /// Whether "Load earlier messages" may be offered AND executed right
+    /// now: a hydrated, non-empty transcript whose persisted-history window
+    /// still has an older page and belongs to the conversation that is
+    /// actually active. The single ownership truth for the ChatView
+    /// affordance and the `loadEarlierMessages` action, so the control can
+    /// never render for a window the action would reject (the production
+    /// no-op regression).
+    var canLoadEarlierMessagesForActiveConversation: Bool {
+        guard let window = persistedTranscriptWindow,
+              window.canLoadEarlier,
+              !messages.isEmpty,
+              persistedTranscriptWindowOwnershipIsCurrent(window) else {
+            return false
+        }
+        return true
     }
 
     /// The endpoint may resolve a runtime ID to its stored session ID. Accept
@@ -5847,6 +13096,9 @@ final class AppState: ObservableObject {
             return false
         }
         guard !isProfileSwitching else { return false }
+        // A profile change replaces the voice gateway; any in-flight read
+        // aloud belongs to the outgoing profile.
+        messageReadAloudController.stop()
         let transitionGeneration: UInt64
         if let viewportTransitionGeneration {
             guard chatViewportTransitionIsCurrent(
@@ -5857,7 +13109,11 @@ final class AppState: ObservableObject {
             transitionGeneration = beginExplicitChatViewportTransition()
         }
         cancelChatResumeTransportRecovery()
-        cacheMessagePresentation()
+        // Hard profile boundary for this forward transition: cancel the
+        // debounced stream flush and write synchronously while the outgoing
+        // profile still owns the in-memory transcript. No parked task
+        // survives the identity changes below (success or rollback).
+        flushPendingPresentationCache()
         cancelSecondaryProfileTitleRecovery()
 
         // Dismiss keyboard before switching profiles
@@ -5899,7 +13155,25 @@ final class AppState: ObservableObject {
             connection = freshConnection
             client = nextClient
             clearPendingDecisionRestorationGuard()
-            activeProfile = target
+            // A profile switch ends any live or suspended Voice conversation
+            // from the outgoing profile. Persist the outgoing mute and tear
+            // down BEFORE the identity flip: the sheet's deferred onDismiss
+            // re-enters closeVoiceConversation after the switch, and its
+            // hasLiveVoiceSession guard makes that a no-op so the outgoing
+            // mute can never be persisted under the target profile.
+            if showVoiceSheet {
+                var preferences = loadVoiceProfilePreferences(profile: activeProfile)
+                preferences.outputMuted = voiceConversationController.isOutputMuted
+                saveVoiceProfilePreferences(preferences, profile: activeProfile)
+            }
+            voiceConversationController.stop()
+            showVoiceSheet = false
+            suspendedVoiceConversation = nil
+            voiceSheetShouldAutoListen = false
+            voiceControllerSessionProfile = nil
+            // Fence any residual deferred cache write scheduled under the
+            // outgoing profile before identities and namespaces change over.
+            setActiveProfile(target)
             sessions = []
             cronSessions = []
             archivedSessions = []
@@ -5917,7 +13191,9 @@ final class AppState: ObservableObject {
             previousClient?.disconnect()
             isConnected = true
             connectedAt = Date()
-            KeychainHelper.saveConnection(freshConnection)
+            if let dashboardID = activeDashboardID {
+                KeychainHelper.saveConnection(freshConnection, dashboardID: dashboardID)
+            }
             defaults.set(target, forKey: activeProfileKey)
 
             await syncSession(
@@ -5946,9 +13222,8 @@ final class AppState: ObservableObject {
             guard chatViewportTransitionIsCurrent(generation: transitionGeneration) else {
                 return false
             }
-            errorMessage = "Could not switch workspace: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not switch workspace: \(error.localizedDescription)")
             clearPendingDecisionRestorationGuard()
-            activeProfile = previousProfile
             // The pre-switch reset neutralized the approval state; restore it
             // with the rest of the previous profile or a failed switch loses
             // the floor while the previous profile is still the active one.
@@ -5963,6 +13238,15 @@ final class AppState: ObservableObject {
             projectsLoading = false
             restoreActiveSessionState(for: previousProfile)
             restorePinnedSessions(for: previousProfile)
+            // restoreActiveSessionState/restorePinnedSessions are
+            // synchronous and cache-write-free; the pre-flight boundary
+            // flush (above) already persisted the outgoing transcript under
+            // the previous profile's namespace. setActiveProfile(_:)
+            // deliberately does NOT flush: flipping the identity back only
+            // re-arms the namespace and bumps the fence epoch, making any
+            // flush scheduled under the failed target during the aborted
+            // attempt stale.
+            setActiveProfile(previousProfile)
             connection = savedConnection
             client?.disconnect()
             client = nil
@@ -5975,22 +13259,152 @@ final class AppState: ObservableObject {
     }
 
     func loadProfiles() async {
-        guard let dashboardTicketBridge else { return }
+        guard let bridge = dashboardTicketBridge else { return }
         do {
-            let response = try await dashboardTicketBridge.requestJSON(path: "/api/profiles")
+            let response: [String: Any]
+            if let profileDiscoveryLoaderOverride {
+                response = try await profileDiscoveryLoaderOverride()
+            } else {
+                response = try await bridge.requestJSON(path: "/api/profiles")
+            }
+            // Commit gate, same identity pattern as the dashboard catalog
+            // loader: a bridge swapped mid-request (server change, re-login,
+            // disconnect) makes this response foreign. A late reply from an
+            // old connection must not overwrite the live list, and must not
+            // repopulate a persisted cache that
+            // prepareChatResumeForConnection(to:) already cleared with the
+            // previous server's profile names. Discarded silently — profile
+            // discovery has no retry loop to feed an error into.
+            guard dashboardTicketBridge === bridge else { return }
             let values = response["profiles"] as? [Any] ?? []
             let names = values.compactMap { value -> String? in
                 if let name = value as? String { return name }
                 return (value as? [String: Any])?["name"] as? String
             }
-            profiles = orderedProfiles(names + ["default"])
-            defaults.set(profiles, forKey: knownProfilesKey)
+            // A 200 with no profile names is a degraded payload (dashboard
+            // mid-restart, partial deploy, proxy), not authoritative evidence
+            // that every profile vanished — Hermes always has `default`. The
+            // next line would otherwise collapse the picker and persist that
+            // degraded list over the complete cache, the exact bug this
+            // function exists to prevent, just via a 200 instead of an error.
+            let nextProfiles = names.isEmpty
+                ? orderedProfiles(profiles + [activeProfile, "default"])
+                : orderedProfiles(names + ["default"])
+            profiles = nextProfiles
+            defaults.set(nextProfiles, forKey: knownProfilesKey)
+            // A non-empty response is authoritative: if the server no longer
+            // knows the active profile (deleted externally), re-home onto a
+            // valid fallback instead of leaving `activeProfile ∉ profiles` —
+            // a state the profile picker cannot represent. The degraded and
+            // empty-payload paths already union `activeProfile` in, so only
+            // this branch can need the correction.
+            if !names.isEmpty, !nextProfiles.contains(activeProfile) {
+                // orderedProfiles always unions "default" into a non-empty
+                // names list, so the fallback is unconditionally "default";
+                // the contains-check stays as cheap defense-in-depth against
+                // a future change to that union invariant.
+                adoptAuthoritativeFallbackProfile(
+                    nextProfiles.contains("default") ? "default" : nextProfiles[0]
+                )
+                // The abandoned profile-scoped connect/reconnect work can no
+                // longer commit (its identity fences now fail), so converge
+                // the transport onto the corrected profile. Fire-and-forget:
+                // never awaited inside discovery, and idempotent — the next
+                // discovery contains the fallback and will not re-adopt.
+                if isConnected {
+                    Task { await reconnect() }
+                }
+            }
         } catch {
-            // Profile discovery is additive. A working chat must not be
-            // replaced by an error just because an older dashboard lacks it.
-            if profiles.isEmpty { profiles = orderedProfiles([activeProfile]) }
-            defaults.set(profiles, forKey: knownProfilesKey)
+            guard dashboardTicketBridge === bridge else { return }
+            // Profile discovery is additive and monotonic. A failed refresh
+            // (bridge still loading, dashboard restart, transient 5xx) must
+            // never shrink the visible list or overwrite a complete persisted
+            // cache with a degraded fallback — that degradation is exactly
+            // how a known profile "disappeared" from the picker until the
+            // next successful discovery or a logout/login cycle. Union with
+            // the current list so the active profile and the `default`
+            // invariant are always represented, then persist the union (a
+            // no-op write when the cache is already complete).
+            let merged = orderedProfiles(profiles + [activeProfile, "default"])
+            profiles = merged
+            defaults.set(merged, forKey: knownProfilesKey)
         }
+    }
+
+    /// Authoritative discovery reported a server that no longer contains the
+    /// active profile (e.g. it was deleted externally). Re-home onto a valid
+    /// fallback using the same local hard-boundary sequence as the forward
+    /// profile transition in `connect(with:profile:)`: flush the outgoing
+    /// transcript under its presentation-cache namespace, clear the
+    /// profile-scoped catalogs and transcript, fence-flip the identity,
+    /// prune the deleted profile's persisted bookkeeping, restore the
+    /// fallback's remembered session/pinned state, and persist the
+    /// correction under `activeProfileKey`.
+    ///
+    /// Deliberately NOT the interactive `switchProfile(to:reusing:)` flow:
+    /// that re-resolves the whole connection and would nest reconnects and
+    /// capability loads inside this discovery call site. Callers schedule a
+    /// fire-and-forget `reconnect()` when the transport is live so the
+    /// client converges onto the corrected profile; every catalog read is
+    /// filtered and path-prefixed by the explicit profile, so no
+    /// cross-profile transcript or cache state leaks in the window before
+    /// that reconnect lands.
+    ///
+    /// Internal for tests: the fallback adoption is a real destructive Voice
+    /// boundary and the cross-profile fail-closed restore contract is pinned
+    /// through it.
+    func adoptAuthoritativeFallbackProfile(_ fallback: String) {
+        guard fallback != activeProfile else { return }
+        // A profile change replaces the voice gateway; any in-flight read
+        // aloud belongs to the outgoing profile (same as switchProfile).
+        messageReadAloudController.stop()
+        // A profile re-home ends any live or suspended Voice conversation
+        // from the outgoing profile. Persist the outgoing mute and tear down
+        // BEFORE the identity flip so it lands in the outgoing profile's
+        // blob, never the fallback's (same contract as switchProfile).
+        if showVoiceSheet {
+            var preferences = loadVoiceProfilePreferences(profile: activeProfile)
+            preferences.outputMuted = voiceConversationController.isOutputMuted
+            saveVoiceProfilePreferences(preferences, profile: activeProfile)
+        }
+        voiceConversationController.stop()
+        showVoiceSheet = false
+        suspendedVoiceConversation = nil
+        voiceSheetShouldAutoListen = false
+        voiceControllerSessionProfile = nil
+        flushPendingPresentationCache()
+        sessions = []
+        cronSessions = []
+        archivedSessions = []
+        projects = []
+        supportsProjects = false
+        projectsLoading = false
+        slashCommands = Self.builtInSlashCommands
+        messages = []
+        persistedTranscriptWindow = nil
+        resetTranscriptLifecycleEvidence()
+        clearStreamingText()
+        resetReasoningTurn()
+        // The next profile's approval mode is unknown until its first session
+        // snapshot arrives; don't let the deleted profile's approval floor or
+        // YOLO state leak across the re-home — neutralize to the safe display
+        // until the fallback profile resolves them (same neutralization as
+        // switchProfile).
+        runtime.approvalsMode = nil
+        runtime.yolo = false
+        lastReportedSessionYolo = nil
+        // Drop the deleted profile's persisted local bookkeeping so a later
+        // re-creation with the same name starts fresh instead of
+        // resurrecting obsolete titles and pins.
+        activeSessionTitlesByProfile.removeValue(forKey: activeProfile)
+        pinnedSessionIDsByProfile.removeValue(forKey: activeProfile)
+        persistActiveSessionTitles()
+        persistPinnedSessions()
+        setActiveProfile(fallback)
+        restoreActiveSessionState(for: fallback)
+        restorePinnedSessions(for: fallback)
+        defaults.set(fallback, forKey: activeProfileKey)
     }
 
     /// Hermes blocks a clarify/approval prompt for only ~5 minutes server-side
@@ -6011,6 +13425,14 @@ final class AppState: ObservableObject {
         guard let index = messages.firstIndex(where: { $0.id == messageId }),
               let current = messages[index].approval,
               current.status == .pending || current.status == .error else { return }
+        let decisionKey = SessionPresentationCache.decisionKey(for: messages[index])
+
+        let submissionIdentity = current.requestId.map { ApprovalSubmissionIdentity.identified($0) }
+            ?? ApprovalSubmissionIdentity.legacy(current.sessionId)
+        liveApprovalSubmissions.insert(submissionIdentity)
+        defer {
+            liveApprovalSubmissions.remove(submissionIdentity)
+        }
 
         messages[index].approval?.status = .submitting
         messages[index].approval?.choice = choice
@@ -6021,26 +13443,84 @@ final class AppState: ObservableObject {
         guard let client else {
             messages[index].approval?.status = .error
             messages[index].approval?.choice = nil
-            messages[index].approval?.error = "Gateway connection is unavailable."
+            messages[index].approval?.error = AppLocalization.string("Gateway connection is unavailable.")
             cacheMessagePresentation()
             return
         }
+        // Ownership snapshot: the completion below may only land while this
+        // exact client (and profile) still owns AppState. A client/server
+        // replacement while the RPC is suspended must turn the stale
+        // continuation inert — success and failure alike — even when profile,
+        // session, and message ids collide across the two connections. This
+        // is the same fence `loadProjects`/`synchronizeTransportContinuation`
+        // use; only client ownership changed here, so no epoch beyond the
+        // pointer identity is needed.
+        let profile = activeProfile
+        let conversationProfile = presentationProfile(for: current.sessionId)
         do {
-            try await client.respondToApproval(sessionId: current.sessionId, choice: choice)
-            guard let updatedIndex = messages.firstIndex(where: { $0.id == messageId }) else { return }
-            messages[updatedIndex].approval?.status = choice == "deny" ? .rejected : .approved
+            let accepted: Bool
+            if let respondToApproval = chatResumeLifecycleOperations.respondToApproval {
+                accepted = try await respondToApproval(
+                    client,
+                    current.sessionId,
+                    current.requestId,
+                    choice,
+                    conversationProfile
+                )
+            } else {
+                accepted = try await client.respondToApproval(
+                    sessionId: current.sessionId,
+                    requestId: current.requestId,
+                    choice: choice,
+                    profile: conversationProfile
+                )
+            }
+            guard profile == activeProfile, self.client === client else { return }
+            guard let updatedIndex = messages.firstIndex(where: { $0.id == messageId }),
+                  SessionPresentationCache.decisionKey(for: messages[updatedIndex]) == decisionKey else { return }
+            if accepted {
+                messages[updatedIndex].approval?.status = choice == "deny" ? .rejected : .approved
+            } else {
+                messages[updatedIndex].approval?.status = .expired
+                messages[updatedIndex].approval?.choice = nil
+                messages[updatedIndex].approval?.error = AppLocalization.string("This approval is no longer active — Hermes timed it out and continued.")
+            }
             cacheMessagePresentation()
+            schedulePendingApprovalsRefresh(sessionId: current.sessionId, using: client)
         } catch {
-            guard let updatedIndex = messages.firstIndex(where: { $0.id == messageId }) else { return }
+            guard profile == activeProfile, self.client === client else { return }
+            guard let updatedIndex = messages.firstIndex(where: { $0.id == messageId }),
+                  SessionPresentationCache.decisionKey(for: messages[updatedIndex]) == decisionKey else { return }
             messages[updatedIndex].approval?.status = .error
             messages[updatedIndex].approval?.choice = nil
             if Self.isExpiredPromptError(error) {
-                messages[updatedIndex].approval?.error = "This approval is no longer active — Hermes timed it out and continued."
+                messages[updatedIndex].approval?.status = .expired
+                messages[updatedIndex].approval?.error = AppLocalization.string("This approval is no longer active — Hermes timed it out and continued.")
             } else {
                 messages[updatedIndex].approval?.error = "Hermes did not accept that decision."
                 errorMessage = error.localizedDescription
             }
             cacheMessagePresentation()
+            if current.requestId == nil {
+                switch messages[updatedIndex].approval?.status {
+                case .error:
+                    schedulePendingApprovalsRefresh(
+                        sessionId: current.sessionId,
+                        using: client,
+                        replacingLegacyErrorMessageID: messageId
+                    )
+                case .expired:
+                    // The legacy request is definitively terminal, so fresh
+                    // identified queued rows can be added without replacing
+                    // or re-arming its expired presentation.
+                    schedulePendingApprovalsRefresh(
+                        sessionId: current.sessionId,
+                        using: client
+                    )
+                default:
+                    break
+                }
+            }
         }
     }
 
@@ -6107,7 +13587,7 @@ final class AppState: ObservableObject {
                 projects = []
                 supportsProjects = false
             } else {
-                errorMessage = "Could not load \(project.title): \(error.localizedDescription)"
+                errorMessage = AppLocalization.string("Could not load \(project.title): \(error.localizedDescription)")
             }
             return nil
         }
@@ -6144,7 +13624,7 @@ final class AppState: ObservableObject {
                 projects = []
                 supportsProjects = false
             } else {
-                errorMessage = "Could not create the project: \(error.localizedDescription)"
+                errorMessage = AppLocalization.string("Could not create the project: \(error.localizedDescription)")
             }
             return false
         }
@@ -6161,7 +13641,7 @@ final class AppState: ObservableObject {
         guard let dashboardTicketBridge else { throw DashboardTicketBridgeError.notReady }
         let profile = activeProfile
         guard let encodedPath = DashboardPath.encodedQueryComponent(path) else {
-            throw DashboardTicketBridgeError.requestFailed("The workspace path could not be encoded.")
+            throw DashboardTicketBridgeError.requestFailed(AppLocalization.string("The workspace path could not be encoded."))
         }
         let result = try await dashboardTicketBridge.requestJSON(
             path: DashboardPath.withProfile("/api/fs/list?path=\(encodedPath)", profile: profile)
@@ -6222,14 +13702,44 @@ final class AppState: ObservableObject {
 
     // MARK: - Capabilities
 
-    func loadCapabilities() async {
+    /// Request-scoped result for a capability load. The caller must be able to
+    /// know how THIS request ended without consulting global error/skill
+    /// state, which can be stale or mutated by unrelated flows.
+    enum CapabilityLoadOutcome {
+        case success(profile: String)
+        case failed(profile: String, message: String)
+        case unavailable(profile: String)
+        /// The active profile changed mid-request; the result belongs to an
+        /// abandoned profile and callers should discard it.
+        case superseded(requestedProfile: String, activeProfile: String)
+
+        var isSuperseded: Bool {
+            if case .superseded = self { return true }
+            return false
+        }
+    }
+
+    @discardableResult
+    func loadCapabilities() async -> CapabilityLoadOutcome {
+        capabilityLoadGeneration &+= 1
+        let generation = capabilityLoadGeneration
         let profile = activeProfile
-        guard let dashboardTicketBridge else { return }
+        guard let dashboardTicketBridge else { return .unavailable(profile: profile) }
         async let skillsResult = dashboardTicketBridge.requestJSON(path: dashboardPath("/api/skills", profile: profile))
         async let toolsetsResult = dashboardTicketBridge.requestJSON(path: dashboardPath("/api/tools/toolsets", profile: profile))
+        // Commit gate: this exact request must still be the newest one AND
+        // target the still-active profile (A -> B -> A stale commits rejected).
+        func ownsRequest() -> Bool {
+            CapabilityLoadPolicy.canCommit(
+                generation: generation,
+                latestGeneration: capabilityLoadGeneration,
+                requestedProfile: profile,
+                activeProfile: activeProfile
+            )
+        }
         do {
             let (skillsResponse, toolsetsResponse) = try await (skillsResult, toolsetsResult)
-            guard profile == activeProfile else { return }
+            guard ownsRequest() else { return .superseded(requestedProfile: profile, activeProfile: activeProfile) }
             let skillsValues = skillsResponse["_array"] as? [Any] ?? []
             self.skills = skillsValues.compactMap(decodeCapabilitySkill)
                 .sorted { lhs, rhs in
@@ -6241,9 +13751,12 @@ final class AppState: ObservableObject {
             let toolsetsValues = toolsetsResponse["_array"] as? [Any] ?? []
             self.toolsets = toolsetsValues.compactMap(decodeCapabilityToolset)
                 .sorted { ($0.label ?? $0.name) < ($1.label ?? $1.name) }
+            capabilitiesProfile = profile
+            return .success(profile: profile)
         } catch {
-            guard profile == activeProfile else { return }
-            errorMessage = "Could not load capabilities: \(error.localizedDescription)"
+            guard ownsRequest() else { return .superseded(requestedProfile: profile, activeProfile: activeProfile) }
+            errorMessage = AppLocalization.string("Could not load capabilities: \(error.localizedDescription)")
+            return .failed(profile: profile, message: AppLocalization.string("Could not load capabilities: \(error.localizedDescription)"))
         }
     }
 
@@ -6266,7 +13779,7 @@ final class AppState: ObservableObject {
             if let index = skills.firstIndex(where: { $0.name == name }) {
                 skills[index].enabled = !enabled
             }
-            errorMessage = "Could not update skill: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not update skill: \(error.localizedDescription)")
         }
     }
 
@@ -6290,7 +13803,7 @@ final class AppState: ObservableObject {
             if let index = toolsets.firstIndex(where: { $0.name == name }) {
                 toolsets[index].enabled = !enabled
             }
-            errorMessage = "Could not update toolset: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not update toolset: \(error.localizedDescription)")
         }
     }
 
@@ -6341,7 +13854,7 @@ final class AppState: ObservableObject {
             }
         } catch {
             guard profile == activeProfile else { return }
-            errorMessage = "Could not load scheduled jobs: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not load scheduled jobs: \(error.localizedDescription)")
         }
     }
 
@@ -6377,7 +13890,7 @@ final class AppState: ObservableObject {
             }
         } catch {
             guard profile == activeProfile else { return }
-            errorMessage = "Could not load scheduled-job runs: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not load scheduled-job runs: \(error.localizedDescription)")
         }
     }
 
@@ -6403,7 +13916,10 @@ final class AppState: ObservableObject {
             }
             return true
         } catch {
-            errorMessage = "Could not \(action) scheduled job: \(error.localizedDescription)"
+            // The wire token stays raw for the URL path; the sentence shows
+            // the localized verb.
+            let actionVerb = AppLocalization.string(String.LocalizationValue(action))
+            errorMessage = AppLocalization.string("Could not \(actionVerb) scheduled job: \(error.localizedDescription)")
             return false
         }
     }
@@ -6498,7 +14014,7 @@ final class AppState: ObservableObject {
                 profileSettingValue(in: config, key: key).map { (key, $0) }
             })
         } catch {
-            errorMessage = "Could not load profile settings: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not load profile settings: \(error.localizedDescription)")
             return [:]
         }
     }
@@ -6548,7 +14064,7 @@ final class AppState: ObservableObject {
             let reasoning = config["reasoning"] as? String ?? config["reasoning_effort"] as? String ?? "medium"
             return ProfileModelDefaults(providers: providers, model: model, provider: provider, reasoning: reasoning)
         } catch {
-            errorMessage = "Could not load model defaults: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not load model defaults: \(error.localizedDescription)")
             return nil
         }
     }
@@ -6563,7 +14079,7 @@ final class AppState: ObservableObject {
                 body: ["model": model, "provider": provider, "scope": "main", "profile": profile]
             )
             if result["confirm_required"] as? Bool == true {
-                errorMessage = result["confirm_message"] as? String ?? "Hermes requires confirmation before using this model."
+                errorMessage = result["confirm_message"] as? String ?? AppLocalization.string("Hermes requires confirmation before using this model.")
                 return false
             }
             var config = try await dashboardTicketBridge.requestJSON(path: dashboardPath("/api/config", profile: profile))
@@ -6579,7 +14095,7 @@ final class AppState: ObservableObject {
             )
             return true
         } catch {
-            errorMessage = "Could not save model defaults: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not save model defaults: \(error.localizedDescription)")
             return false
         }
     }
@@ -6621,7 +14137,7 @@ final class AppState: ObservableObject {
             }
             return true
         } catch {
-            errorMessage = "Could not save \(key): \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not save \(key): \(error.localizedDescription)")
             return false
         }
     }
@@ -6687,7 +14203,7 @@ final class AppState: ObservableObject {
             return true
         } catch {
             if activeProfile == profile { displayPreferences = previous }
-            errorMessage = "Could not save display preference: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not save display preference: \(error.localizedDescription)")
             return false
         }
     }
@@ -6727,7 +14243,7 @@ final class AppState: ObservableObject {
             return true
         } catch {
             busyInputMode = previous
-            errorMessage = "Could not save message behavior: \(error.localizedDescription)"
+            errorMessage = AppLocalization.string("Could not save message behavior: \(error.localizedDescription)")
             return false
         }
     }
@@ -6742,8 +14258,38 @@ final class AppState: ObservableObject {
         profile: String,
         sessionIDs: [String]
     ) async {
-        let taskKeys = Set(sessionIDs.filter { !$0.isEmpty }.map { "\(profile)|\($0)" })
+        let taskKeys = Set(
+            sessionIDs.filter { !$0.isEmpty }.map {
+                Self.secondaryTitleRecoveryTaskKey(profile: profile, sessionID: $0)
+            }
+        )
         await sessionTitleRecoveryTracker.cancel(taskKeys)
+    }
+
+    /// One source of truth for the secondary-recovery task key. The scheduler,
+    /// its cancellation, and the observability seam below must agree: a
+    /// key-format change made in only one of them would silently disable
+    /// another (and quietly turn a test pinning the boundary vacuous).
+    private static func secondaryTitleRecoveryTaskKey(
+        profile: String,
+        sessionID: String
+    ) -> String {
+        "\(profile)|\(sessionID)"
+    }
+
+    /// Whether a secondary automatic title-recovery task is registered for
+    /// this conversation. Canonical Bot Chats are excluded from that
+    /// machinery outright (see `scheduleSecondaryProfileTitleRecovery`), so
+    /// this answers `false` for them, while ordinary conversations keep the
+    /// historical behaviour. Internal rather than private so regression
+    /// tests can pin the boundary without waiting out the recovery delay.
+    func hasSecondaryTitleRecoveryScheduled(forSessionID sessionID: String) -> Bool {
+        sessionTitleRecoveryTracker.hasTask(
+            for: Self.secondaryTitleRecoveryTaskKey(
+                profile: activeProfile,
+                sessionID: sessionID
+            )
+        )
     }
 
     private func titleGenerationSettings(for profile: String) async -> TitleGenerationSettings? {
@@ -6804,13 +14350,21 @@ final class AppState: ObservableObject {
         userMessage: String,
         assistantMessage: String
     ) {
+        // A canonical Bot Chat never participates in automatic title
+        // generation: its identity IS the exact title "Bot Chat", so a
+        // generated rename would break the exact-title lookup that resolves
+        // the profile's forever chat (and could make the bot unmintable or
+        // mintable-twice downstream). Registry identity — never a title
+        // comparison — decides ownership, so this returns before any RPC,
+        // settings read, or task registration.
+        guard botConversationProfile(for: sessionId) == nil else { return }
         let profile = activeProfile
         guard profile != "default",
               let client,
               !userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !assistantMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
-        let taskKey = "\(profile)|\(sessionId)"
+        let taskKey = Self.secondaryTitleRecoveryTaskKey(profile: profile, sessionID: sessionId)
         guard !sessionTitleRecoveryTracker.isSuppressed(taskKey),
               !sessionTitleRecoveryTracker.hasTask(for: taskKey) else { return }
         let token = UUID()
@@ -6832,7 +14386,13 @@ final class AppState: ObservableObject {
 
             do {
                 // Give Hermes' built-in asynchronous title task precedence.
-                if let existingTitle = try await client.sessionTitle(sessionId) {
+                // The profile field is self-describing even though current
+                // Hermes session.title resolution is session-scoped: bot
+                // conversations address their own profile explicitly.
+                if let existingTitle = try await client.sessionTitle(
+                    sessionId,
+                    profile: botConversationProfile(for: sessionId)
+                ) {
                     guard !Task.isCancelled,
                           self.sessionTitleRecoveryTracker.isCurrent(token, for: taskKey),
                           self.activeProfile == profile,
@@ -6919,14 +14479,27 @@ final class AppState: ObservableObject {
         sessions = sessions.map(updated)
         cronSessions = cronSessions.map(updated)
         archivedSessions = archivedSessions.map(updated)
-        if matchesActiveSession { setActiveSessionTitle(title) }
+        // Catalog rows may carry the recovered title either way, but the
+        // ACTIVE ordinary persisted title must not: a .sessionTitle event
+        // for a canonical Bot Chat would otherwise displace the bot's
+        // display label and persist the literal wire title into the
+        // dashboard profile's cache. Registry identity — never a title
+        // comparison — decides ownership.
+        if matchesActiveSession {
+            if let activeSessionId, botConversationProfile(for: activeSessionId) == nil {
+                setActiveSessionTitle(title)
+            }
+        }
     }
 
     // MARK: - Stream event handling
 
     func handleStreamEvent(_ event: StreamEvent) {
         if case .sessionTitle(let runtimeSessionId, let storedSessionId, let title) = event {
-            let taskKey = "\(activeProfile)|\(runtimeSessionId)"
+            let taskKey = Self.secondaryTitleRecoveryTaskKey(
+                profile: activeProfile,
+                sessionID: runtimeSessionId
+            )
             sessionTitleRecoveryTracker.cancel(taskKey)
             applyRecoveredSessionTitle(
                 title,
@@ -6934,8 +14507,180 @@ final class AppState: ObservableObject {
             )
             return
         }
+        // Compaction lifecycle edges are session-scoped bookkeeping, not
+        // transcript projection: they must run for background conversations
+        // too (clearing state, driving the active conversation's refresh)
+        // and are never buffered into a reconcile.
+        if case .statusUpdate(let sessionId, let kind, let text) = event {
+            applyStatusUpdate(sessionId: sessionId, kind: kind, text: text)
+            return
+        }
         if bufferIfReconciling(event) { return }
         applyStreamEvent(event)
+    }
+
+    /// Gateway compression lifecycle edges (`status.update`):
+    /// - `compacting` — server-side compaction active for that conversation.
+    /// - `compacted` — terminal edge: the persisted history was rewritten.
+    /// Unrelated kinds are ignored; they never masquerade as compaction.
+    private func applyStatusUpdate(sessionId: String, kind: StatusUpdateKind, text: String?) {
+        // `text` is display-only upstream; Conduit's compression affordance
+        // is driven by the kind, not by gateway copy.
+        switch kind {
+        case .compacting:
+            establishServerCompactionClaim(
+                sessionId: sessionId,
+                generation: terminalServerCompactionGeneration(for: sessionId)
+            )
+        case .compacted:
+            // Equivalence-aware: a terminal edge addressed to any runtime
+            // alias of the conversation clears its server-side claim.
+            clearServerCompactionClaim(sessionId: sessionId)
+            applyCompactionCompleted(sessionId: sessionId)
+        case .other:
+            break
+        }
+    }
+
+    /// The storage key for a conversation's compaction generation: the
+    /// positively confirmed durable identity when the index knows one, else
+    /// the canonical catalog id. Keying by durable identity makes
+    /// alias-addressed terminal edges and pending continuations share one
+    /// counter across runtime rebinds.
+    private func serverCompactionGenerationKey(for sessionId: String) -> String {
+        // A bot chat's runtime->durable mapping is indexed under the BOT
+        // profile; ordinary sessions keep the dashboard lookup. Try the
+        // conversation's own scope first, then the dashboard scope as a
+        // fallback so a pre-existing mapping is never orphaned.
+        let scopeProfile = botConversationProfile(for: sessionId) ?? activeProfile
+        if let durable = conversationIdentityIndex.durableID(
+            forRuntime: sessionId,
+            profile: scopeProfile
+        ) {
+            return durable
+        }
+        if let durable = conversationIdentityIndex.durableID(
+            forRuntime: sessionId,
+            profile: activeProfile
+        ) {
+            return durable
+        }
+        return canonicalSessionID(for: sessionId) ?? sessionId
+    }
+
+    /// The conversation's terminal-compaction generation: the value stored
+    /// under its durable-generation key.
+    private func terminalServerCompactionGeneration(for sessionId: String) -> Int {
+        serverCompactionTerminalGenerations[serverCompactionGenerationKey(for: sessionId)] ?? 0
+    }
+
+    /// A terminal compaction signal (the gateway's `compacted` edge, or an
+    /// authoritative terminal `session.compress` result) ends any server-side
+    /// claim for the conversation and bumps its terminal generation so a
+    /// stale `pending` continuation cannot resurrect the claim.
+    private func clearServerCompactionClaim(sessionId: String) {
+        let key = serverCompactionGenerationKey(for: sessionId)
+        serverCompactionTerminalGenerations[key, default: 0] += 1
+        // Cancel expiry tasks for every equivalent alias, not just the
+        // addressed id — a re-homed runtime's task is inert after this.
+        for (taskKey, task) in serverCompactionClaimExpiryTasks
+        where composerSessionIDsAreEquivalent(taskKey, sessionId) {
+            task.cancel()
+            serverCompactionClaimExpiryTasks.removeValue(forKey: taskKey)
+        }
+        let cleared = serverCompactingSessionIDs.filter {
+            composerSessionIDsAreEquivalent($0, sessionId)
+        }
+        serverCompactingSessionIDs.subtract(cleared)
+        serverCompactionClaims = serverCompactionClaims.filter {
+            !composerSessionIDsAreEquivalent($0.key, sessionId)
+        }
+    }
+
+    /// Establishes (or refreshes) the server-side claim for `sessionId`.
+    /// Callers decide freshness: a `pending` continuation only reaches here
+    /// when no terminal edge landed during its RPC await. `lifetime` bounds
+    /// the claim (see `expireServerCompactionClaim`); production always uses
+    /// the compression budget, tests shrink it to observe the expiry.
+    func establishServerCompactionClaim(
+        sessionId: String,
+        generation: Int,
+        lifetime: TimeInterval = HermesClient.sessionCompressTimeout
+    ) {
+        if !serverCompactingSessionIDs.contains(where: {
+            composerSessionIDsAreEquivalent($0, sessionId)
+        }) {
+            serverCompactingSessionIDs.insert(sessionId)
+        }
+        serverCompactionClaims[sessionId] = ServerCompactionClaim(
+            generation: generation,
+            expiresAt: Date().addingTimeInterval(lifetime)
+        )
+        // Replace any prior expiry task for this conversation so repeated
+        // compactions never accumulate sleeping tasks.
+        serverCompactionClaimExpiryTasks[sessionId]?.cancel()
+        let expiryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(lifetime))
+            guard let self, !Task.isCancelled else { return }
+            self.expireServerCompactionClaim(sessionId: sessionId, generation: generation)
+        }
+        serverCompactionClaimExpiryTasks[sessionId] = expiryTask
+    }
+
+    /// Bounded expiry for a lost terminal edge: a claim that reaches the end
+    /// of one full compression budget without a `compacted` edge (or a newer
+    /// terminal result) is dropped — the gateway either lost the edge or the
+    /// session, and neither may keep "Compressing…" alive for the whole
+    /// connection. Session-scoped: only the claim whose generation still
+    /// matches is removed, so unrelated conversations are never touched, and
+    /// genuinely active local RPC claims (`compressingSessionIDs`) are never
+    /// affected — they are bounded by their own request timeout.
+    private func expireServerCompactionClaim(sessionId: String, generation: Int) {
+        guard let claim = serverCompactionClaims[sessionId],
+              claim.generation == generation,
+              claim.expiresAt <= Date() else { return }
+        serverCompactionClaims.removeValue(forKey: sessionId)
+        serverCompactionClaimExpiryTasks.removeValue(forKey: sessionId)
+        // Keep the spinner only while a newer equivalent claim (established
+        // under another runtime alias) is still live.
+        let equivalentStillClaimed = serverCompactionClaims.contains {
+            composerSessionIDsAreEquivalent($0.key, sessionId)
+        }
+        if !equivalentStillClaimed {
+            let stale = serverCompactingSessionIDs.filter {
+                composerSessionIDsAreEquivalent($0, sessionId)
+            }
+            serverCompactingSessionIDs.subtract(stale)
+        }
+    }
+
+
+    /// The `compacted` edge means the gateway just rewrote that
+    /// conversation's persisted history — the same server-side rewrite PR
+    /// #168's adoption path guards against, minus the local RPC. Upstream
+    /// Desktop drives a transcript refresh here because a manual `/compress`
+    /// may have returned `pending`: with no normal turn-end event, nothing
+    /// else would surface the summarized transcript.
+    private func applyCompactionCompleted(sessionId: String) {
+        // Only the affected conversation's invariants die with the rewrite.
+        // A background conversation's next open/resume hydrates
+        // authoritatively.
+        guard composerSessionIDsAreEquivalent(sessionId, activeSessionId) else { return }
+        invalidatePersistedHistoryInvariants()
+        // A live turn owns the transcript: never replace it underneath the
+        // turn. Freshness-stale routes the post-turn authoritative path here.
+        if turnState == .running || locallyOwnedInFlightTurn != nil {
+            transcriptFreshnessIsStale = true
+            // Fence: a reconcile that fetched pre-compaction rows must not
+            // commit them underneath the live turn after this rewrite.
+            invalidateReconciliation()
+            return
+        }
+        // Idle: drive the authoritative transcript reconciliation now — the
+        // user sees the compressed transcript without leaving the session.
+        Task { [weak self] in
+            await self?.syncSession()
+        }
     }
 
     private func bufferIfReconciling(_ event: StreamEvent) -> Bool {
@@ -6953,12 +14698,14 @@ final class AppState: ObservableObject {
                 .messageComplete(let sessionId, _, _, _), .messageError(let sessionId, _),
                 .messageInterrupted(let sessionId), .sessionBusy(let sessionId, _),
                 .sessionInfo(let sessionId, _), .sessionTitle(let sessionId, _, _),
-                .toolStart(let sessionId, _, _),
-                .toolComplete(let sessionId, _, _), .reviewSummary(let sessionId, _), .clarify(let sessionId, _, _, _),
+                .toolStart(let sessionId, _, _, _),
+                .toolComplete(let sessionId, _, _, _), .reviewSummary(let sessionId, _), .clarify(let sessionId, _), .clarifyExpire(let sessionId, _),
                 .approval(let sessionId, _),
                 .contextUpdate(let sessionId, _, _, _), .cwdUpdate(let sessionId, _),
                 .modelUpdate(let sessionId, _, _), .agentCount(let sessionId, _),
-                .delegateAgent(let sessionId, _):
+                .delegateAgent(let sessionId, _), .statusUpdate(let sessionId, _, _):
+            // Unreachable through bufferIfReconciling (status.update returns
+            // early); kept for switch completeness.
             return sessionId
         case .unparsed:
             return ""
@@ -7003,8 +14750,11 @@ final class AppState: ObservableObject {
         switch event {
         case .messageStart:
             finalizePendingStreamingCompletion()
-            activeReasoningMessageId = nil
-            receivedReasoningForCurrentTurn = false
+            // A new turn ends any live reasoning card; settle first so the
+            // previous segment keeps its exact buffered text in the
+            // transcript.
+            settleReasoningSegmentIntoTranscript()
+            resetReasoningTurn()
             setRunning(true)
             notifyVoiceAssistant(.started(sessionID: streamSessionId))
 
@@ -7031,15 +14781,17 @@ final class AppState: ObservableObject {
             notifyVoiceAssistant(.completed(sessionID: streamSessionId, content: content))
 
         case .messageError(_, let message):
+            settleReasoningSegmentIntoTranscript()
+            resetReasoningTurn()
             clearStreamingText()
-            activeReasoningMessageId = nil
             errorMessage = message
             setRunning(false)
             notifyVoiceAssistant(.failed(sessionID: streamSessionId, message: message))
 
         case .messageInterrupted:
+            settleReasoningSegmentIntoTranscript()
+            resetReasoningTurn()
             clearStreamingText()
-            activeReasoningMessageId = nil
             setRunning(false)
             notifyVoiceAssistant(.interrupted(sessionID: streamSessionId))
 
@@ -7060,6 +14812,19 @@ final class AppState: ObservableObject {
                 authoritativeYolo: authoritativeYolo,
                 authoritativeApprovalsMode: authoritativeApprovalsMode
             )
+            // Some gateway generations also carry `pending_clarify` on the
+            // session.info snapshot; wherever it appears it is the same
+            // authoritative state as the resume copy.
+            if let pendingClarify = snapshot.pendingClarify {
+                applyClarifyActivity(pendingClarify, source: .authoritativeSnapshot)
+            }
+            if let payload = snapshot.pendingApprovalPayload,
+               let pendingApproval = MessageNormalizer.approvalActivity(
+                   from: payload,
+                   sessionId: sessionID
+               ) {
+                applyApprovalActivity(pendingApproval, authoritative: true)
+            }
             if let running = snapshot.running {
                 setRunning(running)
             }
@@ -7069,31 +14834,115 @@ final class AppState: ObservableObject {
             // active-session stream gate in handleStreamEvent(_:).
             break
 
-        case .toolStart(_, let name, let input):
+        case .toolStart(_, let name, let input, let eventToolID):
             if name.lowercased() == "clarify" { break }
-            activeReasoningMessageId = nil
+            let toolID = eventToolID?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let stableToolID = toolID?.isEmpty == false ? toolID : nil
+            // Tool lifecycle events can be replayed after a resume. A stable
+            // gateway id makes a repeated start idempotent without splitting
+            // the current reasoning or text projection. For legacy events
+            // without a tool ID, avoid duplicating an active running card for
+            // the same tool and input.
+            if let stableToolID {
+                if messages.contains(where: { $0.tool?.id == stableToolID }) {
+                    break
+                }
+            } else if let lastRunningTool = messages.last(where: { $0.role == .tool && $0.tool?.status == .running })?.tool,
+                      lastRunningTool.name == name,
+                      lastRunningTool.input == input {
+                break
+            }
+            // The tool card must land after a complete reasoning card; commit
+            // the coalesced segment before the boundary reorders the
+            // transcript. A tool ends the reasoning SEGMENT only — the turn
+            // flag survives so completion-carried reasoning cannot duplicate
+            // this segment.
+            settleReasoningSegmentIntoTranscript()
+            resetReasoningSegment()
             flushStreamingPartial()
-            messages.append(ChatMessage(
+            let message = ChatMessage(
                 id: "tool-start-\(Date().timeIntervalSince1970)",
                 role: .tool,
                 content: "",
                 timestamp: Self.localTimestamp(),
-                tool: ToolActivity(id: nil, name: name, input: input, output: nil, status: .running)
-            ))
+                tool: ToolActivity(id: stableToolID, name: name, input: input, output: nil, status: .running)
+            )
+            messages.append(message)
+            sessionPresentationCache.recordPendingToolStart(
+                message,
+                profile: presentationProfile(for: streamSessionId),
+                sessionIDs: presentationCacheSessionIDs(for: streamSessionId)
+            )
 
-        case .toolComplete(_, let name, let output):
+        case .toolComplete(_, let name, let output, let eventToolID):
             if name.lowercased() == "clarify" { break }
-            activeReasoningMessageId = nil
+            settleReasoningSegmentIntoTranscript()
+            resetReasoningSegment()
+            let toolID = eventToolID?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let stableToolID = toolID?.isEmpty == false ? toolID : nil
+            let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             // Update the matching running tool card in place instead of
             // appending a duplicate. This keeps input + output together in
             // one chronological entry, matching how the HTTP API returns
             // stored messages on reload.
-            if let index = messages.lastIndex(where: {
-                $0.role == .tool && $0.tool?.name == name && $0.tool?.status == .running
-            }) {
+            let matchingIndex: Int?
+            var resolvedCacheToolID = stableToolID
+            var adoptedMessageID: String? = nil
+            if let stableToolID {
+                if let exactIndex = messages.lastIndex(where: {
+                    $0.role == .tool && $0.tool?.id == stableToolID
+                }) {
+                    matchingIndex = exactIndex
+                    adoptedMessageID = messages[exactIndex].id
+                } else {
+                    // No exact tool-ID match. Check if there is an unambiguous
+                    // running card for the same tool name — regardless of whether
+                    // the card already carries a different stable tool ID or none.
+                    // If exactly one exists, adopt it; if multiple, do not guess.
+                    let candidates = messages.indices.filter { idx in
+                        guard messages[idx].role == .tool,
+                              let tool = messages[idx].tool,
+                              tool.status == .running,
+                              tool.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedName else {
+                            return false
+                        }
+                        return true
+                    }
+                    if candidates.count == 1 {
+                        matchingIndex = candidates[0]
+                        adoptedMessageID = messages[candidates[0]].id
+                        // Preserve the card's existing tool ID when the
+                        // completion's stableToolID didn't match any card.
+                        resolvedCacheToolID = messages[candidates[0]].tool?.id
+                    } else {
+                        matchingIndex = nil
+                    }
+                }
+            } else {
+                // ID-less completion: gather ALL running same-name transcript
+                // candidates regardless of whether they carry a stable tool ID.
+                // If exactly one exists, adopt it (preserving its existing tool
+                // ID). If multiple exist (or none), do not guess.
+                let candidates = messages.indices.filter { idx in
+                    guard messages[idx].role == .tool,
+                          let tool = messages[idx].tool,
+                          tool.status == .running,
+                          tool.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedName else {
+                        return false
+                    }
+                    return true
+                }
+                if candidates.count == 1 {
+                    matchingIndex = candidates[0]
+                    adoptedMessageID = messages[candidates[0]].id
+                } else {
+                    matchingIndex = nil
+                }
+            }
+            if let index = matchingIndex {
                 let existing = messages[index].tool
                 messages[index].tool = ToolActivity(
-                    id: existing?.id,
+                    id: stableToolID ?? existing?.id,
                     name: name,
                     input: existing?.input,
                     output: output,
@@ -7105,13 +14954,24 @@ final class AppState: ObservableObject {
                     role: .tool,
                     content: "",
                     timestamp: Self.localTimestamp(),
-                    tool: ToolActivity(id: nil, name: name, input: nil, output: output, status: .complete)
+                    tool: ToolActivity(id: stableToolID, name: name, input: nil, output: output, status: .complete)
                 ))
             }
+            sessionPresentationCache.resolvePendingTool(
+                named: name,
+                toolID: resolvedCacheToolID,
+                messageID: adoptedMessageID,
+                profile: presentationProfile(for: streamSessionId),
+                sessionIDs: presentationCacheSessionIDs(for: streamSessionId)
+            )
 
         case .reviewSummary(let sessionId, let activity):
             let id = "review-summary-\(sessionId)-\(UUID().uuidString)"
             guard !messages.contains(where: { $0.review == activity }) else { return }
+            // A mid-turn row must not land below the live reasoning card's
+            // eventual commit — settle first so chronology matches the
+            // pre-projection transcript.
+            settleReasoningSegmentIntoTranscript()
             messages.append(ChatMessage(
                 id: id,
                 role: .system,
@@ -7127,77 +14987,15 @@ final class AppState: ObservableObject {
                 activity: activity
             ))
 
-        case .clarify(_, let requestId, let question, let choices):
-            let activity = ClarifyActivity(
-                requestId: requestId,
-                question: question,
-                choices: choices.map { ClarifyChoice(label: $0.label, value: $0.value) },
-                status: .pending
-            )
-            if let index = messages.firstIndex(where: { $0.clarify?.requestId == requestId }) {
-                messages[index].content = question
-                messages[index].clarify = activity
-            } else {
-                // A still-pending push-delivered card for the same question is
-                // superseded by the live event (different ids: gateway vs
-                // plugin-minted), so one logical clarify never renders two
-                // answerable cards. Resolved history stays visible, and a
-                // .submitting card is left alone: its relay answer may already
-                // be in flight and will settle it by request id.
-                var supersededRequestIds: [String] = []
-                let liveQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                messages.removeAll { message in
-                    guard let clarify = message.clarify,
-                          clarify.requestId.hasPrefix(PendingDecisionPayload.relayRequestPrefix),
-                          clarify.status == .pending,
-                          clarify.question.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == liveQuestion else {
-                        return false
-                    }
-                    supersededRequestIds.append(clarify.requestId)
-                    return true
-                }
-                // The superseded card must also leave the presentation cache —
-                // the ordinary flush re-appends still-pending stored cards, so
-                // an in-memory-only removal would resurface as a duplicate
-                // answerable card after the next cold-start resume.
-                let cacheSessionIDs = [
-                    activeSessionId,
-                    reconciliation?.requestedSessionId,
-                    reconciliation?.resolvedSessionId
-                ].compactMap { $0 }
-                for requestId in supersededRequestIds {
-                    sessionPresentationCache.removePendingDecision(
-                        key: "clarify:\(requestId)",
-                        profile: activeProfile,
-                        sessionIDs: cacheSessionIDs
-                    )
-                }
-                messages.append(ChatMessage(
-                    id: "clarify-\(requestId)",
-                    role: .clarify,
-                    content: question,
-                    timestamp: Self.localTimestamp(),
-                    clarify: activity
-                ))
-            }
+        case .clarify(_, let activity):
+            applyClarifyActivity(activity, source: .streamEvent)
             setRunning(true)
 
+        case .clarifyExpire(_, let requestId):
+            expireClarifyRequest(requestId: requestId)
+
         case .approval(_, let activity):
-            if let index = messages.lastIndex(where: {
-                $0.approval?.sessionId == activity.sessionId
-                    && ($0.approval?.status == .pending || $0.approval?.status == .submitting)
-            }) {
-                messages[index].content = activity.description
-                messages[index].approval = activity
-            } else {
-                messages.append(ChatMessage(
-                    id: "approval-\(activity.sessionId)-\(UUID().uuidString)",
-                    role: .approval,
-                    content: activity.description,
-                    timestamp: Self.localTimestamp(),
-                    approval: activity
-                ))
-            }
+            applyApprovalActivity(activity, authoritative: false)
             setRunning(true)
 
         case .contextUpdate(_, let percent, let used, let max):
@@ -7227,34 +15025,564 @@ final class AppState: ObservableObject {
             }
             activeAgents = delegateAgents.filter { $0.status.isActive }.count
 
+        case .statusUpdate:
+            // Lifecycle bookkeeping — handled in handleStreamEvent before
+            // the active-session gate; never a transcript projection.
+            break
+
         case .unparsed:
             break
         }
     }
 
-    /// A reasoning delta belongs exactly where Hermes emitted it. Gateways can
-    /// send either deltas or repeated cumulative snapshots, so merge both into
-    /// one live card rather than creating duplicate thinking boxes.
-    private func appendReasoning(_ text: String) {
-        guard !text.isEmpty else { return }
-        if let id = activeReasoningMessageId,
-           let index = messages.firstIndex(where: { $0.id == id }) {
-            messages[index].content = mergedReasoning(
-                existing: messages[index].content,
-                incoming: text
+    // MARK: - Clarify lifecycle
+
+    /// Injectable relay transport for per-question batch answers. Production
+    /// resolves through the shared PushNotificationService; tests inject
+    /// canned outcomes to pin the released-vs-qid-locked handling.
+    var relayQuestionResponder: (_ requestId: String, _ questionId: String, _ answer: String) async throws -> PushNotificationService.RelayQuestionOutcome =
+        { requestId, questionId, answer in
+            try await PushNotificationService.shared.respondToRelayDecisionQuestion(
+                requestId: requestId,
+                questionId: questionId,
+                answer: answer
             )
+        }
+
+    private enum ApprovalSubmissionIdentity: Hashable {
+        case identified(String)
+        case legacy(String)
+    }
+
+    /// In-memory tokens for approvals currently submitting an RPC on this device.
+    /// This state is ephemeral and never persisted. Restored approval cards
+    /// from disk without an active RPC in flight yield to authoritative replays.
+    private var liveApprovalSubmissions = Set<ApprovalSubmissionIdentity>()
+
+    private func hasLiveApprovalSubmission(
+        for activity: ApprovalActivity,
+        equivalentSessionIDs: Set<String>? = nil
+    ) -> Bool {
+        if let requestId = activity.requestId {
+            return liveApprovalSubmissions.contains(.identified(requestId))
+        }
+        if liveApprovalSubmissions.contains(.legacy(activity.sessionId)) {
+            return true
+        }
+        if let equivalentSessionIDs {
+            return liveApprovalSubmissions.contains(where: {
+                if case .legacy(let sid) = $0 {
+                    return equivalentSessionIDs.contains(sid)
+                }
+                return false
+            })
+        }
+        return false
+    }
+
+    private static func sameLegacyApprovalRequest(
+        _ lhs: ApprovalActivity,
+        _ rhs: ApprovalActivity
+    ) -> Bool {
+        lhs.requestId == nil
+            && rhs.requestId == nil
+            && lhs.command == rhs.command
+            && lhs.description == rhs.description
+            && lhs.choices == rhs.choices
+            && lhs.allowPermanent == rhs.allowPermanent
+            && lhs.smartDenied == rhs.smartDenied
+    }
+
+    private func shouldPreserveLocalApprovalState(
+        existing: ApprovalActivity,
+        incoming: ApprovalActivity,
+        authoritative: Bool,
+        hasLiveSubmission: Bool
+    ) -> Bool {
+        switch existing.status {
+        case .submitting:
+            return hasLiveSubmission || !authoritative
+        case .approved, .rejected, .expired:
+            return true
+        case .error:
+            if existing.requestId == nil, incoming.requestId == nil {
+                return !authoritative && Self.sameLegacyApprovalRequest(existing, incoming)
+            }
+            return !authoritative
+        case .pending:
+            return false
+        }
+    }
+
+    /// Upserts an approval by Hermes request identity. Legacy events without a
+    /// request id retain the historical one-card-per-session behavior. A
+    /// modern authoritative replay removes only an ambiguous legacy card for
+    /// that session; explicitly identified queued approvals remain distinct.
+    private func applyApprovalActivity(
+        _ activity: ApprovalActivity,
+        authoritative: Bool
+    ) {
+        let equivalentSessionIDs = activeChatScrollSessionIdentity.equivalentSessionIDs
+            .union([activity.sessionId])
+
+        if authoritative, activity.requestId != nil {
+            messages.removeAll { message in
+                guard let existing = message.approval,
+                      equivalentSessionIDs.contains(existing.sessionId),
+                      existing.requestId == nil else { return false }
+                return existing.status != .submitting
+                    && SessionPresentationCache.isPendingDecision(existing.status)
+            }
+            let cacheSessionIDs = presentationCacheSessionIDs(for: activity.sessionId)
+            for sessionID in equivalentSessionIDs {
+                sessionPresentationCache.removePendingDecision(
+                    key: "approval:\(sessionID)",
+                    profile: presentationProfile(for: activity.sessionId),
+                    sessionIDs: cacheSessionIDs
+                )
+            }
+        }
+
+        let matchingIndex: Int?
+        if let requestId = activity.requestId {
+            matchingIndex = messages.lastIndex(where: {
+                $0.approval?.requestId == requestId
+            })
+        } else {
+            // Legacy approvals share the session namespace, but multiple
+            // sequential commands in the same session each produce a legacy
+            // approval. A terminal card (.approved, .rejected, .expired) from an
+            // earlier command must not swallow a subsequent legacy approval.
+            // An incoming legacy event matches only an active existing card.
+            matchingIndex = messages.lastIndex(where: {
+                guard let existing = $0.approval else { return false }
+                return existing.requestId == nil
+                    && equivalentSessionIDs.contains(existing.sessionId)
+                    && (existing.status == .pending || existing.status == .submitting || existing.status == .error)
+            })
+        }
+
+        if let index = matchingIndex, let existing = messages[index].approval {
+            let hasLiveSubmission = hasLiveApprovalSubmission(
+                for: existing,
+                equivalentSessionIDs: equivalentSessionIDs
+            )
+            if shouldPreserveLocalApprovalState(
+                existing: existing,
+                incoming: activity,
+                authoritative: authoritative,
+                hasLiveSubmission: hasLiveSubmission
+            ) {
+                var replay = activity
+                replay.status = existing.status
+                replay.choice = existing.choice
+                replay.error = existing.error
+                messages[index].content = replay.description
+                messages[index].approval = replay
+                return
+            }
+            messages[index].content = activity.description
+            messages[index].approval = activity
             return
         }
 
-        let id = "reasoning-\(Date().timeIntervalSince1970)"
+        settleReasoningSegmentIntoTranscript()
+        let identity = activity.requestId ?? activity.sessionId
         messages.append(ChatMessage(
-            id: id,
-            role: .reasoning,
-            content: text,
+            id: "approval-\(identity)-\(UUID().uuidString)",
+            role: .approval,
+            content: activity.description,
             timestamp: Self.localTimestamp(),
-            author: activeProfile
+            approval: activity
         ))
-        activeReasoningMessageId = id
+    }
+
+    /// How a clarification activity reached AppState. Replay defenses for the
+    /// one-shot stream event are deliberately weaker than the gateway's
+    /// authoritative `pending_clarify` snapshot — they are not equally
+    /// authoritative and must not share one merge policy.
+    enum ClarifyActivitySource {
+        /// A duplicate/replayed one-shot `clarify.request` (WS replay
+        /// buffer). Local states are strictly newer than the stale event.
+        case streamEvent
+        /// `session.resume` / `session.info` `pending_clarify`: the
+        /// gateway's current truth. Its question list and locked
+        /// `answers[qid]` outrank local presentation state.
+        case authoritativeSnapshot
+    }
+
+    /// Upserts one normalized clarification card, keyed by the gateway
+    /// `request_id`. Re-delivered events update the existing card in place
+    /// rather than duplicating it. Merge policy differs by source:
+    ///
+    /// - `.streamEvent`: a replayed event is stale by definition — never
+    ///   unlock a question this device answered or has in flight, never
+    ///   resurrect an expired request, and keep rows only the local card
+    ///   holds.
+    /// - `.authoritativeSnapshot`: the gateway's question list and locked
+    ///   answers win outright — a locally cached `.submitting`/`.error`
+    ///   presentation must not override the server, and the snapshot's
+    ///   existence proves the request is still active, so a locally sticky
+    ///   expired flag yields to it.
+    private func applyClarifyActivity(
+        _ activity: ClarifyActivity,
+        source: ClarifyActivitySource
+    ) {
+        if let index = messages.firstIndex(where: { $0.clarify?.requestId == activity.requestId }) {
+            var merged = activity
+            if let existing = messages[index].clarify {
+                switch source {
+                case .streamEvent:
+                    // Expiry is sticky for this request id: a replayed
+                    // one-shot event must not re-arm controls the gateway
+                    // already expired.
+                    merged.isExpired = merged.isExpired || existing.isExpired
+                    let incomingIDs = Set(merged.questions.map(\.id))
+                    for questionIndex in merged.questions.indices {
+                        guard let prior = existing.questions.first(where: { $0.id == merged.questions[questionIndex].id }),
+                              prior.status == .answered || prior.status == .submitting || prior.status == .expired else { continue }
+                        // Local answered/submitting state is strictly newer
+                        // than a replayed pending event; expired state stays
+                        // expired.
+                        merged.questions[questionIndex].status = prior.status
+                        merged.questions[questionIndex].answer = prior.answer
+                    }
+                    // Questions only the local card holds survive the merge —
+                    // a partial replay must not erase rows the user can still
+                    // see.
+                    let survivingExtras = existing.questions.filter { !incomingIDs.contains($0.id) }
+                    merged.questions.append(contentsOf: survivingExtras)
+                case .authoritativeSnapshot:
+                    // The snapshot already carries the gateway's locked
+                    // answers (normalizer applies `answers[qid]`). Nothing
+                    // local outranks it — least of all a `.submitting` from a
+                    // previous process whose RPC outcome is unknown.
+                    merged.isExpired = false
+                }
+            }
+            if merged.isExpired {
+                for questionIndex in merged.questions.indices
+                where merged.questions[questionIndex].status != .answered {
+                    merged.questions[questionIndex].status = .expired
+                    merged.questions[questionIndex].error = nil
+                }
+                // The user-facing explanation must survive any merge that
+                // keeps the expired state — an EXPIRED card with no notice
+                // reads as a broken card.
+                if (merged.error ?? "").isEmpty {
+                    merged.error = Self.clarifyExpiredNotice(for: merged.questions.count)
+                }
+            }
+            messages[index].content = merged.displayQuestion
+            messages[index].clarify = merged
+            return
+        }
+
+        // A still-pending push-delivered card for the same logical clarify is
+        // superseded by the live event (different ids: gateway vs
+        // plugin-minted), so one logical clarify never renders two
+        // answerable cards. Resolved history stays visible, and a
+        // .submitting card is left alone: its relay answer may already
+        // be in flight and will settle it by request id.
+        //
+        // Correlation is deliberately conservative (see
+        // pushCardSupersededBy): the plugin mints its own request ids, so no
+        // trustworthy shared identifier exists — question text is the only
+        // compatibility signal, and a full batch push must match the whole
+        // question set, never just its first question.
+        var supersededRequestIds: [String] = []
+        messages.removeAll { message in
+            guard let clarify = message.clarify,
+                  clarify.requestId.hasPrefix(PendingDecisionPayload.relayRequestPrefix),
+                  clarify.status == .pending,
+                  Self.pushCardSupersededBy(clarify, live: activity) else {
+                return false
+            }
+            supersededRequestIds.append(clarify.requestId)
+            return true
+        }
+        // The superseded card must also leave the presentation cache —
+        // the ordinary flush re-appends still-pending stored cards, so
+        // an in-memory-only removal would resurface as a duplicate
+        // answerable card after the next cold-start resume.
+        let cacheSessionIDs = [
+            activeSessionId,
+            reconciliation?.requestedSessionId,
+            reconciliation?.resolvedSessionId
+        ].compactMap { $0 }
+        for requestId in supersededRequestIds {
+            sessionPresentationCache.removePendingDecision(
+                key: "clarify:\(requestId)",
+                profile: presentationProfile(for: activeSessionId),
+                sessionIDs: cacheSessionIDs
+            )
+        }
+        // The clarify row must sit above the live reasoning card's
+        // eventual commit — settle the segment before it lands.
+        settleReasoningSegmentIntoTranscript()
+        messages.append(ChatMessage(
+            id: "clarify-\(activity.requestId)",
+            role: .clarify,
+            content: activity.displayQuestion,
+            timestamp: Self.localTimestamp(),
+            clarify: activity
+        ))
+    }
+
+    /// Applies `clarify.expire { request_id }`: unanswered questions stop
+    /// presenting answer controls and a late response can no longer make the
+    /// request read as answered. Request identity — never question text —
+    /// decides which card is torn down, so unrelated clarifies are untouched.
+    private func expireClarifyRequest(requestId: String) {
+        guard let index = messages.firstIndex(where: { $0.clarify?.requestId == requestId }),
+              var activity = messages[index].clarify,
+              !activity.isExpired else { return }
+        activity.isExpired = true
+        for questionIndex in activity.questions.indices
+        where activity.questions[questionIndex].status != .answered {
+            activity.questions[questionIndex].status = .expired
+            activity.questions[questionIndex].error = nil
+        }
+        activity.error = Self.clarifyExpiredNotice(for: activity.questions.count)
+        messages[index].clarify = activity
+        cacheMessagePresentation()
+    }
+
+    private static func clarifyExpiredNotice(for questionCount: Int) -> String {
+        questionCount > 1
+            ? AppLocalization.string("These questions are no longer active — Hermes timed them out and continued.")
+            : AppLocalization.string("This question is no longer active — Hermes timed it out and continued.")
+    }
+
+    /// Whether a still-pending push-delivered card describes the same logical
+    /// clarify as a live gateway event and must be superseded by it.
+    ///
+    /// Documented limitation: the notifier plugin mints its own
+    /// `conduit-push-…` request ids, so no trustworthy shared identifier
+    /// exists between the push copy and the gateway copy — normalized
+    /// question text is the only compatibility signal. To keep that weak
+    /// signal safe:
+    ///
+    /// - A legacy collapsed push card (scalar payload, synthetic qid) keeps
+    ///   the historical first-question correlation: the old notifier reduced
+    ///   a batch to question 1, so its lone text matching ANY live question
+    ///   means "same request, collapsed".
+    /// - A full batch push card (real qids) must match the ENTIRE question
+    ///   set. Two unrelated requests that merely share a first question —
+    ///   or a genuine single-question push against a bigger live batch —
+    ///   never cross-supersede.
+    static func pushCardSupersededBy(_ pushed: ClarifyActivity, live: ClarifyActivity) -> Bool {
+        func normalized(_ text: String) -> String {
+            text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        let liveTexts = Set(live.questions.map { normalized($0.question) })
+        guard !liveTexts.isEmpty else { return false }
+        if pushed.questions.contains(where: \.isSyntheticID) {
+            return liveTexts.contains(normalized(pushed.correlationQuestion))
+        }
+        return pushed.questions.count == live.questions.count
+            && pushed.questions.allSatisfy { liveTexts.contains(normalized($0.question)) }
+    }
+
+    /// Applies the typed `clarify.respond` outcome to the matching card. The
+    /// gateway's `remaining` list is the authority on whether one sub-question
+    /// was locked or the whole request completed, and an expired outcome never
+    /// reads as success. Only the targeted question mutates on failure, so one
+    /// question's network error cannot corrupt unrelated answered questions.
+    private func applyClarifyResponseOutcome(
+        _ outcome: HermesClient.ClarifyResponseOutcome,
+        requestId: String,
+        questionId: String,
+        answer: String
+    ) {
+        guard let index = messages.firstIndex(where: { $0.clarify?.requestId == requestId }),
+              var activity = messages[index].clarify else { return }
+        switch outcome {
+        case .expired:
+            activity.isExpired = true
+            for questionIndex in activity.questions.indices
+            where activity.questions[questionIndex].status != .answered {
+                activity.questions[questionIndex].status = .expired
+                activity.questions[questionIndex].error = nil
+            }
+            activity.error = Self.clarifyExpiredNotice(for: activity.questions.count)
+        case .accepted(let remaining):
+            // A late accepted outcome can never resurrect an expired request.
+            guard !activity.isExpired,
+                  let questionIndex = activity.questions.firstIndex(where: { $0.id == questionId }) else {
+                return
+            }
+            activity.questions[questionIndex].status = .answered
+            activity.questions[questionIndex].answer = answer
+            activity.questions[questionIndex].error = nil
+            // Sibling reconciliation is allowed ONLY on an explicit remaining
+            // list — the gateway's authority on what is still open. A locally
+            // pending question it no longer lists was locked by another
+            // surface; settle it without claiming this device's answer text.
+            // An OMITTED remaining field (older/minimal gateways) carries no
+            // sibling information, so only the submitted question is marked.
+            if let remaining {
+                let open = Set(remaining)
+                for index in activity.questions.indices
+                where index != questionIndex
+                    && activity.questions[index].status == .pending
+                    && !open.contains(activity.questions[index].id) {
+                    activity.questions[index].status = .answered
+                    activity.questions[index].answer = nil
+                }
+            }
+        }
+        messages[index].clarify = activity
+        cacheMessagePresentation()
+    }
+
+    /// A reasoning delta belongs exactly where Hermes emitted it. Gateways can
+    /// send either deltas or repeated cumulative snapshots, so merge both into
+    /// one live card rather than creating duplicate thinking boxes. The first
+    /// delta of a segment mounts the live projection immediately so the
+    /// thinking box appears promptly; every later delta coalesces through
+    /// `reasoningBuffer` and republishes the PROJECTION at display cadence.
+    /// The settled transcript is touched only once per segment, at the
+    /// boundary commit.
+    private func appendReasoning(_ text: String) {
+        guard !text.isEmpty else { return }
+        reasoningBuffer = mergedReasoning(
+            existing: reasoningBuffer,
+            incoming: text
+        )
+        guard activeReasoningMessageId != nil else {
+            let id = "reasoning-\(Date().timeIntervalSince1970)"
+            activeReasoningMessageId = id
+            TranscriptPerf.note(.reasoningProjectionPublish)
+            liveReasoningSegment = LiveReasoningSegment(
+                id: id,
+                timestamp: Self.localTimestamp(),
+                content: reasoningBuffer
+            )
+            return
+        }
+        scheduleReasoningPublish()
+    }
+
+    private func scheduleReasoningPublish() {
+        guard !showSidebar, !hasScheduledReasoningPublish else { return }
+        hasScheduledReasoningPublish = true
+        let cardID = activeReasoningMessageId
+
+        reasoningPublishTask = Task { @MainActor [weak self] in
+            do {
+                // Reasoning updates republish the live projection at this
+                // cadence; an expanded ThinkingCard restyles its attributed
+                // text and remeasures a growing height on every commit, so
+                // ~20 fps keeps the stream readable while leaving the main
+                // actor free between layout passes.
+                try await Task.sleep(for: .milliseconds(50))
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled, let self else { return }
+            self.hasScheduledReasoningPublish = false
+            self.reasoningPublishTask = nil
+            self.publishReasoningBuffer(liveCardID: cardID)
+        }
+    }
+
+    /// Stale publish tasks are structurally inert: once a boundary or session
+    /// switch has ended the live card, the captured id no longer matches, so
+    /// nothing can mutate a finalized or replaced transcript.
+    private func publishReasoningBuffer(liveCardID: String?) {
+        guard let liveCardID, liveCardID == activeReasoningMessageId,
+              var segment = liveReasoningSegment, segment.id == liveCardID,
+              segment.content != reasoningBuffer else { return }
+        TranscriptPerf.note(.reasoningProjectionPublish)
+        segment.content = reasoningBuffer
+        liveReasoningSegment = segment
+    }
+
+    /// Publish any coalesced reasoning into the live projection immediately.
+    /// Non-boundary callers (the sidebar closing) keep the segment streaming;
+    /// boundary callers need `settleReasoningSegmentIntoTranscript()`.
+    ///
+    /// Internal (not private) as the deterministic test seam: performance
+    /// fixtures flush each fed delta through this SAME production path, so
+    /// a measured window contains exactly the publications the deltas imply
+    /// instead of racing the ~50 ms coalescing task's scheduler timing.
+    func flushReasoningPublish() {
+        reasoningPublishTask?.cancel()
+        reasoningPublishTask = nil
+        hasScheduledReasoningPublish = false
+        publishReasoningBuffer(liveCardID: activeReasoningMessageId)
+    }
+
+    /// Commit the live reasoning segment into the settled transcript EXACTLY
+    /// ONCE at a semantic boundary: tool card, completion, error,
+    /// interruption, or a new turn. `explicitContent` supersedes the buffered
+    /// text (the completion-carried trace replaces what streamed, exactly as
+    /// it replaced the in-transcript card content before the projection
+    /// existed). Paired with the boundary's `resetReasoning*` call, this
+    /// preserves the pre-projection transcript shape: the card is in
+    /// `messages`, complete, and no stale publish can touch it afterwards.
+    private func settleReasoningSegmentIntoTranscript(explicitContent: String? = nil) {
+        reasoningPublishTask?.cancel()
+        reasoningPublishTask = nil
+        hasScheduledReasoningPublish = false
+
+        func commit(id: String, timestamp: String, content: String) {
+            guard !content.isEmpty else { return }
+            // Commit and the projection clear below must stay in ONE
+            // transaction: ChatView relies on the committed row's id equaling
+            // the live segment's id for a seamless live→settled transition —
+            // splitting them would transiently duplicate ids in the
+            // LazyVStack. The card keeps its mount timestamp; `author`
+            // reflects the profile at settle time (indistinguishable unless
+            // the profile switches mid-stream).
+            TranscriptPerf.note(.reasoningTranscriptMutation)
+            messages.append(ChatMessage(
+                id: id,
+                role: .reasoning,
+                content: content,
+                timestamp: timestamp,
+                author: activeProfile
+            ))
+            reasoningBuffer = ""
+            activeReasoningMessageId = nil
+            liveReasoningSegment = nil
+        }
+
+        if let segment = liveReasoningSegment, activeReasoningMessageId == segment.id {
+            commit(id: segment.id, timestamp: segment.timestamp, content: explicitContent ?? reasoningBuffer)
+        } else if let text = explicitContent {
+            commit(
+                id: "reasoning-\(Date().timeIntervalSince1970)",
+                timestamp: Self.localTimestamp(),
+                content: text
+            )
+        }
+    }
+
+    /// End the active reasoning SEGMENT without publishing. Used at tool
+    /// boundaries: the tool card ends the current thinking card, but the
+    /// assistant TURN continues — reasoning may resume in a fresh segment, and
+    /// reasoning already streamed this turn still counts at completion.
+    private func resetReasoningSegment() {
+        reasoningPublishTask?.cancel()
+        reasoningPublishTask = nil
+        hasScheduledReasoningPublish = false
+        reasoningBuffer = ""
+        activeReasoningMessageId = nil
+        liveReasoningSegment = nil
+    }
+
+    /// Restore the ENTIRE per-turn reasoning state machine to its initial
+    /// condition. Used when the turn or transcript itself is being replaced
+    /// (message boundaries, completion, disconnect, session switch): the old
+    /// card must not receive further updates — including from an in-flight
+    /// publish — and the next turn's completion-carried reasoning must not
+    /// look already-streamed.
+    private func resetReasoningTurn() {
+        resetReasoningSegment()
+        receivedReasoningForCurrentTurn = false
     }
 
     private func mergedReasoning(existing: String, incoming: String) -> String {
@@ -7268,19 +15596,15 @@ final class AppState: ObservableObject {
     /// Completion sometimes carries the full reasoning trace as well as the
     /// deltas. Prefer that complete value without duplicating an already
     /// streamed card; gateways that only provide completion still get a card
-    /// immediately before their final answer.
+    /// immediately before their final answer. Completion is a boundary: the
+    /// trace commits straight into the settled transcript rather than the
+    /// live projection. Reachable only when nothing streamed this turn (the
+    /// caller gates on `receivedReasoningForCurrentTurn`), so there is never
+    /// a live segment to supersede here — `explicitContent` always mounts a
+    /// fresh settled card.
     private func finalizeReasoning(_ text: String) {
         guard !text.isEmpty else { return }
-        if let id = activeReasoningMessageId,
-           let index = messages.firstIndex(where: { $0.id == id }) {
-            if text.hasPrefix(messages[index].content) {
-                messages[index].content = text
-            } else if messages[index].content != text {
-                messages[index].content = text
-            }
-            return
-        }
-        appendReasoning(text)
+        settleReasoningSegmentIntoTranscript(explicitContent: text)
     }
 
     func requestChatScrollToLatest() {
@@ -7297,14 +15621,14 @@ final class AppState: ObservableObject {
             ids.contains(session.id) || ids.contains(where: session.alternateIds.contains)
         }) else { return }
         let title = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        setActiveSessionTitle(title.isEmpty ? "New conversation" : title)
+        setActiveSessionTitle(title.isEmpty ? AppLocalization.string("New conversation") : title)
     }
 
     // MARK: - Chat support surfaces
 
     func openWorkspace() async {
         guard !runtime.cwd.isEmpty else {
-            errorMessage = "Workspace unavailable: Hermes has not reported a working directory for this session yet."
+            errorMessage = AppLocalization.string("Workspace unavailable: Hermes has not reported a working directory for this session yet.")
             return
         }
         workspaceRoot = runtime.cwd
@@ -7348,7 +15672,7 @@ final class AppState: ObservableObject {
         defer { workspaceFileLoading = false }
         do {
             guard let path = DashboardPath.encodedQueryComponent(entry.path) else {
-                throw DashboardTicketBridgeError.requestFailed("The workspace path could not be encoded.")
+                throw DashboardTicketBridgeError.requestFailed(AppLocalization.string("The workspace path could not be encoded."))
             }
             let result = try await dashboardTicketBridge.requestJSON(
                 path: DashboardPath.withProfile("/api/fs/read-text?path=\(path)", profile: profile)
@@ -7372,7 +15696,7 @@ final class AppState: ObservableObject {
         let profile = activeProfile
         do {
             guard let path = DashboardPath.encodedQueryComponent(entry.path) else {
-                throw DashboardTicketBridgeError.requestFailed("The workspace path could not be encoded.")
+                throw DashboardTicketBridgeError.requestFailed(AppLocalization.string("The workspace path could not be encoded."))
             }
             let result = try await dashboardTicketBridge.requestJSON(
                 path: DashboardPath.withProfile("/api/fs/read-data-url?path=\(path)", profile: profile),
@@ -7381,7 +15705,7 @@ final class AppState: ObservableObject {
             guard profile == activeProfile else { return nil }
             guard let dataURL = result["dataUrl"] as? String,
                   let data = DataURLLimits.decodeBase64DataURL(dataURL) else {
-                throw DashboardTicketBridgeError.requestFailed("The gateway returned an invalid file payload.")
+                throw DashboardTicketBridgeError.requestFailed(AppLocalization.string("The gateway returned an invalid file payload."))
             }
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Hermes-Conduit-Downloads", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -7424,7 +15748,7 @@ final class AppState: ObservableObject {
         gatewayDiagnosticsLoading = true
         defer { gatewayDiagnosticsLoading = false }
         guard let dashboardTicketBridge else {
-            gatewayDiagnostics = GatewayDiagnostics(gatewayRunning: isConnected, gatewayState: nil, version: nil, pid: nil, connectors: [], logs: [], error: "Dashboard diagnostics are still loading.")
+            gatewayDiagnostics = GatewayDiagnostics(gatewayRunning: isConnected, gatewayState: nil, version: nil, pid: nil, connectors: [], logs: [], error: AppLocalization.string("Dashboard diagnostics are still loading."))
             return
         }
         async let statusResult = dashboardTicketBridge.requestJSON(path: "/api/status")
@@ -7450,7 +15774,7 @@ final class AppState: ObservableObject {
             pid: status?["gateway_pid"] as? Int,
             connectors: connectors,
             logs: (logs?["lines"] as? [Any] ?? []).map { String(describing: $0) },
-            error: status == nil ? "Could not refresh dashboard status." : nil
+            error: status == nil ? AppLocalization.string("Could not refresh dashboard status.") : nil
         )
     }
 
@@ -7470,10 +15794,76 @@ final class AppState: ObservableObject {
 
     private func setRunning(_ running: Bool) {
         guard turnState != .unsupportedGateway else { return }
+        // Every call is authoritative live evidence, even a re-affirmation:
+        // the ambiguity-recovery guard compares revisions, not values.
+        turnLifecycleEvidence = TurnLifecycleEvidence(
+            revision: turnLifecycleEvidence.revision &+ 1,
+            running: running
+        )
         if running {
             clearPendingDecisionRestorationGuard()
+        } else {
+            // The turn settled. A locally-owned turn whose persisted
+            // boundary was never positively observed leaves ordering debt:
+            // Hermes persisted its user row at turn start, so the next
+            // locally-owned turn must anchor AFTER it.
+            recordLocalOrderingDebtForSettledTurn()
+            locallyOwnedInFlightTurn = nil
         }
         turnState = running ? .running : .idle
+    }
+
+    /// Records the minimum unresolved persisted-ordering obligation when a
+    /// locally-owned turn settles. An unseen boundary owes one canonical user
+    /// turn. A boundary observed only while live owes a zero-boundary settled
+    /// tail read, because later assistant/tool rows may still have persisted.
+    /// Debt counts accumulate when several locally-owned turns settle
+    /// without an intervening read; authoritative adoption (a reconcile
+    /// replacing the transcript) clears the debt outright. Identity
+    /// rotation between turns replaces the slot — an undercount, which
+    /// degrades to a spurious-but-safe authoritative reconcile, never to a
+    /// silent overshoot.
+    private func recordLocalOrderingDebtForSettledTurn() {
+        guard let marker = locallyOwnedInFlightTurn else { return }
+        if !marker.persistedBoundaryObserved {
+            recordLocalOrderingDebt(
+                sessionIDs: marker.sessionIDs,
+                baseline: marker.preSubmitOrderingBaseline
+            )
+        } else {
+            recordLocalOrderingDebt(
+                sessionIDs: marker.sessionIDs,
+                baseline: marker.preSubmitOrderingBaseline,
+                expectedUserTurnIncrement: 0,
+                allowTrailingRowsWithoutNewUserBoundary: true
+            )
+        }
+    }
+
+    /// Debt-accounting core. Debt is only meaningful when the ordering
+    /// baseline was PROVABLE: an unknown baseline (never hydrated, legacy
+    /// gateway) has no ordering metadata to owe — the next turn's
+    /// foreground classifies inconclusive and takes the conservative
+    /// attach, exactly as before ordering evidence existed.
+    private func recordLocalOrderingDebt(
+        sessionIDs: Set<String>,
+        baseline: PersistedOrderingBaseline,
+        expectedUserTurnIncrement: Int = 1,
+        allowTrailingRowsWithoutNewUserBoundary: Bool = false
+    ) {
+        guard !baseline.isUnknown else { return }
+        if pendingLocalOrderingDebt?.sessionIDs == sessionIDs {
+            pendingLocalOrderingDebt?.expectedUserTurnCount += expectedUserTurnIncrement
+            if allowTrailingRowsWithoutNewUserBoundary {
+                pendingLocalOrderingDebt?.allowTrailingRowsWithoutNewUserBoundary = true
+            }
+        } else {
+            pendingLocalOrderingDebt = PendingLocalOrderingDebt(
+                sessionIDs: sessionIDs,
+                expectedUserTurnCount: expectedUserTurnIncrement,
+                allowTrailingRowsWithoutNewUserBoundary: allowTrailingRowsWithoutNewUserBoundary
+            )
+        }
     }
 
     private func applyResponseHapticSignal(_ signal: ResponseHapticPolicy.Signal) {
@@ -7548,13 +15938,27 @@ final class AppState: ObservableObject {
         responseHaptics.invalidateConclusion()
     }
 
-    private func performResponseHapticEffects(
+    /// While a voice session may hold the audio session — Voice Conversation
+    /// (listening, thinking, speaking, muted, transcribing, including a
+    /// paused mic and the arming window) or a provider test — the custom
+    /// Core Haptics response pattern is suppressed: Core Haptics must never
+    /// contend with voice capture or reactivate the coordinator-owned
+    /// session (issue #140). Response feedback falls back to the UIKit
+    /// pattern in that state.
+    var responseHapticsMayUseCoreHaptics: Bool {
+        !voiceConversationController.hasLiveVoiceSession
+    }
+
+    /// Internal for testing: the response-haptic forwarding seam is the
+    /// exact line that must degrade Core Haptics while a voice session is
+    /// live, so tests drive it end to end.
+    func performResponseHapticEffects(
         _ effects: [ResponseHapticState.Effect]
     ) {
         for effect in effects {
             switch effect {
             case .responseStarted:
-                Haptics.responseStarted()
+                Haptics.responseStarted(coreHapticsAllowed: responseHapticsMayUseCoreHaptics)
             case .toolStarted:
                 Haptics.toolStarted()
             case .responseConcluded:
@@ -7574,9 +15978,10 @@ final class AppState: ObservableObject {
         await submitComposer(text: transcript, attachments: [])
     }
 
-    /// Stops the authoritative Hermes turn when a spoken stop command or
-    /// barge-in wins the race with model generation.
-    func interruptForVoice() async {
+    /// Stops the authoritative Hermes turn when a spoken stop command,
+    /// barge-in, or Voice orphan cancellation wins the race with model
+    /// generation. Reports whether the cancellation succeeded.
+    func interruptForVoice() async -> Bool {
         await cancelCurrent()
     }
 
@@ -7597,13 +16002,13 @@ final class AppState: ObservableObject {
             case .permissionDenied:
                 return "Allow Speech Recognition in iOS Settings to use on-device transcription."
             case .unsupported(let localeIdentifier):
-                return "On-device Apple speech recognition is unavailable for \(localeIdentifier)."
+                return AppLocalization.string("On-device Apple speech recognition is unavailable for \(localeIdentifier).")
             case .ready, .permissionRequired:
                 break
             }
         }
         if voiceTranscriptionMode == .hermes, !voiceCapabilitySnapshot.supportsTranscription {
-            return voiceCapabilitySnapshot.unavailableReason ?? "This Hermes profile has no ready speech-to-text provider."
+            return voiceCapabilitySnapshot.unavailableReason ?? AppLocalization.string("This Hermes profile has no ready speech-to-text provider.")
         }
         if !voiceCapabilitySnapshot.supportsSpeech {
             return "This Hermes profile has no ready text-to-speech provider."
@@ -7613,25 +16018,85 @@ final class AppState: ObservableObject {
 
     var canStartVoiceConversation: Bool { voiceUnavailableReason == nil }
 
+    /// TTS-only availability for read aloud: a connected gateway with voice
+    /// enabled and a ready speech provider. Deliberately does not require
+    /// transcription, mic permission, or Apple Speech — a profile with TTS
+    /// but no STT must still be able to read responses aloud.
+    var readAloudUnavailableReason: String? {
+        // Opening a stream needs the dashboard bridge; while it is absent
+        // (mid sign-out, before the connection lands) disable the button
+        // instead of failing at tap time. Mirrors makeVoiceGateway().
+        guard dashboardTicketBridge != nil, connection != nil else {
+            return AppLocalization.string("Read aloud needs a connected Hermes gateway.")
+        }
+        return MessageReadAloudController.unavailableReason(
+            isConnected: isConnected,
+            isVoiceEnabled: isVoiceEnabled,
+            snapshot: voiceCapabilitySnapshot
+        )
+    }
+
+    /// Chat bubble entry point for manual read aloud. Toggling the active
+    /// message stops it without touching the gateway; starting a different
+    /// message takes over from whatever is playing.
+    func toggleReadAloud(message: ChatMessage) {
+        if messageReadAloudController.isActiveMessage(message.id) {
+            messageReadAloudController.stop()
+            return
+        }
+        guard !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if let reason = readAloudUnavailableReason {
+            errorMessage = reason
+            return
+        }
+        // The capability refresh keeps the gateway current; this covers the
+        // gap before the next refresh has run — including right after a
+        // profile switch or re-login, when a stale gateway may still be set.
+        if !readAloudGatewayIsCurrent {
+            assignReadAloudGateway()
+        }
+        // Mutual exclusion (reverse of openVoiceConversation / runVoiceTTSTest):
+        // the voice conversation and read aloud each own their own playback
+        // instance, so a speech test or conversation still speaking must stop
+        // before the manual stream opens — otherwise both engines play at once.
+        voiceConversationController.stop()
+        messageReadAloudController.toggle(messageID: message.id, content: message.content)
+    }
+
     func refreshVoiceCapabilities() async {
         let profile = activeProfile
         guard isConnected, let bridge = dashboardTicketBridge else {
             voiceCapabilitySnapshot = .unavailable
             isVoiceEnabled = false
             voiceConversationController.setGateway(nil)
+            refreshReadAloudGateway()
             return
         }
         installVoiceAssistantObserverIfNeeded()
         isVoiceEnabled = defaults.bool(forKey: voiceEnabledPreferenceKey(profile: profile))
         appleSpeechAvailability = AppleOnDeviceSpeechTranscriber.currentAvailability()
-        let service = HermesVoiceConfigurationService(bridge: bridge, profile: profile)
+        let service = HermesVoiceConfigurationService(
+            requester: voiceCapabilityRequesterForTesting ?? bridge,
+            profile: profile
+        )
         await service.reload()
         guard profile == activeProfile, bridge === dashboardTicketBridge else { return }
         voiceCapabilitySnapshot = service.snapshot.capability
-        let preferences = loadVoiceProfilePreferences(profile: profile)
+        var preferences = loadVoiceProfilePreferences(profile: profile)
+        // PR #159 authority, enforced centrally: while the controller owns a
+        // live Voice session for THIS profile, its live mute is
+        // authoritative over the persisted blob. Ownership is keyed on the
+        // profile the session was opened for, so a refresh for another
+        // profile never carries a live mute across ownership.
+        if voiceConversationController.hasLiveVoiceSession,
+           voiceControllerSessionProfile == profile {
+            preferences.outputMuted = voiceConversationController.isOutputMuted
+        }
         voiceTranscriptionMode = preferences.resolvedTranscriptionMode
+        continuousConversationEnabled = preferences.continuousConversation
         voiceConversationController.setProfilePreferences(preferences)
         refreshVoiceControllerGateway()
+        refreshReadAloudGateway()
     }
 
     @discardableResult
@@ -7640,8 +16105,12 @@ final class AppState: ObservableObject {
         defaults.set(enabled, forKey: voiceEnabledPreferenceKey(profile: activeProfile))
         isVoiceEnabled = enabled
         refreshVoiceControllerGateway()
+        refreshReadAloudGateway()
         if !enabled {
             voiceConversationController.stop()
+            suspendedVoiceConversation = nil
+            voiceSheetShouldAutoListen = false
+            voiceControllerSessionProfile = nil
             showVoiceSheet = false
         }
         return true
@@ -7653,12 +16122,12 @@ final class AppState: ObservableObject {
         if mode == .appleOnDevice, !appleSpeechAvailability.canAttemptRecognition {
             switch appleSpeechAvailability {
             case .permissionDenied:
-                errorMessage = "Speech Recognition permission was denied. Please enable it in Settings > Conduit > Speech Recognition."
+                errorMessage = AppLocalization.string("Speech Recognition permission was denied. Please enable it in Settings > Conduit > Speech Recognition.")
             case .unsupported(let localeIdentifier):
                 let localeName = Locale.current.localizedString(forIdentifier: localeIdentifier) ?? localeIdentifier
-                errorMessage = "On-device speech recognition is not available for \(localeName)."
+                errorMessage = AppLocalization.string("On-device speech recognition is not available for \(localeName).")
             default:
-                errorMessage = "On-device speech recognition is unavailable."
+                errorMessage = AppLocalization.string("On-device speech recognition is unavailable.")
             }
             return false
         }
@@ -7670,79 +16139,267 @@ final class AppState: ObservableObject {
                 return false
             }
         }
-        var preferences = loadVoiceProfilePreferences(profile: activeProfile)
-        preferences.transcriptionMode = mode
-        saveVoiceProfilePreferences(preferences, profile: activeProfile)
+        updateActiveProfileVoicePreferences { $0.transcriptionMode = mode }
         voiceTranscriptionMode = mode
-        voiceConversationController.setProfilePreferences(preferences)
         refreshVoiceControllerGateway()
+        refreshReadAloudGateway()
         return true
+    }
+
+    @discardableResult
+    func setContinuousConversation(_ enabled: Bool) -> Bool {
+        guard isConnected else { return false }
+        updateActiveProfileVoicePreferences { $0.continuousConversation = enabled }
+        continuousConversationEnabled = enabled
+        return true
+    }
+
+    /// Saves an edited spoken Stop phrase list for the active profile and
+    /// reapplies it to the live controller. Goes through the shared Voice
+    /// preference mutation path so live mute is preserved exactly per
+    /// `hasLiveVoiceSession` authority (PR #159 semantics). Entries are
+    /// canonicalized (trimmed, de-duplicated, blanks dropped) at this
+    /// boundary — the single write authority for phrase lists.
+    func setSpokenStopPhrases(_ phrases: [String]) {
+        // Same connected-state policy as `setContinuousConversation`: the
+        // preference key is gateway-qualified, and a write while
+        // disconnected would land in the orphaned "disconnected" namespace.
+        guard isConnected else { return }
+        updateActiveProfileVoicePreferences {
+            $0.spokenStopPhrases = VoiceSpokenCommands.canonicalizedPhraseList(phrases)
+        }
+    }
+
+    /// Saves an edited spoken End Conversation phrase list. Same contract as
+    /// `setSpokenStopPhrases`; an intentionally emptied list persists as
+    /// empty and disables that spoken-command category.
+    func setSpokenEndConversationPhrases(_ phrases: [String]) {
+        guard isConnected else { return }
+        updateActiveProfileVoicePreferences {
+            $0.spokenEndConversationPhrases = VoiceSpokenCommands.canonicalizedPhraseList(phrases)
+        }
+    }
+
+    /// Loads the active profile's preference blob, applies `mutate`, and
+    /// reapplies it to the live controller.
+    ///
+    /// Live `isOutputMuted` is authoritative only while a Voice session is
+    /// actually armed (`hasLiveVoiceSession`). Otherwise the controller may
+    /// still hold the previous profile's mute until
+    /// `refreshVoiceCapabilities()` resyncs, so the loaded profile's
+    /// persisted `outputMuted` is left unchanged.
+    private func updateActiveProfileVoicePreferences(
+        _ mutate: (inout VoiceProfilePreferences) -> Void
+    ) {
+        var preferences = loadVoiceProfilePreferences(profile: activeProfile)
+        mutate(&preferences)
+        if voiceConversationController.hasLiveVoiceSession {
+            preferences.outputMuted = voiceConversationController.isOutputMuted
+        }
+        saveVoiceProfilePreferences(preferences, profile: activeProfile)
+        voiceConversationController.setProfilePreferences(preferences)
     }
 
     @discardableResult
     func openVoiceConversation(_ intent: PendingVoiceIntent) async -> Bool {
         guard isConnected else { return false }
+        // Mutual exclusion: the voice conversation owns playback while its
+        // sheet is open, so a read aloud started before must not continue.
+        messageReadAloudController.stop()
         if showVoiceSheet { closeVoiceConversation() }
-        if let rawProfile = intent.profile {
+        let outcome = await prepareVoiceConversation(
+            profile: intent.profile,
+            startsFreshConversation: intent.startsFreshConversation
+        )
+        switch outcome {
+        case .deferred:
+            return false
+        case .failed(let message):
+            // A rejected attach never presents the Voice sheet: surface the
+            // failure through the app-level error path instead.
+            errorMessage = message
+            return true
+        case .handled:
+            break
+        }
+        // Phone presentation: the prepared conversation is shown in the
+        // Voice sheet. CarPlay attaches through prepareVoiceConversation /
+        // attachToLiveVoiceConversation instead and never mutates
+        // these presentation flags.
+        showSidebar = false
+        voiceSheetShouldAutoListen = true
+        showVoiceSheet = true
+        // The sheet is now the presenting Voice surface: re-assert the gate
+        // before the sheet's auto-listen runs (with CarPlay absent the gate
+        // was false while the sheet was closed).
+        reassertVoiceSurfaceGate()
+        return true
+    }
+
+    /// Outcome of the logical Voice conversation preparation. `.deferred`
+    /// means "not connected yet": the phone router keeps the request pending,
+    /// and CarPlay settles into its error state. `.handled` means the logical
+    /// Voice preparation SUCCEEDED — an existing live conversation was
+    /// attached, or a new/continued conversation was armed. `.failed(String)`
+    /// means the preparation was REJECTED without arming a usable Voice
+    /// conversation (capability unavailable, no session, no gateway, session
+    /// creation failed, turn conflict): the message must be surfaced and NO
+    /// Voice presentation attached.
+    enum VoiceConversationPrepareOutcome: Equatable {
+        case deferred
+        case handled
+        case failed(String)
+    }
+
+    /// Prepare/acquire the LOGICAL Voice conversation — capability refresh,
+    /// profile selection, session continuation/creation, Voice gateway
+    /// installation — with no phone presentation attached. Split out of
+    /// `openVoiceConversation` so the CarPlay surface can open Voice through
+    /// the exact same checks; the phone flow additionally presents the sheet.
+    ///
+    /// If a Voice conversation is already live, this re-arms it in place
+    /// (fresh gateway on the same session) without clearing the transcript.
+    func prepareVoiceConversation(
+        profile: String?,
+        startsFreshConversation: Bool
+    ) async -> VoiceConversationPrepareOutcome {
+        if let rawProfile = profile {
             let requestedProfile = rawProfile.trimmingCharacters(in: .whitespacesAndNewlines)
             if !requestedProfile.isEmpty, requestedProfile != activeProfile {
                 await switchProfile(to: requestedProfile)
             }
             guard requestedProfile.isEmpty || requestedProfile == activeProfile else {
-                errorMessage = "Conduit could not open the requested voice profile."
-                return true
+                errorMessage = AppLocalization.string("Conduit could not open the requested voice profile.")
+                return .failed(AppLocalization.string("Conduit could not open the requested voice profile."))
             }
         }
-        guard isConnected else { return false }
+        guard isConnected else { return .deferred }
+        if voiceConversationController.hasLiveVoiceSession, !startsFreshConversation {
+            // Another Voice presentation is attaching to the existing logical
+            // conversation (the sheet presentation is the caller's job): no
+            // beginVoiceTurn, no transcript reset, no session churn, no
+            // in-flight-turn cancellation. This intentionally precedes the
+            // generic turn-running rejection — a running turn owned by the
+            // shared Voice session is the attachment, not a conflict.
+            guard attachToLiveVoiceConversation() else {
+                return .failed(voiceUnavailableReason
+                    ?? AppLocalization.string("Hermes could not reattach the live voice conversation."))
+            }
+            return .handled
+        }
         if turnState.isRunning {
-            guard intent.startsFreshConversation else {
-                errorMessage = "Stop the current response before starting voice in this conversation."
-                return true
+            guard startsFreshConversation else {
+                errorMessage = AppLocalization.string("Stop the current response before starting voice in this conversation.")
+                return .failed(AppLocalization.string("Stop the current response before starting voice in this conversation."))
             }
             await cancelCurrent()
         }
         await refreshVoiceCapabilities()
         guard canStartVoiceConversation else {
             errorMessage = voiceUnavailableReason
-            return true
+            return .failed(voiceUnavailableReason ?? AppLocalization.string("Voice is unavailable."))
         }
         let previousSessionID = activeSessionId
-        if intent.startsFreshConversation || activeSessionId == nil {
+        if startsFreshConversation || activeSessionId == nil {
             await createNewSession()
-            if intent.startsFreshConversation, activeSessionId == previousSessionID {
-                errorMessage = "Hermes could not create the requested voice conversation."
-                return true
+            if startsFreshConversation, activeSessionId == previousSessionID {
+                errorMessage = AppLocalization.string("Hermes could not create the requested voice conversation.")
+                return .failed(AppLocalization.string("Hermes could not create the requested voice conversation."))
             }
         }
         guard let sessionID = activeSessionId, let gateway = makeVoiceGateway() else {
-            errorMessage = "Hermes could not prepare a voice conversation."
-            return true
+            errorMessage = AppLocalization.string("Hermes could not prepare a voice conversation.")
+            return .failed(AppLocalization.string("Hermes could not prepare a voice conversation."))
         }
+        // A fresh user-initiated open supersedes any stale suspension (e.g.
+        // a descriptor retained across sign-out, or one whose reconciliation
+        // task is still in flight): it must never fail-close this new
+        // session on a later scene cycle.
+        suspendedVoiceConversation = nil
         voiceConversationController.setGateway(gateway)
         voiceConversationController.beginVoiceTurn(sessionID: sessionID)
-        showSidebar = false
-        showVoiceSheet = true
+        voiceControllerSessionProfile = activeProfile
+        return .handled
+    }
+
+    /// Attach the CALLING presentation (phone Voice sheet, CarPlay surface)
+    /// to an ALREADY-LIVE logical Voice conversation. Never restarts a turn,
+    /// never clears the transcript, never creates a session, never cancels an
+    /// in-flight turn: it re-asserts the presentation-surface gate (the phone
+    /// may be locked with a gate left false by an earlier CarPlay-only
+    /// disconnect) and re-arms the gateway reference when needed. The
+    /// restoration descriptor is retired only AFTER the attach is known to
+    /// succeed, so a failed re-arm leaves the phone-restoration path intact.
+    @discardableResult
+    func attachToLiveVoiceConversation() -> Bool {
+        guard voiceConversationController.hasLiveVoiceSession else { return false }
+        voiceConversationController.setForegroundActive(hasActiveVoiceSurface)
+        if !voiceConversationController.isGatewayAttached {
+            refreshVoiceControllerGateway()
+        }
+        guard voiceConversationController.isGatewayAttached else { return false }
+        suspendedVoiceConversation = nil
         return true
     }
 
+    /// CarPlay surface presented. Re-asserts the Voice gate: the phone scene
+    /// may be inactive with a gate left false by an earlier CarPlay-only
+    /// disconnect (no scene-phase event fires while the phone is locked, so
+    /// nothing else heals it), and the driver's next Listen must be able to
+    /// re-arm capture. No-op while the phone scene is active.
+    func handleCarPlayVoiceSurfaceActivated() {
+        reassertVoiceSurfaceGate()
+    }
+
+    /// Called by the CarPlay coordinator when the CarPlay Voice surface goes
+    /// away. While the phone scene is active, the phone still presents Voice
+    /// and nothing is touched. With no active Voice surface left, this is
+    /// exactly the PR #161 background boundary: the sheet's presentation
+    /// intent (if any) survives through the suspended descriptor, and a
+    /// CarPlay-only conversation is released — never treated as spoken
+    /// Goodbye, which is Close.
+    func handleCarPlayVoiceSurfaceRemoved() {
+        guard !hasActiveVoiceSurface else { return }
+        suspendVoiceConversationForBackground()
+    }
+
     func closeVoiceConversation() {
-        var preferences = loadVoiceProfilePreferences(profile: activeProfile)
-        preferences.outputMuted = voiceConversationController.isOutputMuted
-        saveVoiceProfilePreferences(preferences, profile: activeProfile)
+        // Explicit Close (button, swipe, spoken End Conversation) beats any
+        // lifecycle suspension: the conversation is not restorable.
+        suspendedVoiceConversation = nil
+        voiceSheetShouldAutoListen = false
+        // Live-mute persistence obeys the PR #159 authority rule: the
+        // controller's mute wins only for the profile that owns the session.
+        // A same-profile close that arrives after the controller was
+        // already torn down (e.g. audio interruption) still persists; a
+        // close arriving after a profile flip (the sheet's deferred
+        // onDismiss) persists nothing.
+        if voiceConversationController.hasLiveVoiceSession
+            || voiceControllerSessionProfile == activeProfile {
+            var preferences = loadVoiceProfilePreferences(profile: activeProfile)
+            preferences.outputMuted = voiceConversationController.isOutputMuted
+            saveVoiceProfilePreferences(preferences, profile: activeProfile)
+        }
         voiceConversationController.endVoiceSession()
+        voiceControllerSessionProfile = nil
         showVoiceSheet = false
     }
 
     func runVoiceASRTest() async -> VoiceProviderTestResult {
+        // Ownership first: a playing read aloud must release its standalone
+        // lease before anything else in this flow — the capability refresh
+        // and the capture test itself — can claim conversation-capture
+        // ownership or await the network.
+        messageReadAloudController.stop()
         await refreshVoiceCapabilities()
         guard isVoiceEnabled else {
-            return .failure("Enable voice for this profile before running a speech-to-text test.")
+            return .failure(AppLocalization.string("Enable voice for this profile before running a speech-to-text test."))
         }
         guard selectedTranscriptionIsAvailable else {
-            return .failure(voiceUnavailableReason ?? "The selected speech-to-text option is unavailable.")
+            return .failure(voiceUnavailableReason ?? AppLocalization.string("The selected speech-to-text option is unavailable."))
         }
         guard let gateway = makeVoiceGateway() else {
-            return .failure("Conduit could not connect this test to the selected profile.")
+            return .failure(AppLocalization.string("Conduit could not connect this test to the selected profile."))
         }
         voiceConversationController.setGateway(gateway)
         let result = await voiceConversationController.runTranscriptionTest()
@@ -7754,17 +16411,23 @@ final class AppState: ObservableObject {
     func runVoiceTTSTest() async -> VoiceProviderTestResult {
         await refreshVoiceCapabilities()
         guard isVoiceEnabled else {
-            return .failure("Enable voice for this profile before running a speech playback test.")
+            return .failure(AppLocalization.string("Enable voice for this profile before running a speech playback test."))
         }
         guard voiceCapabilitySnapshot.supportsSpeech else {
-            return .failure(voiceUnavailableReason ?? "The selected assistant speech provider is unavailable.")
+            return .failure(voiceUnavailableReason ?? AppLocalization.string("The selected assistant speech provider is unavailable."))
         }
         guard let gateway = makeVoiceGateway() else {
-            return .failure("Conduit could not connect this test to the selected profile.")
+            return .failure(AppLocalization.string("Conduit could not connect this test to the selected profile."))
         }
+        // The speech test speaks through the voice controller's own playback
+        // instance (the same AVSpeech infrastructure read aloud uses, but a
+        // separate instance), so the test and a still-playing message would
+        // otherwise both produce audio. AppState enforces mutual exclusion in
+        // both directions; toggleReadAloud stops this controller in turn.
+        messageReadAloudController.stop()
         voiceConversationController.setGateway(gateway)
         return await voiceConversationController.runSpeechTest(
-            text: "Conduit voice is ready for this profile."
+            text: AppLocalization.string("Conduit voice is ready for this profile.")
         )
     }
 
@@ -7791,12 +16454,75 @@ final class AppState: ObservableObject {
         )
     }
 
+    /// Keeps the read aloud gateway in step with capability refreshes without
+    /// churning a live instance: swapping the gateway mid-playback would stop
+    /// the message. A kept gateway must still match the active profile AND
+    /// the live dashboard bridge — a gateway built against an invalidated or
+    /// rotated bridge (re-login, profile switch) is rebuilt instead.
+    private var readAloudGatewayIsCurrent: Bool {
+        guard let gateway = messageReadAloudController.gateway,
+              let bridge = dashboardTicketBridge else { return false }
+        return gateway.profile == activeProfile && readAloudGatewayBridge === bridge
+    }
+
+    private func assignReadAloudGateway() {
+        messageReadAloudController.setGateway(makeVoiceGateway())
+        readAloudGatewayBridge = dashboardTicketBridge
+    }
+
+    private func refreshReadAloudGateway() {
+        if readAloudUnavailableReason != nil {
+            messageReadAloudController.setGateway(nil)
+            readAloudGatewayBridge = nil
+            return
+        }
+        guard !readAloudGatewayIsCurrent else { return }
+        assignReadAloudGateway()
+    }
+
+    /// Test-only: installs the post-connect voice capability state (bridge,
+    /// snapshot, preference) without a dashboard round trip, so the read
+    /// aloud / voice conversation mutual exclusion can be exercised with
+    /// mock controllers. `readAloudGatewayBridge` is set to the same bridge
+    /// so a mock read aloud gateway installed on the controller counts as
+    /// current and is not replaced by a real one at tap time. Pass
+    /// `transcriptionMode` / `appleSpeechAvailability` to pin the route the
+    /// capability checks consult; nil leaves the current value.
+    func installVoiceCapabilityStateForTesting(
+        bridge: DashboardTicketBridge,
+        snapshot: VoiceCapabilitySnapshot,
+        isVoiceEnabled: Bool,
+        transcriptionMode: VoiceTranscriptionMode? = nil,
+        appleSpeechAvailability: AppleSpeechRecognitionAvailability? = nil
+    ) {
+        dashboardTicketBridge = bridge
+        readAloudGatewayBridge = bridge
+        voiceCapabilitySnapshot = snapshot
+        self.isVoiceEnabled = isVoiceEnabled
+        if let transcriptionMode { voiceTranscriptionMode = transcriptionMode }
+        if let appleSpeechAvailability { self.appleSpeechAvailability = appleSpeechAvailability }
+    }
+
+    /// Test-only: installs a dashboard bridge (and nothing else) so profile
+    /// discovery can exercise its bridge-identity commit gate — modeled
+    /// connection swaps — without the voice capability snapshot plumbing.
+    func installDashboardTicketBridgeForTesting(_ bridge: DashboardTicketBridge) {
+        dashboardTicketBridge = bridge
+    }
+
     private func loadVoiceProfilePreferences(profile: String) -> VoiceProfilePreferences {
         guard let data = defaults.data(forKey: voicePreferencesKey(profile: profile)),
               let preferences = try? JSONDecoder().decode(VoiceProfilePreferences.self, from: data) else {
             return VoiceProfilePreferences()
         }
         return preferences
+    }
+
+    /// The active profile's persisted Voice preferences, for display surfaces
+    /// (settings editors seed from this). Mutations go through the dedicated
+    /// setters, never by writing this value back.
+    var activeProfileVoicePreferences: VoiceProfilePreferences {
+        loadVoiceProfilePreferences(profile: activeProfile)
     }
 
     private func saveVoiceProfilePreferences(_ preferences: VoiceProfilePreferences, profile: String) {
@@ -7862,6 +16588,9 @@ final class AppState: ObservableObject {
         content: String?,
         reasoning: String?
     ) {
+        // messageComplete is a semantic boundary: the thinking card must show
+        // its full buffered reasoning immediately, not one cadence later.
+        settleReasoningSegmentIntoTranscript()
         streamingCompletionTask?.cancel()
         streamingPublishTask?.cancel()
         streamingPublishTask = nil
@@ -7937,6 +16666,9 @@ final class AppState: ObservableObject {
         finalContent: String,
         reasoning: String?
     ) {
+        // Reasoning that raced the drain window must not be discarded when
+        // the pending completion finalizes.
+        settleReasoningSegmentIntoTranscript()
         removeAllPartials()
         // Some gateways repeat the full trace in completion after already
         // emitting reasoning events. Use it only when streaming supplied no
@@ -7947,15 +16679,29 @@ final class AppState: ObservableObject {
 
         let firstTurnUserMessage = messages.first(where: { $0.role == .user })?.content
         let isFirstUserTurn = messages.filter { $0.role == .user }.count == 1
-        let resolvedMessageID = messageId
+        let trimmedMessageID = messageId
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .flatMap { $0.isEmpty ? nil : $0 }
+        let resolvedMessageID = trimmedMessageID
             ?? "assistant-\(Date().timeIntervalSince1970)"
         let systemNotice = MessageNormalizer.systemNoticeText(fromText: finalContent)
         let displayContent = systemNotice ?? finalContent
         let displayRole: MessageRole = systemNotice == nil ? .assistant : .system
-        if !displayContent.isEmpty,
-           (messages.last?.role != displayRole || messages.last?.content != displayContent) {
+        // In-place finalization only for GATEWAY-SUPPLIED ids: a cross-surface
+        // persisted advancement can merge the persisted row before the live
+        // completion arrives, and the completion must finalize that row in
+        // place instead of appending a twin. The timestamp fallback id is
+        // minted locally per completion — matching on it could overwrite an
+        // unrelated same-second completion — so it keeps the historical
+        // append semantics.
+        if let trimmedMessageID,
+           let existingIndex = messages.lastIndex(where: { $0.id == trimmedMessageID }) {
+            if !displayContent.isEmpty {
+                messages[existingIndex].content = displayContent
+                messages[existingIndex].rawContent = systemNotice == nil ? nil : finalContent
+            }
+        } else if !displayContent.isEmpty,
+                  (messages.last?.role != displayRole || messages.last?.content != displayContent) {
             messages.append(ChatMessage(
                 id: resolvedMessageID,
                 role: displayRole,
@@ -7968,8 +16714,7 @@ final class AppState: ObservableObject {
 
         clearStreamingText()
         activeAssistantMessageId = nil
-        activeReasoningMessageId = nil
-        receivedReasoningForCurrentTurn = false
+        resetReasoningTurn()
         setRunning(false)
         // Cancel any pending coalesced flush and write immediately — the
         // turn is complete so all messages are in their final state.
@@ -8079,7 +16824,6 @@ enum KeychainHelper {
     private static let credentialsKey = "hermes-conduit.credentials.v1"
     private static let cloudflareAccessKey = "hermes-conduit.cloudflare-access.v1"
     private static let pushRegistrationKey = "hermes-conduit.push-registration.v1"
-    private static let roomHubCredentialKey = "hermes-conduit.room-hub-credential.v1"
     private static let service = "com.milim.conduit"
 
     static func saveConnection(_ conn: HermesConnection) {
@@ -8135,6 +16879,14 @@ enum KeychainHelper {
         delete(account: cloudflareAccessKey)
     }
 
+    /// The raw legacy global Cloudflare record (origin included), read only
+    /// by the legacy migration.
+    static func loadCloudflareKeychainRecord() -> CloudflareAccessKeychainRecord? {
+        guard let data = load(account: cloudflareAccessKey),
+              let stored = try? JSONDecoder().decode(CloudflareAccessKeychainRecord.self, from: data) else { return nil }
+        return stored
+    }
+
     static func savePushRegistration(_ data: Data) {
         save(data, account: pushRegistrationKey)
     }
@@ -8147,33 +16899,126 @@ enum KeychainHelper {
         delete(account: pushRegistrationKey)
     }
 
-    // MARK: Room hub credential (ANVIL Room read seam)
+    // MARK: Dashboard registry (multi-server, #148)
 
-    // The Hub bearer credential is a dashboard-scoped record — born
-    // multi-dashboard, so there is deliberately no legacy global variant.
-    // Two dashboards can point at two Hub deployments and never share the
-    // token; clearing one dashboard's record cannot reach the other's.
+    static let dashboardRegistryAccount = "hermes-conduit.dashboard-registry.v1"
 
-    private static func roomScopedAccount(_ base: String, dashboardID: UUID) -> String {
+    static func saveDashboardRegistryData(_ data: Data) {
+        save(data, account: dashboardRegistryAccount)
+    }
+
+    static func loadDashboardRegistryData() -> Data? {
+        load(account: dashboardRegistryAccount)
+    }
+
+    /// Removes the registry record. Used by tests to reset cross-test
+    /// Keychain state; production never deletes the registry (migration
+    /// idempotency depends on its presence).
+    static func clearDashboardRegistry() {
+        delete(account: dashboardRegistryAccount)
+    }
+
+    // MARK: Dashboard-scoped secure records (multi-server, #148)
+    //
+    // Every reusable authentication record gains a dashboard-scoped variant
+    // whose Keychain account embeds the dashboard UUID. Scoped accounts can
+    // never collide with the legacy global accounts (the UUID suffix is
+    // globally unique), so the load-time legacy-query fallback below cannot
+    // cross dashboards — and only the migration path intentionally reads the
+    // legacy layout (see LegacyDashboardReader).
+
+    static func scopedAccount(_ base: String, dashboardID: UUID) -> String {
         "\(base).\(dashboardID.uuidString)"
     }
 
-    static func saveRoomHubCredential(_ credential: RoomHubCredential, dashboardID: UUID) {
-        guard let data = try? JSONEncoder().encode(credential) else { return }
+    static func saveConnection(_ conn: HermesConnection, dashboardID: UUID) {
+        guard let data = try? JSONEncoder().encode(conn) else { return }
+        save(data, account: scopedAccount(key, dashboardID: dashboardID))
+    }
+
+    static func loadConnection(dashboardID: UUID) -> HermesConnection? {
+        guard let data = load(account: scopedAccount(key, dashboardID: dashboardID)) else { return nil }
+        return try? JSONDecoder().decode(HermesConnection.self, from: data)
+    }
+
+    /// Clears the scoped connection ticket AND the dashboard's durable cookie
+    /// mirror, mirroring the legacy `clearConnection()` pairing.
+    static func clearConnection(dashboardID: UUID) {
+        delete(account: scopedAccount(key, dashboardID: dashboardID))
+        delete(account: scopedAccount(dashboardCookieKey, dashboardID: dashboardID))
+    }
+
+    static func saveDashboardCookies(_ data: Data, dashboardID: UUID) {
+        save(data, account: scopedAccount(dashboardCookieKey, dashboardID: dashboardID))
+    }
+
+    static func loadDashboardCookies(dashboardID: UUID) -> Data? {
+        load(account: scopedAccount(dashboardCookieKey, dashboardID: dashboardID))
+    }
+
+    static func clearDashboardCookies(dashboardID: UUID) {
+        delete(account: scopedAccount(dashboardCookieKey, dashboardID: dashboardID))
+    }
+
+    static func saveCredentials(_ credentials: DashboardCredentials, dashboardID: UUID) {
+        guard let data = try? JSONEncoder().encode(credentials) else { return }
         save(
             data,
-            account: roomScopedAccount(roomHubCredentialKey, dashboardID: dashboardID),
+            account: scopedAccount(credentialsKey, dashboardID: dashboardID),
             accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         )
     }
 
-    static func loadRoomHubCredential(dashboardID: UUID) -> RoomHubCredential? {
-        guard let data = load(account: roomScopedAccount(roomHubCredentialKey, dashboardID: dashboardID)) else { return nil }
-        return try? JSONDecoder().decode(RoomHubCredential.self, from: data)
+    static func loadCredentials(dashboardID: UUID) -> DashboardCredentials? {
+        guard let data = load(account: scopedAccount(credentialsKey, dashboardID: dashboardID)) else { return nil }
+        return try? JSONDecoder().decode(DashboardCredentials.self, from: data)
     }
 
-    static func clearRoomHubCredential(dashboardID: UUID) {
-        delete(account: roomScopedAccount(roomHubCredentialKey, dashboardID: dashboardID))
+    static func clearCredentials(dashboardID: UUID) {
+        delete(account: scopedAccount(credentialsKey, dashboardID: dashboardID))
+    }
+
+    static func saveCloudflareAccess(_ access: CloudflareAccessCredentials, origin: String, dashboardID: UUID) {
+        let stored = CloudflareAccessKeychainRecord(clientID: access.clientID, clientSecret: access.clientSecret, origin: origin)
+        guard let data = try? JSONEncoder().encode(stored) else { return }
+        save(
+            data,
+            account: scopedAccount(cloudflareAccessKey, dashboardID: dashboardID),
+            accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        )
+    }
+
+    /// Returns the dashboard's stored token only when the stored origin
+    /// matches the given base URL — the same origin fence the global record
+    /// applies, now scoped per dashboard.
+    static func loadCloudflareAccess(dashboardID: UUID, for baseURL: String? = nil) -> CloudflareAccessCredentials? {
+        guard let record = loadCloudflareKeychainRecord(dashboardID: dashboardID) else { return nil }
+        if let baseURL {
+            let normalized = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? baseURL
+            guard record.origin == normalized else { return nil }
+        }
+        return record.credentials
+    }
+
+    static func clearCloudflareAccess(dashboardID: UUID) {
+        delete(account: scopedAccount(cloudflareAccessKey, dashboardID: dashboardID))
+    }
+
+    /// The raw Cloudflare record (origin included) for a dashboard, without
+    /// origin matching.
+    static func loadCloudflareKeychainRecord(dashboardID: UUID) -> CloudflareAccessKeychainRecord? {
+        guard let data = load(account: scopedAccount(cloudflareAccessKey, dashboardID: dashboardID)),
+              let stored = try? JSONDecoder().decode(CloudflareAccessKeychainRecord.self, from: data) else { return nil }
+        return stored
+    }
+
+    static func saveCloudflareKeychainRecord(_ record: CloudflareAccessKeychainRecord, dashboardID: UUID) {
+        guard let data = try? JSONEncoder().encode(record) else { return }
+        save(
+            data,
+            account: scopedAccount(cloudflareAccessKey, dashboardID: dashboardID),
+            accessibility: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        )
     }
 
     private static func save(
@@ -8190,7 +17035,7 @@ enum KeychainHelper {
             var insert = query
             insert[kSecValueData as String] = data
             insert[kSecAttrAccessible as String] = accessibility
-            backend.add(insert)
+            _ = backend.add(insert)
         }
     }
 
@@ -8234,6 +17079,72 @@ enum KeychainHelper {
 }
 
 // MARK: - Attachment Helper
+
+/// Pure ownership rules for capability loads, extracted for deterministic
+/// testing of the rapid-profile-switch races.
+enum CapabilityLoadPolicy {
+    /// A finished request may commit only while it is still the newest load
+    /// AND its profile is still active (A -> B -> A stale commits rejected).
+    static func canCommit(
+        generation: UInt64,
+        latestGeneration: UInt64,
+        requestedProfile: String,
+        activeProfile: String
+    ) -> Bool {
+        generation == latestGeneration && requestedProfile == activeProfile
+    }
+
+    /// Rows may render only when the snapshot belongs to the active profile.
+    static func shouldPresentRows(snapshotProfile: String?, activeProfile: String) -> Bool {
+        snapshotProfile == activeProfile
+    }
+
+    /// Final rendering boundary for the Capabilities screen. Foreign or absent
+    /// snapshots can never resolve to a row-bearing state - toggles must never
+    /// appear under a profile they do not belong to.
+    enum PresentationState: Equatable {
+        case loading
+        case failure(String)
+        case emptySuccess
+        case list(banner: String?)
+    }
+
+    static func resolvePresentation(
+        snapshotProfile: String?,
+        activeProfile: String,
+        isLoading: Bool,
+        loadError: String?,
+        hasRows: Bool
+    ) -> PresentationState {
+        let ownsSnapshot = shouldPresentRows(
+            snapshotProfile: snapshotProfile,
+            activeProfile: activeProfile
+        )
+
+        // The view's request token guarantees a settled error belongs to the
+        // CURRENT request/profile - never to a foreign one. So errors surface
+        // before any snapshot-ownership masking; otherwise a failed first
+        // load (no snapshot yet) would hide behind an eternal spinner.
+        if isLoading {
+            return .loading
+        }
+
+        if let loadError {
+            if ownsSnapshot && hasRows {
+                return .list(banner: loadError)
+            }
+            return .failure(loadError)
+        }
+
+        guard ownsSnapshot else {
+            // No settled result for this profile yet: never render rows that
+            // belong to another profile while the current one is pending.
+            return .loading
+        }
+
+        return hasRows ? .list(banner: nil) : .emptySuccess
+    }
+}
 
 enum AttachmentHelper {
     static func toBase64(_ attachment: Attachment) async -> String {

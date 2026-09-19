@@ -15,25 +15,57 @@ final class AVSpeechPlaybackService: NSObject, SpeechPlaybackService {
     private var pendingBuffers = 0
     private var drainWaiters: [CheckedContinuation<Void, Never>] = []
     private var encodedPlayer: AVAudioPlayer?
+    /// Set once `finish()` is requested: when the last scheduled buffer (or
+    /// the encoded player) then drains, playback is terminal and ownership
+    /// must be released. Mid-stream buffer gaps keep ownership so the session
+    /// does not flap while the gateway prepares the next chunk.
+    private var isFinishing = false
+    private let coordinator: VoiceAudioSessionCoordinator
+    private var lease: VoiceAudioLease?
+    /// Which audio-session ownership this service claims while playing.
+    /// Conversation playback joins the capture-owned session; standalone
+    /// flows (Read Aloud, TTS provider test) claim output-only ownership.
+    var ownershipIntent: VoiceAudioIntent = .standalonePlayback
     private(set) var isPlaying = false
 
-    override init() {
+    /// Optional injection instead of a default `.shared` argument: default
+    /// parameter values are evaluated in a nonisolated context, which cannot
+    /// read the MainActor-isolated singleton.
+    init(coordinator: VoiceAudioSessionCoordinator? = nil) {
+        self.coordinator = coordinator ?? .shared
         super.init()
         engine.attach(player)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleInterruption(_:)),
+            name: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance()
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleEngineConfigurationChange(_:)),
+            name: .AVAudioEngineConfigurationChange,
+            object: engine
+        )
     }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
 
     func start(sampleRate: Double) throws {
         stop()
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
-        try session.setActive(true)
         guard let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: sampleRate, channels: 1, interleaved: true) else {
-            throw VoiceAudioError.unavailable("The gateway reported an unsupported PCM format.")
+            throw VoiceAudioError.unavailable(AppLocalization.string("The gateway reported an unsupported PCM format."))
         }
-        self.format = format
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-        engine.prepare()
-        try engine.start()
+        lease = try coordinator.acquire(ownershipIntent)
+        do {
+            self.format = format
+            engine.connect(player, to: engine.mainMixerNode, format: format)
+            engine.prepare()
+            try engine.start()
+        } catch {
+            releaseOwnership()
+            throw error
+        }
         player.play()
         isPlaying = true
     }
@@ -41,7 +73,11 @@ final class AVSpeechPlaybackService: NSObject, SpeechPlaybackService {
     func enqueuePCM16(_ data: Data, sampleRate: Double) throws -> Int {
         if format == nil { try start(sampleRate: sampleRate) }
         guard let format, abs(format.sampleRate - sampleRate) < 1 else {
-            throw VoiceAudioError.unavailable("The gateway changed PCM sample rates during a stream.")
+            // A stream that changes sample rates can never render; settle
+            // immediately so the lease does not wait on the caller's error
+            // path.
+            stop()
+            throw VoiceAudioError.unavailable(AppLocalization.string("The gateway changed PCM sample rates during a stream."))
         }
         remainder.append(data)
         let alignedBytes = remainder.count - (remainder.count % 2)
@@ -70,26 +106,33 @@ final class AVSpeechPlaybackService: NSObject, SpeechPlaybackService {
 
     func playEncodedAudioData(_ data: Data) throws {
         stop()
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
-        try session.setActive(true)
-        let player = try AVAudioPlayer(data: data)
-        player.delegate = self
-        player.prepareToPlay()
-        guard player.play() else { throw VoiceAudioError.unavailable("Could not play Hermes fallback speech.") }
-        encodedPlayer = player
-        isPlaying = true
+        lease = try coordinator.acquire(ownershipIntent)
+        do {
+            let player = try AVAudioPlayer(data: data)
+            player.delegate = self
+            player.prepareToPlay()
+            guard player.play() else { throw VoiceAudioError.unavailable(AppLocalization.string("Could not play Hermes fallback speech.")) }
+            encodedPlayer = player
+            isPlaying = true
+        } catch {
+            releaseOwnership()
+            throw error
+        }
     }
 
     func finish() throws {
         // An odd tail is invalid PCM16 and is intentionally discarded rather
         // than shifted into the next response.
         remainder.removeAll(keepingCapacity: true)
+        isFinishing = true
     }
 
     func drain() async {
         guard pendingBuffers > 0 || encodedPlayer != nil else {
             isPlaying = false
+            // Nothing was ever scheduled (or the queue drained between
+            // checks): a finishing stream must still release ownership.
+            if isFinishing { stop() }
             return
         }
         await withCheckedContinuation { continuation in
@@ -98,6 +141,7 @@ final class AVSpeechPlaybackService: NSObject, SpeechPlaybackService {
     }
 
     func stop() {
+        isFinishing = false
         player.stop()
         encodedPlayer?.stop()
         encodedPlayer = nil
@@ -109,12 +153,65 @@ final class AVSpeechPlaybackService: NSObject, SpeechPlaybackService {
         let waiters = drainWaiters
         drainWaiters.removeAll()
         waiters.forEach { $0.resume() }
+        releaseOwnership()
+    }
+
+    /// Ownership is released only after the engine stopped rendering, so the
+    /// coordinator never deactivates the session underneath live audio. The
+    /// coordinator keeps the session active when another owner (conversation
+    /// capture) still needs it.
+    private func releaseOwnership() {
+        guard let lease else { return }
+        self.lease = nil
+        coordinator.release(lease)
+    }
+
+    /// Both notification handlers hop through `Task { @MainActor }`: session
+    /// notifications are not guaranteed to arrive on the main thread, and
+    /// every reachable entry point below (stop, coordinator release, waiter
+    /// resumption) is MainActor-isolated state.
+    @objc private func handleInterruption(_ notification: Notification) {
+        guard let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue), type == .began else { return }
+        Task { @MainActor [weak self] in
+            // Playback can no longer continue: settle buffers and drain
+            // waiters so awaiting controllers never hang, and release session
+            // ownership so other media recovers. Resuming after the
+            // interruption ends is deliberate follow-up work, not silent
+            // breakage.
+            self?.stop()
+        }
+    }
+
+    @objc private func handleEngineConfigurationChange(_ notification: Notification) {
+        Task { @MainActor [weak self] in
+            // A route change can stop the rendering engine under a live lease
+            // (AirPods disconnect, dock/undock). Settle instead of leaving
+            // buffers undrained and ownership claimed by audio that can never
+            // play. A conversation drain self-heals: the next PCM buffer
+            // reacquires ownership and restarts the engine on the new route.
+            guard let self, self.lease != nil, !self.engine.isRunning else { return }
+            self.stop()
+        }
     }
 
     private func bufferDidDrain() {
-        pendingBuffers = max(0, pendingBuffers - 1)
+        guard pendingBuffers > 0 else { return }
+        pendingBuffers -= 1
         guard pendingBuffers == 0 else { return }
-        isPlaying = false
+        if isFinishing {
+            // Terminal: everything queued has rendered. stop() tears the
+            // engine down, resumes drain waiters exactly once, and releases
+            // session ownership so standalone speech un-ducks other media the
+            // moment it ends.
+            stop()
+        } else {
+            isPlaying = false
+            settleDrainWaiters()
+        }
+    }
+
+    private func settleDrainWaiters() {
         let waiters = drainWaiters
         drainWaiters.removeAll()
         waiters.forEach { $0.resume() }
@@ -123,13 +220,12 @@ final class AVSpeechPlaybackService: NSObject, SpeechPlaybackService {
 
 extension AVSpeechPlaybackService: AVAudioPlayerDelegate {
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in
-            guard self.encodedPlayer === player else { return }
-            self.encodedPlayer = nil
-            self.isPlaying = false
-            let waiters = self.drainWaiters
-            self.drainWaiters.removeAll()
-            waiters.forEach { $0.resume() }
+        Task { @MainActor [weak self] in
+            guard let self, self.encodedPlayer === player else { return }
+            // Natural completion is terminal for the encoded path: stop()
+            // clears the player, resumes drain waiters, and releases the
+            // session lease.
+            self.stop()
         }
     }
 }

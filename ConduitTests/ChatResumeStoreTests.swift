@@ -106,6 +106,41 @@ final class ChatResumeStoreTests: XCTestCase {
         XCTAssertNil(store.snapshot(for: .init(profile: "default", sessionID: "stored-a")))
     }
 
+    func testRemoveSessionsDropsSnapshotsAndLastSelectionWithoutTouchingSiblings() throws {
+        let (defaults, suite) = try defaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = ChatResumeStore(defaults: defaults)
+        let deletedKey = ChatScrollSessionKey(profile: "default", sessionID: "stored-a")
+        let siblingKey = ChatScrollSessionKey(profile: "default", sessionID: "stored-b")
+        let otherProfileKey = ChatScrollSessionKey(profile: "work", sessionID: "stored-a")
+        store.save(
+            ChatScrollSnapshot(anchorMessageID: "deleted-anchor", followsLatest: false),
+            for: deletedKey,
+            at: Date()
+        )
+        store.save(
+            ChatScrollSnapshot(anchorMessageID: "sibling-anchor", followsLatest: false),
+            for: siblingKey,
+            at: Date()
+        )
+        store.save(
+            ChatScrollSnapshot(anchorMessageID: "other-profile-anchor", followsLatest: false),
+            for: otherProfileKey,
+            at: Date()
+        )
+        store.setLastSessionID("stored-a", for: "default")
+
+        store.removeSessions(profile: "default", sessionIDs: ["stored-a", "runtime-a"])
+
+        XCTAssertNil(store.snapshot(for: deletedKey))
+        XCTAssertNil(store.lastSessionID(for: "default"), "The deleted conversation cannot stay last-selected")
+        XCTAssertNotNil(store.snapshot(for: siblingKey))
+        XCTAssertNotNil(
+            store.snapshot(for: otherProfileKey),
+            "Deletion is profile-scoped; another profile's same-named session survives"
+        )
+    }
+
     func testSnapshotMigratesFromRuntimeToCanonicalKey() throws {
         let (defaults, suite) = try defaults()
         defer { defaults.removePersistentDomain(forName: suite) }

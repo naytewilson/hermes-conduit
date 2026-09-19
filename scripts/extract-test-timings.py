@@ -1,0 +1,926 @@
+#!/usr/bin/env python3
+"""CI v2 timing extraction and report aggregation for Hermes Conduit.
+
+Subcommands
+-----------
+extract      Read an .xcresult bundle via `xcrun xcresulttool` and normalize
+             per-XCTest-class durations plus per-test retry attempts into JSON.
+merge-parts  Fold the per-attempt extraction parts written by the
+             UI lane runner - the batched shard attempt (parts named
+             ...-batch-a<n>.json) plus every per-class diagnosis invocation
+             (...-<class>-a<n>.json) - into the lane-level
+             observations.json / detail.json documents. Parts fold in
+             wall-clock order (batch attempt first, per-class diagnosis
+             after, attempts numerically within a group) and the last fold
+             wins per class: on a green lane that is always the passing
+             attempt.
+lane-result  Merge bash-computed lane facts with extraction output into the
+             canonical lane-result.json consumed by the report job.
+aggregate    Build the human-readable CI Test Report (GitHub Step Summary)
+             from plan.json + lane-result.json files + build-result.json.
+
+Design rules (see docs/CI.md):
+  * Timing extraction is NEVER allowed to fail a CI lane. Any structural
+    surprise in the xcresult schema exits with code 3 and the caller falls
+    back to previously known timing history.
+  * Aggregate output is best-effort reporting; it never changes job status.
+  * Only Python 3 stdlib is used (runs on ubuntu and macOS runners).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+
+SCHEMA_VERSION = 1
+
+# Exit codes with contractual meaning for callers.
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_SCHEMA = 3  # xcresult structure not understood -> caller keeps old history
+
+
+def warn(msg: str) -> None:
+    print(f"::warning::extract-test-timings: {msg}", file=sys.stderr)
+
+
+def info(msg: str) -> None:
+    print(msg)
+
+
+def now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# extract
+# ---------------------------------------------------------------------------
+
+def _duration_seconds(node: dict) -> float:
+    """Best-effort duration of a node in seconds. Missing durations are 0."""
+    raw = node.get("durationInSeconds")
+    if isinstance(raw, (int, float)) and raw >= 0:
+        return float(raw)
+    text = node.get("duration")
+    if isinstance(text, str):
+        m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)s?\s*", text)
+        if m:
+            return float(m.group(1))
+    return 0.0
+
+
+def _norm_result(node: dict) -> str:
+    r = node.get("result")
+    return r if isinstance(r, str) else "Unknown"
+
+
+def _walk_bundle(bundle: dict, stats: dict, problems: list) -> None:
+    """Walk one test-bundle node, accumulating class-level durations and
+    per-test attempts. Class = nearest enclosing Test Suite node."""
+    suite_stack: list = []
+
+    def visit(node: dict) -> None:
+        ntype = str(node.get("nodeType", ""))
+        ntype_l = ntype.lower()
+        name = str(node.get("name", "?"))
+        if "test case" in ntype_l:
+            if not suite_stack:
+                problems.append(f"test case {name!r} with no enclosing suite")
+                return
+            cls = suite_stack[-1]
+            seconds = _duration_seconds(node)
+            key = f"{cls}/{name}"
+            stats["attempts"].setdefault(key, {"class": cls, "test": name, "attempts": []})
+            stats["attempts"][key]["attempts"].append(
+                {"result": _norm_result(node), "seconds": seconds}
+            )
+            return
+        if "test suite" in ntype_l:
+            suite_stack.append(name)
+            for child in node.get("children", []) or []:
+                visit(child)
+            suite_stack.pop()
+            return
+        # Unknown intermediate node (e.g. future grouping types): descend so
+        # partial schema changes degrade to warnings instead of hard failure.
+        if node.get("children"):
+            problems.append(f"unrecognized node type {ntype!r} (descended anyway)")
+            for child in node.get("children", []) or []:
+                visit(child)
+
+    for child in bundle.get("children", []) or []:
+        visit(child)
+
+
+def extract(xcresult: str) -> dict:
+    """Run xcresulttool on an .xcresult bundle and normalize the document."""
+    cmd = ["xcrun", "xcresulttool", "get", "test-results", "tests", "--path", xcresult]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        raise RuntimeError("xcrun not found; timing extraction requires macOS/Xcode")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("xcresulttool timed out after 300s")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "xcresulttool exited {0}: {1}".format(
+                proc.returncode, proc.stderr.strip()[:500])
+        )
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"xcresulttool produced invalid JSON: {exc}")
+    return extract_from_doc(data, xcresult)
+
+
+def extract_from_doc(data: dict, xcresult_label: str) -> dict:
+    """Normalize an already-parsed xcresulttool document. Pure function so the
+    regression tests can exercise schema handling without macOS."""
+    if not isinstance(data, dict) or "testNodes" not in data:
+        raise RuntimeError("xcresult JSON missing 'testNodes'; schema changed?")
+
+    problems: list = []
+    stats = {"class_seconds": {}, "attempts": {}}
+    bundles_seen = []
+
+    for top in data.get("testNodes", []) or []:
+        for bundle in top.get("children", []) or []:
+            btype = str(bundle.get("nodeType", "")).lower()
+            if "test bundle" not in btype:
+                continue
+            bundle_name = str(bundle.get("name", "?"))
+            bundles_seen.append(bundle_name)
+            _walk_bundle(bundle, stats, problems)
+
+    attempts = list(stats["attempts"].values())
+    for att in attempts:
+        att["final"] = att["attempts"][-1]["result"] if att["attempts"] else "Unknown"
+        att["attempts_count"] = len(att["attempts"])
+    # Class duration = sum of each test's LAST attempt (native retry reruns
+    # only failed tests, so summing every attempt would inflate flaky classes
+    # and skew the LPT lane balance).
+    class_seconds: dict = {}
+    for att in attempts:
+        if att["attempts"]:
+            cls = att["class"]
+            class_seconds[cls] = class_seconds.get(cls, 0.0) + att["attempts"][-1]["seconds"]
+    failures = [
+        {"class": a["class"], "test": a["test"], "attempts": a["attempts"]}
+        for a in attempts
+        if a["final"].lower() == "failed"
+    ]
+    flaky = [
+        {"class": a["class"], "test": a["test"], "attempts": a["attempts"],
+         "final": a["final"]}
+        for a in attempts
+        if a["attempts_count"] > 1
+    ]
+    total_cases = sum(len(a["attempts"]) for a in attempts)
+
+    if not bundles_seen:
+        raise RuntimeError("no test bundle nodes found in xcresult")
+    if not class_seconds and not attempts:
+        # A run can legitimately contain zero tests, but never in our CI.
+        raise RuntimeError("xcresult contained no test cases")
+
+    for p in problems:
+        warn(p)
+
+    doc = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": now_iso(),
+        "xcresult": os.path.basename(str(xcresult_label).rstrip("/")),
+        "bundles": bundles_seen,
+        "classes": {k: round(v, 3) for k, v in sorted(class_seconds.items())},
+        "attempts": sorted(attempts, key=lambda a: (a["class"], a["test"])),
+        "failures": failures,
+        "retried": flaky,
+        "counts": {"classes": len(class_seconds), "cases": total_cases},
+    }
+    return doc
+
+
+# ---------------------------------------------------------------------------
+# lane-result
+# ---------------------------------------------------------------------------
+
+def _num(value):
+    """Normalize a lane fact to None / int / bounded float so the artifact
+    never carries float noise like `600.0` for a whole-second budget."""
+    if value is None:
+        return None
+    number = float(value)
+    return int(number) if number.is_integer() else round(number, 3)
+
+
+def lane_result(args) -> int:
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "lane": args.lane,
+        "kind": args.kind,
+        "target": args.target,
+        "classes": [c for c in args.classes.split(",") if c],
+        "status": args.status,
+        "predicted_s": _num(args.predicted_s),
+        "timeout_s": _num(args.timeout_s),
+        "actual_s": _num(args.actual_s),
+        "started_at": args.started_at,
+        "finished_at": now_iso(),
+        "attempts": [],
+        "simulator_reset": bool(args.simulator_reset),
+        "simulator_erase": bool(args.simulator_erase),
+        "hung_class": args.hung_class or None,
+        "retried_classes": [c for c in (args.retried_classes or "").split(",") if c],
+        "infra_recovered_classes": [
+            c for c in (args.infra_recovered_classes or "").split(",") if c],
+        "persistent_infra_classes": [
+            c for c in (args.persistent_infra_classes or "").split(",") if c],
+        "isolation": None,
+        "batches": [],
+        "hung_batch": args.hung_batch if args.hung_batch else None,
+    }
+    # Every external input is best-effort: this script assembles the canonical
+    # lane result, so malformed side data must never crash a green lane.
+    for field, raw in (("attempts", args.attempts_json),
+                       ("isolation", args.isolation_json),
+                       ("batches", args.batches_json)):
+        if raw:
+            try:
+                result[field] = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                warn(f"lane-result: malformed {field} JSON ignored ({exc})")
+
+    def load_side_file(path):
+        if path and os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                if not isinstance(doc, dict) or "schema_version" not in doc:
+                    warn(f"lane-result: ignoring unrecognized side file {path}")
+                    return None
+                return doc
+            except (OSError, json.JSONDecodeError) as exc:
+                warn(f"lane-result: unreadable side file {path} ignored ({exc})")
+        return None
+
+    obs = load_side_file(args.observations)
+    if obs is not None and isinstance(obs.get("classes", {}), dict):
+        result["class_seconds"] = obs.get("classes", {})
+    detail = load_side_file(args.detail)
+    if detail is not None:
+        result["failures"] = detail.get("failures", [])
+        result["flaky"] = detail.get("retried", [])
+
+    text = json.dumps(result, indent=2, sort_keys=True)
+    with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text + "\n")
+    info(f"lane result written: {args.out} (status={args.status})")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# merge-parts (UI lane per-class extraction fold-up)
+# ---------------------------------------------------------------------------
+
+def _attempt_index(name: str) -> int:
+    """Attempt number embedded by the runner as ...-a<digits>.json."""
+    m = re.search(r"-a(\d+)\.json$", name)
+    return int(m.group(1)) if m else 0
+
+
+def _part_sort_key(name: str) -> tuple:
+    """Chronological fold order, returned as (is_batch, stem, attempt):
+    batch-named parts fold before every class-named part regardless of
+    ASCII order (the lowercase stem would otherwise sort after the class
+    names and win last-wins with stale killed-batch data; the batch group
+    covers both the UI shard's "batch" part and the unit lane runner's
+    numbered "batch-<n>" parts). Within a group the constant is_batch field
+    collapses and (stem, attempt) orders numeric attempts correctly (a2
+    after a10 - plain filename sort would put a10 first)."""
+    stem = re.sub(r"-a\d+\.json$", "", name)
+    cls = _part_class(name)
+    is_batch = 0 if (cls == "batch" or cls.startswith("batch-")) else 1
+    return (is_batch, stem, _attempt_index(name))
+
+
+def _part_class(name: str) -> str:
+    """Class name embedded by the runner as observations-<class>-a<n>.json /
+    detail-<class>-a<n>.json. Swift test-class identifiers are \\w+."""
+    stem = re.sub(r"-a\d+\.json$", "", name)
+    return re.sub(r"^(observations|detail)-", "", stem)
+
+
+def _list_field(doc: dict, key: str) -> list:
+    """A list field from a part document; non-list junk degrades to empty
+    with a warning instead of being char-extended into the merged list."""
+    value = doc.get(key, []) or []
+    if isinstance(value, list):
+        return value
+    warn(f"merge-parts: ignoring non-list {key} in a detail part")
+    return []
+
+
+def merge_observation_parts(parts: list) -> dict:
+    """parts: (filename, parsed doc) tuples in chronological fold order (see
+    _part_sort_key: batch attempt first, per-class diagnosis after, numeric
+    attempts within a group).
+    Returns the lane-level observations document. A class seen in several
+    attempts keeps its LAST attempt's duration: the runner extracts every
+    attempt, and on a green lane the last attempt of a retried class is the
+    passing one. Case counts follow the same last-wins rule so a retried
+    class is not double-counted; a class whose duration is corrupt loses its
+    case count too, keeping counts consistent with classes."""
+    classes: dict = {}
+    cases_by_class: dict = {}
+    bundles: list = []
+    for _name, doc in parts:
+        if not isinstance(doc, dict) or not isinstance(doc.get("classes", {}), dict):
+            warn("merge-parts: ignoring observation part with unexpected schema")
+            continue
+        parsed_here: list = []
+        for cname, secs in doc["classes"].items():
+            # Extraction is best-effort: one corrupt duration must not lose
+            # the whole lane's timings. nan/inf would survive float() and
+            # poison downstream planning math, so they are rejected too.
+            try:
+                value = float(secs)
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(
+                        f"non-finite/negative duration for {cname!r}: {secs!r}")
+            except (TypeError, ValueError):
+                warn(f"merge-parts: ignoring non-numeric duration for {cname!r}")
+                continue
+            classes[cname] = value
+            parsed_here.append(cname)
+        for b in doc.get("bundles", []) or []:
+            if b not in bundles:
+                bundles.append(b)
+        counts = doc.get("counts", {})
+        cases = counts.get("cases", 0) if isinstance(counts, dict) else 0
+        cases_ok = (isinstance(cases, (int, float)) and not isinstance(cases, bool)
+                    and math.isfinite(float(cases)))
+        if cases_ok and parsed_here:
+            # Attribute this part's case count to the classes THIS part
+            # contributed (last-wins per class; single-class parts in
+            # practice, split evenly if a part ever carries several).
+            each, remainder = divmod(int(cases), len(parsed_here))
+            for i, cname in enumerate(parsed_here):
+                cases_by_class[cname] = each + (1 if i < remainder else 0)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": now_iso(),
+        "xcresult": "merged-per-class-parts",
+        "bundles": bundles,
+        "classes": {k: round(v, 3) for k, v in sorted(classes.items())},
+        "counts": {"classes": len(classes), "cases": sum(cases_by_class.values())},
+    }
+
+
+def merge_detail_parts(parts: list) -> dict:
+    """parts: (filename, parsed doc) tuples in chronological fold order (see
+    _part_sort_key).
+    Attempts and retried tests are concatenated across classes and attempts
+    (each entry carries its class). FAILURES are per-class STATE, not an
+    append log: the class's highest attempt PART decides, so a class that
+    failed attempt 1 and passed the targeted retry leaves no stale failures
+    behind on a green lane. (Limitation: if the winning attempt's extraction
+    itself failed, no part exists for it and the previous attempt's failures
+    stay - the lane verdict is never affected, and aggregate only renders
+    failures for non-pass lanes.)"""
+    attempts: list = []
+    retried: list = []
+    failures_by_class: dict = {}
+    for fname, doc in parts:
+        if not isinstance(doc, dict):
+            warn("merge-parts: ignoring detail part with unexpected schema")
+            continue
+        attempts.extend(_list_field(doc, "attempts"))
+        retried.extend(_list_field(doc, "retried"))
+        cls = _part_class(fname)
+        failures_by_class[cls] = _list_field(doc, "failures")
+    # The synthetic "batch" key carries the batched shard attempt's failures.
+    # Per-class parts supersede that attempt FOR THE CLASSES THEY RE-EXECUTED
+    # (a per-class part exists exactly for a class diagnosis actually ran),
+    # so their batch entries are dropped; batch evidence for classes
+    # diagnosis never reached - a lane stopped at a hang, with later classes
+    # recorded as not_diagnosed - must SURVIVE so the red lane's report stays
+    # complete. Supersession is therefore per class, keyed on which classes
+    # produced per-class parts, never on mere part presence.
+    if "batch" in failures_by_class:
+        covered = {k for k in failures_by_class if k != "batch"}
+        if covered:
+            survivors = [f for f in failures_by_class.pop("batch")
+                         if f.get("class") not in covered]
+            if survivors:
+                failures_by_class["batch"] = survivors
+    failures: list = []
+    for cls in failures_by_class:
+        failures.extend(failures_by_class[cls])
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": now_iso(),
+        "xcresult": "merged-per-class-parts",
+        "attempts": sorted(attempts, key=lambda a: (a.get("class", ""), a.get("test", ""))),
+        "failures": failures,
+        "retried": retried,
+    }
+
+
+def merge_parts(parts_dir: str, observations_out: str, detail_out: str) -> int:
+    if not os.path.isdir(parts_dir):
+        warn(f"merge-parts: parts directory missing: {parts_dir}")
+        return EXIT_SCHEMA
+    obs_files = sorted(
+        f for f in os.listdir(parts_dir) if f.startswith("observations-") and f.endswith(".json"))
+    det_files = sorted(
+        f for f in os.listdir(parts_dir) if f.startswith("detail-") and f.endswith(".json"))
+    if not obs_files and not det_files:
+        warn("merge-parts: no extraction parts found")
+        return EXIT_SCHEMA
+    # Order by (class, attempt) so "last attempt wins" really means the
+    # highest attempt number, not the lexicographically last filename.
+    obs_files.sort(key=_part_sort_key)
+    det_files.sort(key=_part_sort_key)
+
+    def load_all(names):
+        pairs = []
+        for f in names:
+            try:
+                with open(os.path.join(parts_dir, f), encoding="utf-8") as fh:
+                    pairs.append((f, json.load(fh)))
+            except (OSError, json.JSONDecodeError) as exc:
+                warn(f"merge-parts: unreadable part {f} ignored ({exc})")
+        return pairs
+
+    obs_doc = merge_observation_parts(load_all(obs_files))
+    det_doc = merge_detail_parts(load_all(det_files))
+    for path, doc in ((observations_out, obs_doc), (detail_out, det_doc)):
+        if not path:
+            continue
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+    info(
+        f"merged {len(obs_doc['classes'])} observation classes from "
+        f"{len(obs_files)} + {len(det_files)} part files "
+        f"({len(det_doc['failures'])} failures)"
+    )
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# aggregate
+# ---------------------------------------------------------------------------
+
+def _fmt_secs(s):
+    if s is None:
+        return "-"
+    m, sec = divmod(int(round(s)), 60)
+    return f"{m}m {sec:02d}s" if m else f"{sec}s"
+
+
+def _load_json(path: str):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _batch_summary_line(batch: dict, total: int) -> str:
+    """One concise batch line for the report, e.g.
+    `batch 3/5 watchdog -> retry PASS`."""
+    index = batch.get("batch", "?")
+    label = f"batch {index}/{total}"
+    attempts = batch.get("attempts") or []
+    statuses = [str(a.get("status", "?")) for a in attempts]
+    if batch.get("status") == "not_run":
+        return f"{label} NOT RUN (lane stopped earlier)"
+    if not statuses:
+        return f"{label} {batch.get('status', '?')}"
+    if len(statuses) == 1:
+        return f"{label} {statuses[0].upper()}"
+    return "{0} {1} -> retry {2}".format(
+        label, statuses[0], statuses[-1].upper())
+
+
+def aggregate(args) -> int:
+    lines: list = []
+    plan = _load_json(args.plan)
+
+    lanes = plan.get("unit_lanes", [])
+
+    results = {}  # lane name -> lane-result dict
+    for root, _dirs, files in os.walk(args.lanes_dir):
+        for fname in files:
+            if fname == "lane-result.json":
+                path = os.path.join(root, fname)
+                try:
+                    doc = _load_json(path)
+                    lane_name = doc.get("lane", path)
+                    if lane_name in results:
+                        warn(f"duplicate lane result for {lane_name!r} ({path}); keeping the last one")
+                    results[lane_name] = doc
+                except (OSError, json.JSONDecodeError) as exc:
+                    warn(f"unreadable lane result {path}: {exc}")
+
+    build = None
+    if args.build_result and os.path.exists(args.build_result):
+        try:
+            build = _load_json(args.build_result)
+        except (OSError, json.JSONDecodeError) as exc:
+            warn(f"unreadable build result: {exc}")
+
+    lines.append("# CI Test Report")
+    lines.append("")
+
+    # --- Build -------------------------------------------------------------
+    lines.append("## Build")
+    if build:
+        lines.append(
+            f"- Status: **{build.get('status', '?')}**"
+            f"  -  Duration: {_fmt_secs(build.get('duration_s'))}"
+        )
+        if build.get("shared_artifact") is not None:
+            lines.append(
+                f"- Shared build artifact: **{'yes' if build['shared_artifact'] else 'no'}**"
+                " (downstream lanes run test-without-building from downloaded products)"
+            )
+    else:
+        lines.append("- No build result artifact found (build job may have failed early).")
+    lines.append("")
+
+    # --- Unit lanes ----------------------------------------------------------
+    lines.append("## Unit lanes")
+    lines.append("")
+    lines.append("| Lane | Predicted | Actual | Status | Batches | Classes |")
+    lines.append("|---|---|---|---|---|---|")
+    any_actual = False
+    for lane in lanes:
+        name = lane.get("lane")
+        res = results.get(name, {})
+        actual = res.get("actual_s")
+        if actual is not None:
+            any_actual = True
+        batch_count = lane.get("batch_count", len(lane.get("batches", [])))
+        lines.append(
+            f"| {name} | {_fmt_secs(lane.get('predicted_s'))} | {_fmt_secs(actual)} "
+            f"| {res.get('status', 'no result')} | {batch_count} | {len(lane.get('classes', []))} |"
+        )
+    if not lanes:
+        lines.append("| (no unit lanes planned) | | | | | |")
+    lines.append("")
+
+    # --- Unit batch detail -----------------------------------------------------
+    # Every unit lane's per-batch outcome, so a reviewer never has to open raw
+    # Actions logs to learn which batch stalled (or that all batches passed).
+    batch_lines_rendered = False
+    for lane in lanes:
+        res = results.get(lane.get("lane"), {})
+        batches = res.get("batches") or []
+        if not isinstance(batches, list) or not batches:
+            continue
+        if not batch_lines_rendered:
+            lines.append("### Unit lane batches")
+            lines.append("")
+            batch_lines_rendered = True
+        total = len(batches)
+        lines.append(f"- **{lane.get('lane')}** ({total} batches)")
+        for batch in batches:
+            if not isinstance(batch, dict):
+                continue
+            lines.append(f"  - {_batch_summary_line(batch, total)}")
+    if batch_lines_rendered:
+        lines.append("")
+        lines.append(
+            "Each batch is a fresh xcodebuild invocation on the lane's own "
+            "runner/Simulator session; a batch-level watchdog stall or "
+            "infrastructure wedge retries that SAME batch once (never the "
+            "whole lane).")
+        lines.append("")
+
+    # --- UI ------------------------------------------------------------------
+    lines.append("## UI lanes")
+    # plan.json carries `ui_lanes`; tolerate the legacy single-lane shape so
+    # the report can always render artifacts from an older schema.
+    ui_lanes = plan.get("ui_lanes") or []
+    if not ui_lanes and plan.get("ui_lane"):
+        ui_lanes = [plan["ui_lane"]]
+    if ui_lanes:
+        lines.append("")
+        lines.append("| Lane | Predicted | Actual | Status | Classes |")
+        lines.append("|---|---|---|---|---|")
+        for lane in ui_lanes:
+            name = lane.get("lane", "ui")
+            res = results.get(name, {})
+            lines.append(
+                f"| {name} | {_fmt_secs(lane.get('predicted_s'))} | "
+                f"{_fmt_secs(res.get('actual_s'))} | {res.get('status', 'no result')} "
+                f"| {len(lane.get('classes', []))} |"
+            )
+        lines.append("")
+        lines.append("Each UI shard runs as ONE batched xcodebuild invocation; "
+                     "a failure retries only the failed tests (exact methods "
+                     "when the xcresult identifies them, else the class), and "
+                     "timeouts/infrastructure wedges fall back to per-class "
+                     "diagnosis.")
+    else:
+        lines.append("")
+        lines.append("- No UI tests planned.")
+    lines.append("")
+
+    # --- Retries / flaky -----------------------------------------------------
+    flaky_rows = [
+        (name, res) for name, res in sorted(results.items())
+        if res.get("flaky")
+    ]
+    # Runner-level flakes: UI classes whose TARGETED retry rescued them. They
+    # must stay visible - a retry pass is a flake, not a clean pass.
+    retried_class_rows = [
+        (name, res) for name, res in sorted(results.items())
+        if res.get("retried_classes")
+    ]
+    # Infra-recovered classes also ran twice, but the retry rescued an
+    # environment wedge, not a test flake - reported, without the flake alarm.
+    infra_recovered_rows = [
+        (name, res) for name, res in sorted(results.items())
+        if res.get("infra_recovered_classes")
+    ]
+    lines.append("## Retries & flaky tests")
+    if not flaky_rows and not retried_class_rows and not infra_recovered_rows:
+        lines.append("- None: every test passed on its first attempt.")
+    else:
+        for name, res in flaky_rows:
+            for fl in res["flaky"]:
+                chain = " -> ".join(
+                    "{0} ({1})".format(a["result"], _fmt_secs(a["seconds"]))
+                    for a in fl.get("attempts", [])
+                )
+                lines.append(f"- `{fl['class']}/{fl['test']}` [{name}]: {chain}")
+            lines.append(
+                f"  - **FLAKE WARNING**: {name} passed only after retry - investigate."
+            )
+        for name, res in retried_class_rows:
+            for cls in res["retried_classes"]:
+                lines.append(
+                    f"- `{cls}` [{name}]: class failed its first attempt, "
+                    "PASSED on the targeted retry (only this class re-ran)"
+                )
+                lines.append(
+                    f"  - **FLAKE WARNING**: `{cls}` passed only after retry - "
+                    "investigate; its first-attempt result bundle is in the lane artifact."
+                )
+        for name, res in infra_recovered_rows:
+            for cls in res["infra_recovered_classes"]:
+                lines.append(
+                    f"- `{cls}` [{name}]: passed after an infrastructure retry "
+                    "(simulator/environment wedge recovered; not a test flake)"
+                )
+    lines.append("")
+
+    # --- Failures / hangs ------------------------------------------------------
+    failed_rows = [
+        (name, res) for name, res in sorted(results.items())
+        if res.get("status") not in (None, "pass")
+    ]
+    if failed_rows:
+        lines.append("## Failures & diagnostics")
+        for name, res in failed_rows:
+            lines.append(f"### {name} - status **{res.get('status')}**")
+            lines.append(
+                f"- predicted {_fmt_secs(res.get('predicted_s'))} vs actual "
+                f"{_fmt_secs(res.get('actual_s'))}; watchdog budget "
+                f"{_fmt_secs(res.get('timeout_s'))}"
+            )
+            if res.get("simulator_reset") or res.get("simulator_erase"):
+                kind = "erase" if res.get("simulator_erase") else "reset"
+                lines.append(f"- simulator {kind} performed during recovery")
+            attempts = res.get("attempts", [])
+            if attempts:
+                chain = " -> ".join(str(a.get("status", "?")) for a in attempts)
+                lines.append(f"- attempts: {chain}")
+            if res.get("hung_batch"):
+                hung = res["hung_batch"]
+                batch = next((b for b in (res.get("batches") or [])
+                              if isinstance(b, dict) and b.get("batch") == hung), {})
+                cls_list = ", ".join(batch.get("classes", []) or []) or "?"
+                lines.append(
+                    f"- **HUNG: unit batch {hung} stalled twice** "
+                    f"(watchdog on both attempts; classes: `{cls_list}`; "
+                    "its one allowed batch retry also stalled - never retried "
+                    "again)"
+                )
+            if res.get("hung_class"):
+                if res.get("kind") == "ui":
+                    lines.append(
+                        f"- **HUNG: `{res['hung_class']}` exceeded its per-class "
+                        "watchdog twice** (the targeted retry timed out too; "
+                        "later classes were recorded as not_diagnosed)"
+                    )
+                else:
+                    lines.append(
+                        f"- **HANG identified by isolation mode: `{res['hung_class']}`** "
+                        "(lane timed out; class-granular rerun pinned this class)"
+                    )
+            for cls in res.get("persistent_infra_classes", []) or []:
+                lines.append(
+                    f"- persistent infrastructure failure: `{cls}` (exited "
+                    "nonzero twice with zero failing tests; remaining classes "
+                    "still ran after a simulator reset)"
+                )
+            if res.get("isolation"):
+                lines.append("- isolation per-class results:")
+                for cls in res["isolation"].get("classes", []):
+                    lines.append(
+                        f"  - `{cls.get('class')}`: {cls.get('status')} "
+                        f"({_fmt_secs(cls.get('seconds'))})"
+                    )
+            for failure in res.get("failures", [])[:20]:
+                lines.append(f"- failing test: `{failure.get('test')}`")
+            lines.append("")
+
+    # --- Slowest classes -------------------------------------------------------
+    merged: dict = {}
+    for res in results.values():
+        class_seconds = res.get("class_seconds")
+        if not isinstance(class_seconds, dict):
+            continue
+        for cls, secs in class_seconds.items():
+            merged[cls] = max(secs, merged.get(cls, 0.0))
+    if merged:
+        lines.append("## Slowest test classes (this run)")
+        lines.append("")
+        lines.append("| Class | Seconds |")
+        lines.append("|---|---|")
+        for cls, secs in sorted(merged.items(), key=lambda kv: -kv[1])[:10]:
+            lines.append(f"| {cls} | {secs:.1f} |")
+        lines.append("")
+
+    # --- Imbalance & wall clock -------------------------------------------------
+    if lanes:
+        preds = [l.get("predicted_s") or 0.0 for l in lanes]
+        avg_p = sum(preds) / len(preds)
+        imb_p = (max(preds) - min(preds)) / avg_p * 100 if avg_p else 0.0
+        lines.append(f"- Predicted lane imbalance: **{imb_p:.1f}%** (from the timing plan)")
+        if any_actual:
+            # Only numeric durations participate; a None actual (lane result
+            # without a measured duration) must never reach max/min/sum.
+            def _numeric(value):
+                return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+            actuals = [
+                results[l["lane"]]["actual_s"] for l in lanes
+                if l["lane"] in results and _numeric(results[l["lane"]].get("actual_s"))
+            ]
+            if actuals and len(actuals) == len(lanes):
+                avg_a = sum(actuals) / len(actuals)
+                imb_a = (max(actuals) - min(actuals)) / avg_a * 100 if avg_a else 0.0
+                lines.append(f"- Actual lane imbalance: **{imb_a:.1f}%**")
+            else:
+                lines.append(
+                    f"- Actual lane imbalance: incomplete "
+                    f"({len(actuals)}/{len(lanes)} lanes reported a numeric "
+                    "duration); omitted"
+                )
+
+    starts, ends = [], []
+    for res in results.values():
+        if res.get("started_at"):
+            starts.append(res["started_at"])
+        if res.get("finished_at"):
+            ends.append(res["finished_at"])
+    if build and build.get("started_at"):
+        starts.append(build["started_at"])
+    if build and build.get("finished_at"):
+        ends.append(build["finished_at"])
+    total = None
+    if starts and ends:
+        def parse(ts):
+            try:
+                return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+            except (TypeError, ValueError):
+                return None
+        parsed_starts = [t for t in map(parse, starts) if t is not None]
+        parsed_ends = [t for t in map(parse, ends) if t is not None]
+        if parsed_starts and parsed_ends:
+            total = int((max(parsed_ends) - min(parsed_starts)).total_seconds())
+    if total is not None:
+        lines.append(
+            f"- Overall wall clock (build start -> last lane finish): "
+            f"**{_fmt_secs(total)}**"
+        )
+    lines.append("")
+
+    text = "\n".join(lines)
+    with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    print(text)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("extract", help="extract timings from an .xcresult")
+    p.add_argument("--xcresult", required=True)
+    p.add_argument("--observations", help="write class-duration JSON here")
+    p.add_argument("--detail", help="write attempts/failures JSON here")
+    p.set_defaults(func=lambda a: _cmd_extract(a))
+
+    p = sub.add_parser("merge-parts", help="fold per-class extraction parts into lane-level documents")
+    p.add_argument("--parts-dir", required=True)
+    p.add_argument("--observations-out", default="")
+    p.add_argument("--detail-out", default="")
+    p.set_defaults(func=lambda a: merge_parts(a.parts_dir, a.observations_out, a.detail_out))
+
+    p = sub.add_parser("lane-result", help="assemble lane-result.json")
+    p.add_argument("--lane", required=True)
+    p.add_argument("--kind", required=True, choices=["unit", "ui"])
+    p.add_argument("--target", required=True)
+    p.add_argument("--classes", default="")
+    p.add_argument("--status", required=True)
+    p.add_argument("--predicted-s", type=float, default=None)
+    p.add_argument("--timeout-s", type=float, default=None)
+    p.add_argument("--actual-s", type=float, default=None)
+    p.add_argument("--started-at", default=None)
+    p.add_argument("--attempts-json", default="")
+    p.add_argument("--isolation-json", default="")
+    p.add_argument("--batches-json", default="")
+    p.add_argument("--retried-classes", default="")
+    p.add_argument("--infra-recovered-classes", default="")
+    p.add_argument("--persistent-infra-classes", default="")
+    p.add_argument("--simulator-reset", action="store_true")
+    p.add_argument("--simulator-erase", action="store_true")
+    p.add_argument("--hung-class", default="")
+    p.add_argument("--hung-batch", type=int, default=0)
+    p.add_argument("--observations", default="")
+    p.add_argument("--detail", default="")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=lambda a: lane_result(a))
+
+    p = sub.add_parser("aggregate", help="build the CI Test Report summary")
+    p.add_argument("--plan", required=True)
+    p.add_argument("--lanes-dir", required=True)
+    p.add_argument("--build-result", default="")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=lambda a: aggregate(a))
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+def _cmd_extract(a) -> int:
+    try:
+        doc = extract(a.xcresult)
+    except (RuntimeError, OSError) as exc:
+        warn(f"timing extraction failed safely: {exc}")
+        # Never leave a stale observations/detail file behind: the lane runner
+        # treats these as optional, and an old file from a previous attempt
+        # could silently poison the lane result (and, downstream, the EWMA
+        # timing history) with timings from a different invocation.
+        for stale in (a.observations, a.detail):
+            if stale and os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError as exc2:
+                    warn(f"could not remove stale output {stale}: {exc2}")
+        return EXIT_SCHEMA
+    if a.observations:
+        slim = {
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": doc["generated_at"],
+            "xcresult": doc["xcresult"],
+            "bundles": doc["bundles"],
+            "classes": doc["classes"],
+            "counts": doc["counts"],
+        }
+        with open(a.observations, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(slim, indent=2, sort_keys=True) + "\n")
+    if a.detail:
+        slim = {
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": doc["generated_at"],
+            "xcresult": doc["xcresult"],
+            "attempts": doc["attempts"],
+            "failures": doc["failures"],
+            "retried": doc["retried"],
+        }
+        with open(a.detail, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(slim, indent=2, sort_keys=True) + "\n")
+    info(
+        f"extracted timings: {doc['counts']['classes']} classes, "
+        f"{doc['counts']['cases']} case attempts, "
+        f"{len(doc['failures'])} failures, {len(doc['retried'])} retried tests"
+    )
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

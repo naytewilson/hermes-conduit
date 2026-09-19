@@ -70,6 +70,30 @@ final class SessionRenameTests: XCTestCase {
         XCTAssertEqual(storedRequest?.1, "Renamed")
     }
 
+    func testRotatedActiveRuntimeOutsideRowIDsRenamesDurableTarget() async throws {
+        // A runtime rotation the row has not caught up with (activeSessionID
+        // is the confirmed new runtime, the stale row still lists only the
+        // old one) must not fire the runtime RPC at an unverified id: the
+        // rename targets the row's durable id instead.
+        let session = makeSession()
+        var runtimeRequest: (String, String)?
+        var storedRequest: (String, String)?
+
+        _ = try await SessionRenameOperation.perform(
+            session: session,
+            activeSessionID: "runtime-new",
+            title: "Renamed",
+            operations: .init(
+                renameRuntime: { runtimeRequest = ($0, $1) },
+                renameStored: { storedRequest = ($0, $1) }
+            )
+        )
+
+        XCTAssertNil(runtimeRequest, "runtime-new is not positively tied to this row")
+        XCTAssertEqual(storedRequest?.0, "stored-id", "The durable id is the safe rename target")
+        XCTAssertEqual(storedRequest?.1, "Renamed")
+    }
+
     func testFailedRuntimeRPCFallsBackToStoredSessionPATCH() async throws {
         let session = makeSession()
         var storedRequest: (String, String)?

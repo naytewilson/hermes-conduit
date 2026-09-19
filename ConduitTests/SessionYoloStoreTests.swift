@@ -95,6 +95,24 @@ final class SessionYoloStoreTests: XCTestCase {
         XCTAssertEqual(diagnostics, [.unsupportedVersion(99)])
     }
 
+    func testClearAllOverridesDropsEveryProfileAndSurvivesRecreation() {
+        let (suite, defaults) = makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let key = "test.session-yolo"
+        let store = SessionYoloStore(defaults: defaults, storageKey: key)
+
+        store.setOverride(true, for: "default", sessionID: "session-a")
+        store.setOverride(false, for: "work", sessionID: "session-b")
+        store.clearAllOverrides()
+
+        XCTAssertNil(store.storedOverride(for: "default", sessionID: "session-a"))
+        XCTAssertNil(store.storedOverride(for: "work", sessionID: "session-b"))
+
+        let recreated = SessionYoloStore(defaults: defaults, storageKey: key)
+        XCTAssertNil(recreated.storedOverride(for: "default", sessionID: "session-a"))
+        XCTAssertNil(recreated.storedOverride(for: "work", sessionID: "session-b"))
+    }
+
     private func makeDefaults() -> (String, UserDefaults) {
         let suite = "SessionYoloStoreTests.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suite) else {

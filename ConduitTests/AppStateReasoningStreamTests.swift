@@ -1,0 +1,870 @@
+import Combine
+import XCTest
+@testable import Conduit
+
+/// Live reasoning must publish through the same display-cadence discipline as
+/// assistant streaming: raw gateway deltas merge into an authoritative buffer
+/// immediately, but the UI only republishes at a coalesced cadence so an
+/// expanded ThinkingCard cannot saturate main-actor layout work (0x8BADF00D
+/// scene-update watchdog during active reasoning streams).
+///
+/// The live card renders from the published PROJECTION
+/// (`liveReasoningSegment`) and never mutates the settled `messages` array
+/// while streaming — per-publish transcript mutation is O(message count) in a
+/// deep agent session. Settled `.reasoning` rows appear exactly once per
+/// segment, committed at semantic boundaries (tool cards, completion, error,
+/// interruption, new turn).
+@MainActor
+final class AppStateReasoningStreamTests: XCTestCase {
+
+    // MARK: - Harness
+
+    private func makeAppState(
+        lifecycleOperations: ChatResumeLifecycleOperations = .live
+    ) -> AppState {
+        let suite = "AppStateReasoningStreamTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            fatalError("Failed to create test UserDefaults suite")
+        }
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            chatResumeLifecycleOperations: lifecycleOperations,
+            sessionPresentationCache: SessionPresentationCache(defaults: defaults)
+        )
+    }
+
+    private func installActiveSession(_ state: AppState, id: String) {
+        let summary = SessionSummary(
+            id: id,
+            alternateIds: [],
+            title: id,
+            model: "Hermes",
+            updatedLabel: "now",
+            profile: "default",
+            source: .chat,
+            isActive: false,
+            isArchived: false,
+            lineageRootId: nil
+        )
+        state.sessions = [summary]
+        state.activeSessionId = id
+    }
+
+    /// The sidebar drawer suppresses streaming publications while open and
+    /// force-publishes the authoritative buffers when it closes. Toggling it
+    /// gives tests a synchronous flush without sleeping on the publish cadence.
+    /// The flush targets the live projection only — the segment keeps
+    /// streaming; only boundaries commit it into the transcript.
+    private func forceFlushPendingReasoning(on state: AppState) {
+        state.showSidebar = true
+        state.showSidebar = false
+    }
+
+    private func feedReasoning(
+        _ chunks: [String],
+        sessionId: String,
+        state: AppState
+    ) {
+        chunks.forEach {
+            state.handleStreamEvent(.reasoningDelta(sessionId: sessionId, text: $0))
+        }
+    }
+
+    private func reasoningCards(in state: AppState) -> [ChatMessage] {
+        state.messages.filter { $0.role == .reasoning }
+    }
+
+    /// Live reasoning content as the UI sees it (the projection), independent
+    /// of the settled transcript.
+    private func liveReasoningContent(on state: AppState) -> String? {
+        state.liveReasoningSegment?.content
+    }
+
+    // MARK: - Coalescing
+
+    func testRapidReasoningDeltasCoalesceTranscriptPublications() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+        let chunks = (0..<75).map { "reasoning-line-\($0) " }
+        let expectedTotal = chunks.joined()
+
+        var burstPublications = 0
+        let cancellable = state.$messages.dropFirst().sink { _ in burstPublications += 1 }
+        feedReasoning(chunks, sessionId: "stored-a", state: state)
+        cancellable.cancel()
+
+        // Zero transcript publications: the live card mounts in the
+        // projection, and every raw delta after that merges into the
+        // authoritative buffer without touching `messages` at all.
+        XCTAssertEqual(burstPublications, 0)
+        XCTAssertEqual(reasoningCards(in: state).count, 0)
+        XCTAssertEqual(liveReasoningContent(on: state), chunks.first)
+
+        forceFlushPendingReasoning(on: state)
+        XCTAssertEqual(liveReasoningContent(on: state), expectedTotal)
+        XCTAssertEqual(reasoningCards(in: state).count, 0)
+    }
+
+    func testScheduledReasoningPublishFiresWithoutForcedFlush() async throws {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(
+            ["coalesced chunk one ", "coalesced chunk two"],
+            sessionId: "stored-a",
+            state: state
+        )
+        XCTAssertEqual(liveReasoningContent(on: state), "coalesced chunk one ")
+
+        // The scheduled 50 ms publish must land on its own — no sidebar
+        // force-flush, no boundary event. The wait only needs to clear the
+        // cadence interval, so generous slack keeps it stable on CI runners.
+        var scheduledTranscriptPublications = 0
+        let cancellable = state.$messages.dropFirst().sink { _ in
+            scheduledTranscriptPublications += 1
+        }
+        try await Task.sleep(for: .milliseconds(500))
+        cancellable.cancel()
+        XCTAssertEqual(
+            liveReasoningContent(on: state),
+            "coalesced chunk one coalesced chunk two"
+        )
+        XCTAssertEqual(
+            scheduledTranscriptPublications, 0,
+            "the scheduled reasoning publish must not touch the settled transcript"
+        )
+    }
+
+    func testReasoningCardIdentityIsStableAcrossCoalescedPublications() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(["first segment "], sessionId: "stored-a", state: state)
+        forceFlushPendingReasoning(on: state)
+        let firstCardID = state.liveReasoningSegment?.id
+
+        feedReasoning(["continues to stream "], sessionId: "stored-a", state: state)
+        forceFlushPendingReasoning(on: state)
+
+        // One live card for the whole segment, stable identity, still outside
+        // the settled transcript.
+        XCTAssertEqual(reasoningCards(in: state).count, 0)
+        XCTAssertEqual(state.liveReasoningSegment?.id, firstCardID)
+        XCTAssertEqual(
+            liveReasoningContent(on: state),
+            "first segment continues to stream "
+        )
+    }
+
+    // MARK: - Gateway delta shapes
+
+    func testCumulativeReasoningSnapshotsDoNotDuplicate() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(
+            ["abc", "abcdef", "abcdefgh"],
+            sessionId: "stored-a",
+            state: state
+        )
+        forceFlushPendingReasoning(on: state)
+
+        XCTAssertEqual(liveReasoningContent(on: state), "abcdefgh")
+    }
+
+    func testIncrementalReasoningDeltasConcatenateExactly() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(["abc", "def", "ghi"], sessionId: "stored-a", state: state)
+        forceFlushPendingReasoning(on: state)
+
+        XCTAssertEqual(liveReasoningContent(on: state), "abcdefghi")
+    }
+
+    // MARK: - Boundary commits
+
+    func testMessageCompleteFlushesPendingReasoningSynchronously() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(
+            ["partial thought ", "still buffering"],
+            sessionId: "stored-a",
+            state: state
+        )
+        state.handleStreamEvent(
+            .messageComplete(
+                sessionId: "stored-a",
+                messageId: "assistant-1",
+                content: "Final answer",
+                reasoning: nil
+            )
+        )
+
+        // The boundary commits the live segment into the settled transcript.
+        XCTAssertEqual(
+            reasoningCards(in: state).first?.content,
+            "partial thought still buffering"
+        )
+        XCTAssertNil(state.liveReasoningSegment)
+
+        // Force the drained completion so the final assistant message lands
+        // synchronously; the reasoning card must stay complete and ordered
+        // before it.
+        state.handleStreamEvent(.messageStart(sessionId: "stored-a"))
+        guard let reasoningIndex = state.messages.firstIndex(where: { $0.role == .reasoning }),
+              let assistantIndex = state.messages.firstIndex(where: { $0.id == "assistant-1" })
+        else {
+            return XCTFail("Expected finalized reasoning card and assistant message")
+        }
+        XCTAssertEqual(state.messages[reasoningIndex].content, "partial thought still buffering")
+        XCTAssertLessThan(reasoningIndex, assistantIndex)
+    }
+
+    func testToolStartFlushesPendingReasoningAndPreservesOrdering() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(
+            ["deciding which file to inspect ", "before the tool runs"],
+            sessionId: "stored-a",
+            state: state
+        )
+        state.handleStreamEvent(
+            .toolStart(sessionId: "stored-a", toolName: "read_file", toolInput: nil)
+        )
+
+        XCTAssertEqual(
+            reasoningCards(in: state).first?.content,
+            "deciding which file to inspect before the tool runs"
+        )
+        XCTAssertEqual(state.messages.last?.role, .tool)
+        guard let reasoningIndex = state.messages.firstIndex(where: { $0.role == .reasoning }),
+              let toolIndex = state.messages.firstIndex(where: { $0.role == .tool })
+        else {
+            return XCTFail("Expected reasoning card followed by tool card")
+        }
+        XCTAssertLessThan(reasoningIndex, toolIndex)
+
+        // Reasoning that resumes after a tool belongs to a fresh live card,
+        // never the finalized one.
+        feedReasoning(["post-tool thinking "], sessionId: "stored-a", state: state)
+        forceFlushPendingReasoning(on: state)
+        XCTAssertEqual(reasoningCards(in: state).count, 1)
+        XCTAssertEqual(liveReasoningContent(on: state), "post-tool thinking ")
+    }
+
+    func testMessageErrorFlushesPendingReasoningWithoutStaleDelayedPublish() async throws {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        // Two chunks guarantee a coalesced publish is actually pending when
+        // the boundary arrives; one chunk would mount the card fully and
+        // make the flush assertion trivially pass.
+        feedReasoning(
+            ["mid-flight reasoning ", "still open"],
+            sessionId: "stored-a",
+            state: state
+        )
+        state.handleStreamEvent(
+            .messageError(sessionId: "stored-a", message: "gateway exploded")
+        )
+
+        XCTAssertEqual(
+            reasoningCards(in: state).first?.content,
+            "mid-flight reasoning still open"
+        )
+        XCTAssertEqual(state.errorMessage, "gateway exploded")
+
+        // No coalesced publish may fire after the boundary: not the
+        // transcript equality, and not even a single republication.
+        var postBoundaryPublications = 0
+        let cancellable = state.$messages.dropFirst().sink { _ in
+            postBoundaryPublications += 1
+        }
+        try await Task.sleep(for: .milliseconds(250))
+        cancellable.cancel()
+        XCTAssertEqual(postBoundaryPublications, 0)
+        XCTAssertEqual(
+            reasoningCards(in: state).first?.content,
+            "mid-flight reasoning still open"
+        )
+    }
+
+    func testMessageInterruptedFlushesPendingReasoningWithoutStaleDelayedPublish() async throws {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(
+            ["about to be ", "interrupted"],
+            sessionId: "stored-a",
+            state: state
+        )
+        state.handleStreamEvent(.messageInterrupted(sessionId: "stored-a"))
+
+        XCTAssertEqual(
+            reasoningCards(in: state).first?.content,
+            "about to be interrupted"
+        )
+
+        var postBoundaryPublications = 0
+        let cancellable = state.$messages.dropFirst().sink { _ in
+            postBoundaryPublications += 1
+        }
+        try await Task.sleep(for: .milliseconds(250))
+        cancellable.cancel()
+        XCTAssertEqual(postBoundaryPublications, 0)
+        XCTAssertEqual(
+            reasoningCards(in: state).first?.content,
+            "about to be interrupted"
+        )
+    }
+
+    func testShowSidebarSuppressesReasoningPublishUntilClosed() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(["visible "], sessionId: "stored-a", state: state)
+        XCTAssertEqual(liveReasoningContent(on: state), "visible ")
+
+        // The drawer suppresses coalesced reasoning publications while it is
+        // animating; the buffer stays authoritative.
+        state.showSidebar = true
+        feedReasoning(["hidden ", "while draining"], sessionId: "stored-a", state: state)
+        XCTAssertEqual(liveReasoningContent(on: state), "visible ")
+
+        state.showSidebar = false
+        XCTAssertEqual(
+            liveReasoningContent(on: state),
+            "visible hidden while draining"
+        )
+        // The suppression flush publishes the projection; it must not commit
+        // the still-streaming segment into the transcript.
+        XCTAssertEqual(reasoningCards(in: state).count, 0)
+    }
+
+    func testReasoningDeltaDuringCompletionDrainMountsFreshCardAfterAssistant() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(["pre-complete "], sessionId: "stored-a", state: state)
+        state.handleStreamEvent(
+            .messageComplete(
+                sessionId: "stored-a",
+                messageId: "assistant-1",
+                content: "Final answer",
+                reasoning: nil
+            )
+        )
+        // A delta racing the drain window finalizes the pending completion
+        // first, then mounts a fresh live card — the pre-projection behavior,
+        // with no buffered text lost. The fresh segment stays in the
+        // projection until its own boundary.
+        state.handleStreamEvent(
+            .reasoningDelta(sessionId: "stored-a", text: "late thought")
+        )
+
+        XCTAssertEqual(state.messages.map(\.role), [.reasoning, .assistant])
+        XCTAssertEqual(liveReasoningContent(on: state), "late thought")
+
+        // The next turn boundary commits the late segment in order.
+        state.handleStreamEvent(.messageStart(sessionId: "stored-a"))
+        XCTAssertEqual(state.messages.map(\.role), [.reasoning, .assistant, .reasoning])
+        XCTAssertEqual(state.messages.last?.content, "late thought")
+    }
+
+    func testCompletionReasoningTraceDoesNotDuplicateStreamedCard() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(
+            ["streamed so far ", "still streaming"],
+            sessionId: "stored-a",
+            state: state
+        )
+        state.handleStreamEvent(
+            .messageComplete(
+                sessionId: "stored-a",
+                messageId: "assistant-1",
+                content: "Final answer",
+                reasoning: "full trace"
+            )
+        )
+        state.handleStreamEvent(.messageStart(sessionId: "stored-a"))
+
+        // Completion repeating the trace after streamed reasoning keeps the
+        // streamed card; it must not append a duplicate thinking box.
+        XCTAssertEqual(reasoningCards(in: state).count, 1)
+        XCTAssertEqual(
+            reasoningCards(in: state).first?.content,
+            "streamed so far still streaming"
+        )
+    }
+
+    func testCompletionOnlyReasoningSurvivesFullReasoningStateReset() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        // Turn one streamed reasoning: receivedReasoningForCurrentTurn == true.
+        feedReasoning(["prior turn reasoning "], sessionId: "stored-a", state: state)
+        state.handleStreamEvent(.messageStart(sessionId: "stored-a"))
+        XCTAssertEqual(reasoningCards(in: state).count, 1)
+
+        // A full state reset (disconnect) must restore the ENTIRE per-turn
+        // reasoning state machine — a stale turn flag would make the next
+        // session's completion-carried reasoning look already-streamed and
+        // silently discard it.
+        state.disconnect()
+        installActiveSession(state, id: "stored-b")
+
+        state.handleStreamEvent(
+            .messageComplete(
+                sessionId: "stored-b",
+                messageId: "assistant-b",
+                content: "Answer",
+                reasoning: "completion-only reasoning"
+            )
+        )
+        // Force the drained completion synchronously.
+        state.handleStreamEvent(.messageStart(sessionId: "stored-b"))
+
+        let cards = reasoningCards(in: state)
+        XCTAssertEqual(cards.count, 1)
+        XCTAssertEqual(cards.first?.content, "completion-only reasoning")
+        XCTAssertFalse(
+            state.messages.contains { $0.content.contains("prior turn") },
+            "Session A reasoning must not leak into session B's transcript"
+        )
+    }
+
+    func testToolBoundaryDoesNotEraseTurnReasoningFlagAtCompletion() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(["pre-tool reasoning"], sessionId: "stored-a", state: state)
+        state.handleStreamEvent(
+            .toolStart(sessionId: "stored-a", toolName: "read_file", toolInput: nil)
+        )
+        state.handleStreamEvent(
+            .toolComplete(sessionId: "stored-a", toolName: "read_file", toolOutput: "result")
+        )
+        state.handleStreamEvent(
+            .messageComplete(
+                sessionId: "stored-a",
+                messageId: "assistant-1",
+                content: "Final answer",
+                reasoning: "full completion trace"
+            )
+        )
+        // Force the drained completion synchronously.
+        state.handleStreamEvent(.messageStart(sessionId: "stored-a"))
+
+        // A tool boundary ends the reasoning SEGMENT, not the turn: reasoning
+        // streamed before the tool still counts as this turn's reasoning, so
+        // the completion-carried trace must not mount a duplicate card.
+        let cards = reasoningCards(in: state)
+        XCTAssertEqual(cards.count, 1)
+        XCTAssertEqual(cards.first?.content, "pre-tool reasoning")
+
+        guard let reasoningIndex = state.messages.firstIndex(where: { $0.role == .reasoning }),
+              let toolIndex = state.messages.firstIndex(where: { $0.role == .tool }),
+              let assistantIndex = state.messages.firstIndex(where: { $0.id == "assistant-1" })
+        else {
+            return XCTFail("Expected reasoning, tool, and assistant messages")
+        }
+        XCTAssertLessThan(reasoningIndex, toolIndex)
+        XCTAssertLessThan(toolIndex, assistantIndex)
+        XCTAssertEqual(state.messages[assistantIndex].content, "Final answer")
+        XCTAssertEqual(state.messages[toolIndex].tool?.status, .complete)
+    }
+
+    func testStableToolIDsKeepConcurrentIdenticalCallsDistinctOutOfOrder() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        for toolID in ["call-a", "call-b"] {
+            state.handleStreamEvent(.toolStart(
+                sessionId: "stored-a", toolName: "terminal", toolInput: "git status", toolID: toolID
+            ))
+        }
+        state.handleStreamEvent(.toolComplete(
+            sessionId: "stored-a", toolName: "terminal", toolOutput: "b-output", toolID: "call-b"
+        ))
+        state.handleStreamEvent(.toolComplete(
+            sessionId: "stored-a", toolName: "terminal", toolOutput: "a-output", toolID: "call-a"
+        ))
+
+        let tools = state.messages.compactMap(\.tool)
+        XCTAssertEqual(tools.count, 2)
+        XCTAssertEqual(tools.first { $0.id == "call-a" }?.output, "a-output")
+        XCTAssertEqual(tools.first { $0.id == "call-b" }?.output, "b-output")
+
+        // Replayed completion updates the same terminal card in place.
+        state.handleStreamEvent(.toolComplete(
+            sessionId: "stored-a", toolName: "terminal", toolOutput: "b-replayed", toolID: "call-b"
+        ))
+        XCTAssertEqual(state.messages.compactMap(\.tool).count, 2)
+        XCTAssertEqual(state.messages.compactMap(\.tool).first { $0.id == "call-b" }?.output, "b-replayed")
+
+        // A replayed start cannot re-arm a completed card with the same id.
+        state.handleStreamEvent(.toolStart(
+            sessionId: "stored-a", toolName: "terminal", toolInput: "git status", toolID: "call-a"
+        ))
+        XCTAssertEqual(state.messages.compactMap(\.tool).count, 2)
+        XCTAssertEqual(state.messages.compactMap(\.tool).first { $0.id == "call-a" }?.status, .complete)
+
+        // A completion for another known id must append its own result, not
+        // steal either of the two same-name calls.
+        state.handleStreamEvent(.toolComplete(
+            sessionId: "stored-a", toolName: "terminal", toolOutput: "c-output", toolID: "call-c"
+        ))
+        XCTAssertEqual(state.messages.compactMap(\.tool).first { $0.id == "call-a" }?.output, "a-output")
+        XCTAssertEqual(state.messages.compactMap(\.tool).first { $0.id == "call-b" }?.output, "b-replayed")
+        XCTAssertEqual(state.messages.compactMap(\.tool).first { $0.id == "call-c" }?.status, .complete)
+    }
+
+    func testAmbiguousIdlessCompletionDoesNotGuessOrDestroyRunningCards() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+        state.handleStreamEvent(.toolStart(sessionId: "stored-a", toolName: "terminal", toolInput: "first"))
+        state.handleStreamEvent(.toolStart(sessionId: "stored-a", toolName: "terminal", toolInput: "second"))
+        state.handleStreamEvent(.toolComplete(sessionId: "stored-a", toolName: "terminal", toolOutput: "done"))
+
+        let tools = state.messages.compactMap(\.tool)
+        XCTAssertEqual(tools.count, 3, "An ID-less completion must not guess when multiple ID-less running cards exist")
+        XCTAssertEqual(tools[0].status, .running)
+        XCTAssertEqual(tools[0].input, "first")
+        XCTAssertEqual(tools[1].status, .running)
+        XCTAssertEqual(tools[1].input, "second")
+        XCTAssertEqual(tools[2].status, .complete)
+        XCTAssertEqual(tools[2].output, "done")
+    }
+
+    func testUniqueIdlessCompletionAdoptsRunningCardInPlace() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+        state.handleStreamEvent(.toolStart(sessionId: "stored-a", toolName: "terminal", toolInput: "first"))
+        state.handleStreamEvent(.toolComplete(sessionId: "stored-a", toolName: "terminal", toolOutput: "done"))
+
+        let tools = state.messages.compactMap(\.tool)
+        XCTAssertEqual(tools.count, 1, "An ID-less completion should adopt the unique running card")
+        XCTAssertEqual(tools[0].status, .complete)
+        XCTAssertEqual(tools[0].input, "first")
+        XCTAssertEqual(tools[0].output, "done")
+    }
+
+    func testIdentifiedCompletionAdoptsUniqueIdlessRunningTool() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+        state.handleStreamEvent(.toolStart(sessionId: "stored-a", toolName: "terminal", toolInput: "git status", toolID: nil))
+        state.handleStreamEvent(.toolComplete(sessionId: "stored-a", toolName: "terminal", toolOutput: "clean", toolID: "call-xyz"))
+
+        let tools = state.messages.compactMap(\.tool)
+        XCTAssertEqual(tools.count, 1, "An identified completion should adopt a unique ID-less running card")
+        XCTAssertEqual(tools[0].id, "call-xyz")
+        XCTAssertEqual(tools[0].status, .complete)
+        XCTAssertEqual(tools[0].input, "git status")
+        XCTAssertEqual(tools[0].output, "clean")
+    }
+
+    func testIdentifiedCompletionDoesNotAdoptAmbiguousIdlessRunningTools() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+        state.handleStreamEvent(.toolStart(sessionId: "stored-a", toolName: "terminal", toolInput: "first", toolID: nil))
+        state.handleStreamEvent(.toolStart(sessionId: "stored-a", toolName: "terminal", toolInput: "second", toolID: nil))
+        state.handleStreamEvent(.toolComplete(sessionId: "stored-a", toolName: "terminal", toolOutput: "done", toolID: "call-xyz"))
+
+        let tools = state.messages.compactMap(\.tool)
+        XCTAssertEqual(tools.count, 3, "An identified completion must not guess when multiple ID-less running cards exist")
+        XCTAssertEqual(tools[0].status, .running)
+        XCTAssertEqual(tools[1].status, .running)
+        XCTAssertEqual(tools[2].status, .complete)
+        XCTAssertEqual(tools[2].id, "call-xyz")
+        XCTAssertEqual(tools[2].output, "done")
+    }
+
+    func testIdlessCompletionAdoptsUniqueIdentifiedRunningToolPreservingToolID() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+        state.handleStreamEvent(.toolStart(sessionId: "stored-a", toolName: "terminal", toolInput: "git pull", toolID: "call-start-123"))
+        state.handleStreamEvent(.toolComplete(sessionId: "stored-a", toolName: "terminal", toolOutput: "up to date", toolID: nil))
+
+        let tools = state.messages.compactMap(\.tool)
+        XCTAssertEqual(tools.count, 1, "An ID-less completion should adopt a unique identified running card")
+        XCTAssertEqual(tools[0].id, "call-start-123", "Preserves the existing tool ID from the start event")
+        XCTAssertEqual(tools[0].status, .complete)
+        XCTAssertEqual(tools[0].input, "git pull")
+        XCTAssertEqual(tools[0].output, "up to date")
+    }
+
+    func testIdlessCompletionDoesNotAdoptAmbiguousIdentifiedRunningTools() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+        state.handleStreamEvent(.toolStart(sessionId: "stored-a", toolName: "terminal", toolInput: "cmd 1", toolID: "call-1"))
+        state.handleStreamEvent(.toolStart(sessionId: "stored-a", toolName: "terminal", toolInput: "cmd 2", toolID: "call-2"))
+        state.handleStreamEvent(.toolComplete(sessionId: "stored-a", toolName: "terminal", toolOutput: "done", toolID: nil))
+
+        let tools = state.messages.compactMap(\.tool)
+        XCTAssertEqual(tools.count, 3, "An ID-less completion must not guess when multiple identified running cards exist")
+        XCTAssertEqual(tools[0].status, .running)
+        XCTAssertEqual(tools[0].id, "call-1")
+        XCTAssertEqual(tools[1].status, .running)
+        XCTAssertEqual(tools[1].id, "call-2")
+        XCTAssertEqual(tools[2].status, .complete)
+        XCTAssertNil(tools[2].id)
+        XCTAssertEqual(tools[2].output, "done")
+    }
+
+    func testMultiSegmentTurnKeepsBothSegmentsAndSkipsCompletionTrace() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        // Two reasoning segments separated by tools inside ONE turn. Both
+        // segment cards must survive to completion, and the completion-carried
+        // trace must not append a third.
+        feedReasoning(["first segment "], sessionId: "stored-a", state: state)
+        state.handleStreamEvent(
+            .toolStart(sessionId: "stored-a", toolName: "read_file", toolInput: nil)
+        )
+        feedReasoning(["second segment"], sessionId: "stored-a", state: state)
+        state.handleStreamEvent(
+            .toolComplete(sessionId: "stored-a", toolName: "read_file", toolOutput: "result")
+        )
+        state.handleStreamEvent(
+            .messageComplete(
+                sessionId: "stored-a",
+                messageId: "assistant-1",
+                content: "Final answer",
+                reasoning: "full completion trace"
+            )
+        )
+        state.handleStreamEvent(.messageStart(sessionId: "stored-a"))
+
+        let cards = reasoningCards(in: state)
+        XCTAssertEqual(cards.count, 2)
+        XCTAssertEqual(cards.first?.content, "first segment ")
+        XCTAssertEqual(cards.last?.content, "second segment")
+        XCTAssertEqual(state.messages.last?.id, "assistant-1")
+    }
+
+    /// Mid-turn transcript rows (review summaries, clarify/approval cards,
+    /// slash output, steer corrections) must not land below the live
+    /// reasoning card's eventual commit: each append settles the segment
+    /// first, preserving the pre-projection chronology, and reasoning that
+    /// resumes afterwards mounts a fresh segment (tool-boundary precedent).
+    func testMidTurnTranscriptAppendsCommitReasoningSegmentFirst() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(["thinking about the change "], sessionId: "stored-a", state: state)
+        state.handleStreamEvent(.reviewSummary(
+            sessionId: "stored-a",
+            activity: ReviewActivity(summary: "mid-turn review", details: nil, fullSessionId: nil)
+        ))
+
+        // The live card committed above the review row; nothing stays live.
+        XCTAssertEqual(state.messages.map(\.role), [.reasoning, .system])
+        XCTAssertEqual(state.messages.first?.content, "thinking about the change ")
+        XCTAssertNil(state.liveReasoningSegment)
+
+        // Reasoning that resumes after the interjection mounts a FRESH
+        // segment, which the next mid-turn append commits the same way.
+        feedReasoning(["second segment "], sessionId: "stored-a", state: state)
+        state.handleStreamEvent(.approval(
+            sessionId: "stored-a",
+            activity: ApprovalActivity(
+                sessionId: "stored-a",
+                command: "run tests",
+                description: "wants to run tests",
+                choices: nil,
+                allowPermanent: false,
+                smartDenied: false,
+                status: .pending,
+                choice: nil,
+                error: nil
+            )
+        ))
+        XCTAssertEqual(state.messages.map(\.role), [.reasoning, .system, .reasoning, .approval])
+        XCTAssertEqual(state.messages[2].content, "second segment ")
+
+        feedReasoning(["third segment"], sessionId: "stored-a", state: state)
+        state.handleStreamEvent(.clarify(
+            sessionId: "stored-a",
+            activity: ClarifyActivity(
+                requestId: "req-1",
+                questions: [
+                    ClarifyQuestion(id: "q0", question: "which scope?", choices: [
+                        ClarifyChoice(label: "A", value: "a"),
+                        ClarifyChoice(label: "B", value: "b")
+                    ])
+                ]
+            )
+        ))
+        XCTAssertEqual(
+            state.messages.map(\.role),
+            [.reasoning, .system, .reasoning, .approval, .reasoning, .clarify]
+        )
+        XCTAssertEqual(state.messages[4].content, "third segment")
+        XCTAssertNil(state.liveReasoningSegment)
+    }
+
+    func testSessionSwitchDiscardsPendingReasoningPublishForNewSession() async {
+        let replacementMessages = [
+            ChatMessage(id: "new-1", role: .assistant, content: "Other session", timestamp: "1")
+        ]
+        let state = makeAppState(lifecycleOperations: ChatResumeLifecycleOperations(
+            openSession: { _, sessionID, _ in
+                SessionResumeResult(
+                    sessionId: sessionID,
+                    messages: replacementMessages,
+                    snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)])
+                )
+            },
+            refreshContext: { _, _ in }
+        ))
+        let connection = HermesConnection(baseUrl: "https://one.example", ticket: "ticket")
+        state.connection = connection
+        state.client = HermesClient(connection: connection, profile: "default")
+        let origin = SessionSummary(
+            id: "stored-a",
+            alternateIds: [],
+            title: "stored-a",
+            model: "Hermes",
+            updatedLabel: "now",
+            profile: "default",
+            source: .chat,
+            isActive: false,
+            isArchived: false,
+            lineageRootId: nil
+        )
+        let destination = SessionSummary(
+            id: "stored-b",
+            alternateIds: [],
+            title: "stored-b",
+            model: "Hermes",
+            updatedLabel: "now",
+            profile: "default",
+            source: .chat,
+            isActive: false,
+            isArchived: false,
+            lineageRootId: nil
+        )
+        state.sessions = [origin, destination]
+        state.activeSessionId = origin.id
+
+        feedReasoning(
+            ["stale reasoning ", "that must not leak"],
+            sessionId: origin.id,
+            state: state
+        )
+        let opened = await state.openSession(destination.id)
+        XCTAssertTrue(opened)
+
+        XCTAssertEqual(state.activeSessionId, destination.id)
+        XCTAssertTrue(reasoningCards(in: state).isEmpty)
+        XCTAssertNil(state.liveReasoningSegment)
+        XCTAssertEqual(state.messages, replacementMessages)
+
+        // Even a forced flush of any surviving pending state must not
+        // reproduce the old session's reasoning inside the new transcript.
+        forceFlushPendingReasoning(on: state)
+        XCTAssertTrue(reasoningCards(in: state).isEmpty)
+        XCTAssertNil(state.liveReasoningSegment)
+        XCTAssertEqual(state.messages, replacementMessages)
+
+        // Five 50 ms cadence periods: proves that after the session switch no
+        // stale publish (guarded or not) can mutate the replacement transcript.
+        try? await Task.sleep(for: .milliseconds(250))
+        XCTAssertTrue(reasoningCards(in: state).isEmpty)
+        XCTAssertNil(state.liveReasoningSegment)
+        XCTAssertEqual(state.messages, replacementMessages)
+    }
+
+    func testBotChatToolRecoveryAndCleanupUnderBotProfileNamespace() async {
+        let suite = "testBotChatToolRecovery.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            XCTFail("Failed to initialize UserDefaults suite")
+            return
+        }
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let cache = SessionPresentationCache(defaults: defaults)
+        let state = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            sessionPresentationCache: cache
+        )
+
+        let botSessionID = "bot-session-1"
+        let botProfile = "my-bot-profile"
+        let dashboardProfile = "dashboard-default"
+
+        state.setActiveProfileForTesting(dashboardProfile)
+        installActiveSession(state, id: botSessionID)
+        state.noteBotChatSessionForTesting(botSessionID, profile: botProfile)
+
+        // 1. Begin a tool call in the bot chat
+        state.handleStreamEvent(.toolStart(
+            sessionId: botSessionID,
+            toolName: "calculator",
+            toolInput: "40 + 2",
+            toolID: "call-calc-1"
+        ))
+
+        let toolInFlight = state.messages.compactMap(\.tool)
+        XCTAssertEqual(toolInFlight.count, 1)
+        XCTAssertEqual(toolInFlight.first?.status, .running)
+
+        // Verify pending tool is stored under botProfile, NOT dashboardProfile
+        let botPending = cache.merge([], profile: botProfile, sessionIDs: [botSessionID], includePendingTools: true)
+        let dashboardPending = cache.merge([], profile: dashboardProfile, sessionIDs: [botSessionID], includePendingTools: true)
+        XCTAssertEqual(botPending.compactMap(\.tool).map(\.id), ["call-calc-1"], "Pending tool must be persisted under the bot profile namespace")
+        XCTAssertTrue(dashboardPending.isEmpty, "No pending tool entry should exist under the dashboard profile")
+
+        // 2. Simulate reopen/recovery with running == true
+        let recoverState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            sessionPresentationCache: cache
+        )
+        recoverState.setActiveProfileForTesting(dashboardProfile)
+        installActiveSession(recoverState, id: botSessionID)
+        recoverState.noteBotChatSessionForTesting(botSessionID, profile: botProfile)
+
+        let resumeResultRunning = SessionResumeResult(
+            sessionId: botSessionID,
+            messages: [],
+            snapshot: SessionRuntimeSnapshot(object: ["running": .bool(true)])
+        )
+        let restored = recoverState.applyChatResume(resumeResultRunning)
+        XCTAssertTrue(restored)
+        let restoredTools = recoverState.messages.compactMap(\.tool)
+        XCTAssertEqual(restoredTools.count, 1, "The running tool card must be restored from the bot profile cache")
+        XCTAssertEqual(restoredTools.first?.id, "call-calc-1")
+        XCTAssertEqual(restoredTools.first?.status, .running)
+
+        // 3. Simulate completion/clean it up with running == false
+        let resumeResultIdle = SessionResumeResult(
+            sessionId: botSessionID,
+            messages: [
+                ChatMessage(
+                    id: "tool-complete-gw",
+                    role: .tool,
+                    content: "",
+                    timestamp: "now",
+                    tool: ToolActivity(id: "call-calc-1", name: "calculator", input: "40 + 2", output: "42", status: .complete)
+                )
+            ],
+            snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)])
+        )
+        _ = recoverState.applyChatResume(resumeResultIdle)
+
+        // Verify no stale dashboard-profile entry remains and bot-profile entry is cleared
+        let updatedDashboardPending = cache.merge([], profile: dashboardProfile, sessionIDs: [botSessionID], includePendingTools: true)
+        let updatedBotPending = cache.merge([], profile: botProfile, sessionIDs: [botSessionID], includePendingTools: true)
+        XCTAssertTrue(updatedDashboardPending.isEmpty)
+        XCTAssertTrue(updatedBotPending.filter { $0.tool?.status == .running }.isEmpty, "Pending tool side store must be cleaned up when running == false")
+    }
+}

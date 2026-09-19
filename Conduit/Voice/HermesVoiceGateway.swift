@@ -7,6 +7,26 @@ import Foundation
 
 @MainActor
 final class HermesVoiceGateway: VoiceGatewayService {
+    /// Mirrors Hermes Desktop's transcription request policy
+    /// (apps/desktop/src/api/system.ts): remote providers and long recordings
+    /// regularly exceed short request ceilings, so every request gets a
+    /// generous floor that scales with the payload and clamps at a cap.
+    static let transcriptionMinimumRequestTimeoutMilliseconds = 180_000
+    static let transcriptionMaximumRequestTimeoutMilliseconds = 600_000
+    /// The payload is the base64 audio data URL itself, so its length tracks
+    /// clip size. Conduit records 16kHz mono 16-bit WAV (~42.7k base64
+    /// characters per second of audio), so 0.1ms per character budgets ~4.3s
+    /// of timeout per 1s of audio before the cap clamps it.
+    static let transcriptionTimeoutMillisecondsPerDataURLCharacter = 0.1
+
+    static func transcriptionRequestTimeoutMilliseconds(dataURLCharacterCount: Int) -> Int {
+        let estimated = max(
+            transcriptionMinimumRequestTimeoutMilliseconds,
+            Int(ceil(Double(dataURLCharacterCount) * transcriptionTimeoutMillisecondsPerDataURLCharacter))
+        )
+        return min(transcriptionMaximumRequestTimeoutMilliseconds, estimated)
+    }
+
     let profile: String
     private let bridge: DashboardTicketBridge
     private let baseURL: String
@@ -19,11 +39,16 @@ final class HermesVoiceGateway: VoiceGatewayService {
     }
 
     func transcribe(_ audio: VoiceCapturedAudio) async throws -> String {
+        // Base64 encoding is expensive for long recordings — build the data
+        // URL once and reuse it for both the payload and the timeout budget.
+        let dataURL = audio.dataURL
         let response = try await bridge.requestJSON(
             path: "/api/audio/transcribe" + profileQuery,
             method: "POST",
-            body: ["data_url": audio.dataURL, "mime_type": "audio/wav"],
-            timeoutMilliseconds: 90_000
+            body: ["data_url": dataURL, "mime_type": "audio/wav"],
+            timeoutMilliseconds: Self.transcriptionRequestTimeoutMilliseconds(
+                dataURLCharacterCount: dataURL.utf8.count
+            )
         )
         if let error = response["error"] as? String, !error.isEmpty { throw DashboardTicketBridgeError.requestFailed(error) }
         guard let rawTranscript = response["transcript"] as? String ?? response["text"] as? String else {
@@ -53,7 +78,7 @@ final class HermesVoiceGateway: VoiceGatewayService {
                 queryItems: [URLQueryItem(name: "ticket", value: ticket), URLQueryItem(name: "profile", value: profile)]
             )
         } catch {
-            throw VoiceAudioError.unavailable("Could not open the speech stream.")
+            throw VoiceAudioError.unavailable(AppLocalization.string("Could not open the speech stream."))
         }
         let task = URLSession.shared.webSocketTask(with: url)
         task.resume()
@@ -79,7 +104,7 @@ final class HermesVoiceGateway: VoiceGatewayService {
         if let error = response["error"] as? String, !error.isEmpty { throw DashboardTicketBridgeError.requestFailed(error) }
         guard let dataURL = response["data_url"] as? String ?? response["dataUrl"] as? String,
               let data = DataURLLimits.decodeBase64DataURL(dataURL) else {
-            throw DashboardTicketBridgeError.requestFailed("Hermes returned invalid fallback audio.")
+            throw DashboardTicketBridgeError.requestFailed(AppLocalization.string("Hermes returned invalid fallback audio."))
         }
         return data
     }
@@ -151,7 +176,7 @@ private final class HermesSpeechStream: VoiceSpeechStream {
                 catch { return }
                 guard let self, !self.terminal, !self.cancelledByClient else { return }
                 if self.receivedPCM {
-                    self.complete(.failure(VoiceAudioError.unavailable("Hermes speech streaming timed out.")))
+                    self.complete(.failure(VoiceAudioError.unavailable(AppLocalization.string("Hermes speech streaming timed out."))))
                 } else {
                     self.fallbackMode = true
                     // A send of {done:true} can remain suspended even after
@@ -202,7 +227,7 @@ private final class HermesSpeechStream: VoiceSpeechStream {
 
     private func sendJSON(_ object: [String: Any]) async throws {
         let data = try JSONSerialization.data(withJSONObject: object)
-        guard let string = String(data: data, encoding: .utf8) else { throw VoiceAudioError.unavailable("Could not encode speech request.") }
+        guard let string = String(data: data, encoding: .utf8) else { throw VoiceAudioError.unavailable(AppLocalization.string("Could not encode speech request.")) }
         // Hermes uses receive_json(), so these must be WebSocket text frames.
         try await task.send(.string(string))
     }
@@ -249,7 +274,7 @@ private final class HermesSpeechStream: VoiceSpeechStream {
             task.cancel(with: .goingAway, reason: nil)
             startFallbackIfNeeded()
         case "error":
-            complete(.failure(DashboardTicketBridgeError.requestFailed(object["message"] as? String ?? "Hermes speech stream failed.")))
+            complete(.failure(DashboardTicketBridgeError.requestFailed(object["message"] as? String ?? AppLocalization.string("Hermes speech stream failed."))))
         default:
             break
         }

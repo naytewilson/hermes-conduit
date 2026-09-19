@@ -15,6 +15,14 @@ struct SelectableTextView: UIViewRepresentable {
     let maximumNumberOfLines: Int
     let wrapsLines: Bool
     let linkColor: UIColor
+    /// Paragraph-style alignment applied to laid-out text, so it governs
+    /// every wrapped line (Markdown table `:---:`/`---:` cells). `.natural`
+    /// preserves the default for all other callers.
+    let textAlignment: NSTextAlignment
+    /// When set, the view self-sizes at a deterministic width derived from
+    /// its content and this range (used by Markdown table cells), ignoring
+    /// layout proposals. See `measuredSize(proposalWidth:textView:)`.
+    let selfSizingWidthRange: ClosedRange<CGFloat>?
     let selectionCoordinator: MarkdownSelectionCoordinator?
     let selectionSegment: MarkdownSelectionSegmentDescriptor?
 
@@ -26,6 +34,8 @@ struct SelectableTextView: UIViewRepresentable {
         maximumNumberOfLines: Int = 0,
         wrapsLines: Bool = true,
         linkColor: UIColor = .link,
+        textAlignment: NSTextAlignment = .natural,
+        selfSizingWidthRange: ClosedRange<CGFloat>? = nil,
         selectionCoordinator: MarkdownSelectionCoordinator? = nil,
         selectionSegment: MarkdownSelectionSegmentDescriptor? = nil
     ) {
@@ -36,6 +46,8 @@ struct SelectableTextView: UIViewRepresentable {
         self.maximumNumberOfLines = maximumNumberOfLines
         self.wrapsLines = wrapsLines
         self.linkColor = linkColor
+        self.textAlignment = textAlignment
+        self.selfSizingWidthRange = selfSizingWidthRange
         self.selectionCoordinator = selectionCoordinator
         self.selectionSegment = selectionSegment
     }
@@ -48,6 +60,8 @@ struct SelectableTextView: UIViewRepresentable {
         maximumNumberOfLines: Int = 0,
         wrapsLines: Bool = true,
         linkColor: UIColor = .link,
+        textAlignment: NSTextAlignment = .natural,
+        selfSizingWidthRange: ClosedRange<CGFloat>? = nil,
         selectionCoordinator: MarkdownSelectionCoordinator? = nil,
         selectionSegment: MarkdownSelectionSegmentDescriptor? = nil
     ) {
@@ -59,6 +73,8 @@ struct SelectableTextView: UIViewRepresentable {
             maximumNumberOfLines: maximumNumberOfLines,
             wrapsLines: wrapsLines,
             linkColor: linkColor,
+            textAlignment: textAlignment,
+            selfSizingWidthRange: selfSizingWidthRange,
             selectionCoordinator: selectionCoordinator,
             selectionSegment: selectionSegment
         )
@@ -72,6 +88,8 @@ struct SelectableTextView: UIViewRepresentable {
         maximumNumberOfLines: Int = 0,
         wrapsLines: Bool = true,
         linkColor: UIColor = .link,
+        textAlignment: NSTextAlignment = .natural,
+        selfSizingWidthRange: ClosedRange<CGFloat>? = nil,
         selectionCoordinator: MarkdownSelectionCoordinator? = nil,
         selectionSegment: MarkdownSelectionSegmentDescriptor? = nil
     ) {
@@ -86,6 +104,8 @@ struct SelectableTextView: UIViewRepresentable {
             maximumNumberOfLines: maximumNumberOfLines,
             wrapsLines: wrapsLines,
             linkColor: linkColor,
+            textAlignment: textAlignment,
+            selfSizingWidthRange: selfSizingWidthRange,
             selectionCoordinator: selectionCoordinator,
             selectionSegment: selectionSegment
         )
@@ -139,6 +159,7 @@ struct SelectableTextView: UIViewRepresentable {
 
     @MainActor
     func updateUIViewForTests(_ uiView: SelectableTextViewHostView, coordinator: Coordinator) {
+        TranscriptPerf.note(.selectableTextViewUpdate)
         coordinator.linkColor = linkColor
         coordinator.selectionCoordinator = selectionCoordinator
         coordinator.selectionSegment = selectionSegment
@@ -151,12 +172,39 @@ struct SelectableTextView: UIViewRepresentable {
             replacementTextView.attributedText = uiView.mountedTextView.attributedText
             replacementTextView.selectedRange = uiView.mountedTextView.selectedRange
             uiView.setMountedTextView(replacementTextView)
+            // The mounted text view instance changed. The replacement only
+            // inherits attributedText/selection — font, colors, line limits,
+            // wrapping, container sizing, and link attributes are applied by
+            // `configure` alone, so the presentation gate must not skip it:
+            // clear the applied presentation (and cached metrics derived
+            // from the previous instance) so the gate below configures this
+            // fresh view exactly once. Attributed content is still preserved:
+            // configure's isEqual guard skips replacement when the copied
+            // text already matches, so a selection-only swap does not
+            // regenerate content.
+            coordinator.appliedPresentation = nil
+            coordinator.cachedMeasurement = nil
+            coordinator.presentationGeneration &+= 1
         }
 
         let textView = uiView.mountedTextView
         textView.delegate = coordinator
         configureSelectionBridge(for: textView, coordinator: coordinator)
-        configure(textView)
+
+        // Presentation identity: when every input that materially affects
+        // text styling/layout is unchanged, `configure` is a no-op-by-rebuild
+        // (styled copy, attribute enumeration, container mutation, intrinsic
+        // invalidation) — skip it entirely. Selection registration below is
+        // deliberately NOT part of the gate: coordinator/segment changes must
+        // keep flowing without forcing text restyling.
+        let presentation = Coordinator.Presentation(view: self)
+        let presentationIsUnchanged = coordinator.appliedPresentation == presentation
+        if !presentationIsUnchanged {
+            configure(textView)
+            coordinator.appliedPresentation = presentation
+            coordinator.presentationGeneration &+= 1
+        }
+
         registerSelectionIfNeeded(for: textView, coordinator: coordinator)
         uiView.mountedSelectionCoordinator = coordinator.selectionCoordinator
         uiView.mountedSelectionSegment = coordinator.selectionSegment
@@ -193,13 +241,110 @@ struct SelectableTextView: UIViewRepresentable {
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: SelectableTextViewHostView, context: Context) -> CGSize? {
+        measuredSizeCached(
+            proposalWidth: proposal.width,
+            textView: uiView.mountedTextView,
+            coordinator: context.coordinator
+        )
+    }
+
+    /// Cached measurement entry for the SwiftUI sizing hook: an unchanged
+    /// presentation measured at the same effective width returns the cached
+    /// CGSize without asking TextKit to lay the text out again. Any change
+    /// that can alter geometry bumps `presentationGeneration` in
+    /// `updateUIViewForTests`, invalidating the entry; the cache lives on
+    /// the coordinator and dies with the mounted view.
+    @MainActor
+    func measuredSizeCached(
+        proposalWidth: CGFloat?,
+        textView: UITextView,
+        coordinator: Coordinator
+    ) -> CGSize? {
+        let key: Coordinator.MeasurementKey
+        switch effectiveMeasurementMode(proposalWidth: proposalWidth) {
+        case .none:
+            return nil
+        case .nonWrapping:
+            key = .nonWrapping
+        case .selfSizing:
+            key = .selfSizing
+        case .wrapping(let width):
+            key = .wrapping(width: width)
+        }
+
+        if let cached = coordinator.cachedMeasurement,
+           cached.generation == coordinator.presentationGeneration,
+           cached.key == key {
+            return cached.size
+        }
+        guard let size = measuredSize(proposalWidth: proposalWidth, textView: textView) else {
+            return nil
+        }
+        coordinator.cachedMeasurement = Coordinator.CachedMeasurement(
+            generation: coordinator.presentationGeneration,
+            key: key,
+            size: size
+        )
+        return size
+    }
+
+    /// The measurement mode derived from the view's configuration and the
+    /// proposal — mirrors the branching in `measuredSize(proposalWidth:textView:)`.
+    private enum MeasurementMode {
+        case none
+        case nonWrapping
+        case selfSizing
+        case wrapping(width: CGFloat)
+    }
+
+    private func effectiveMeasurementMode(proposalWidth: CGFloat?) -> MeasurementMode {
+        if !wrapsLines {
+            return .nonWrapping
+        }
+        if selfSizingWidthRange != nil {
+            return .selfSizing
+        }
+        guard let width = proposalWidth, width > 0, width.isFinite else {
+            return .none
+        }
+        return .wrapping(width: width)
+    }
+
+    /// Extracted sizing logic so `sizeThatFits` and unit tests share one
+    /// path (`UIViewRepresentableContext` cannot be constructed outside
+    /// SwiftUI).
+    ///
+    /// Self-sizing range (table cells): Markdown tables lay out inside a
+    /// horizontal ScrollView, where width proposals are nil or transient and
+    /// first-pass UIKit bounds are zero — a proposal- or bounds-derived width
+    /// produces a different wrapped height on the first pass than in steady
+    /// state, which is the intermittent half-line/1–2-line clipping. Instead,
+    /// the measurement width is derived deterministically from the content's
+    /// ideal width clamped to the table's column policy, so the first pass
+    /// and every later pass report the same correct height.
+    func measuredSize(proposalWidth: CGFloat?, textView: UITextView) -> CGSize? {
         if !wrapsLines {
             return measureNonWrapping()
         }
 
-        guard let width = proposal.width, width > 0 else { return nil }
-        let measured = uiView.mountedTextView.sizeThatFits(CGSize(width: width, height: CGFloat.greatestFiniteMagnitude))
-        return CGSize(width: width, height: ceil(measured.height))
+        if let range = selfSizingWidthRange {
+            let idealWidth = max(1, measureNonWrapping().width)
+            let width = min(max(idealWidth, range.lowerBound), range.upperBound)
+            return CGSize(width: width, height: Self.measuredWrappingHeight(of: textView, at: width))
+        }
+
+        guard let width = proposalWidth, width > 0, width.isFinite else { return nil }
+        return CGSize(width: width, height: Self.measuredWrappingHeight(of: textView, at: width))
+    }
+
+    /// Shared measurement path for `sizeThatFits` and unit tests. Delegates
+    /// to `UITextView.sizeThatFits` at the target width. On iOS 17+
+    /// (TextKit 2) the proposed width drives wrapping independent of the
+    /// text container's stored size, so no container mutation is needed.
+    static func measuredWrappingHeight(of textView: UITextView, at width: CGFloat) -> CGFloat {
+        TranscriptPerf.note(.textKitMeasurement)
+        let measured = textView.sizeThatFits(CGSize(width: width, height: CGFloat.greatestFiniteMagnitude))
+        return ceil(measured.height)
     }
 
     private func configure(_ textView: UITextView) {
@@ -220,6 +365,7 @@ struct SelectableTextView: UIViewRepresentable {
 
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.lineSpacing = lineSpacing
+        paragraphStyle.alignment = textAlignment
 
         // Single-pass styling: preserve per-run font and foregroundColor from
         // attributedText, fill only missing attributes with the configured
@@ -245,6 +391,7 @@ struct SelectableTextView: UIViewRepresentable {
 
         let selectedRange = textView.selectedRange
         if !textView.attributedText.isEqual(to: styledText) {
+            TranscriptPerf.note(.selectableTextViewTextRebuild)
             textView.attributedText = styledText
             let selectedLocation = min(selectedRange.location, styledText.length)
             let selectedEnd = min(NSMaxRange(selectedRange), styledText.length)
@@ -384,9 +531,62 @@ struct SelectableTextView: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
+        /// Every input that materially affects text presentation. When an
+        /// incoming update's presentation equals the applied one, text
+        /// configuration is skipped. `NSAttributedString` equality is
+        /// content equality, so a stable object from the Markdown render
+        /// cache compares equal cheaply while a genuinely changed value
+        /// correctly invalidates.
+        struct Presentation: Equatable {
+            let attributedText: NSAttributedString
+            let font: UIFont
+            let textColor: UIColor
+            let lineSpacing: CGFloat
+            let maximumNumberOfLines: Int
+            let wrapsLines: Bool
+            let linkColor: UIColor
+            let textAlignment: NSTextAlignment
+            let selfSizingWidthRange: ClosedRange<CGFloat>?
+
+            init(view: SelectableTextView) {
+                self.attributedText = view.attributedText
+                self.font = view.font
+                self.textColor = view.textColor
+                self.lineSpacing = view.lineSpacing
+                self.maximumNumberOfLines = view.maximumNumberOfLines
+                self.wrapsLines = view.wrapsLines
+                self.linkColor = view.linkColor
+                self.textAlignment = view.textAlignment
+                self.selfSizingWidthRange = view.selfSizingWidthRange
+            }
+        }
+
+        /// Identifies the effective measurement inputs for the sizing cache.
+        /// The presentation generation (bumped whenever styling is applied or
+        /// the mounted text view is swapped) covers content/font/spacing/
+        /// alignment/limits; the key covers the width regime.
+        enum MeasurementKey: Equatable {
+            case nonWrapping
+            case selfSizing
+            case wrapping(width: CGFloat)
+        }
+
+        struct CachedMeasurement {
+            let generation: UInt64
+            let key: MeasurementKey
+            let size: CGSize
+        }
+
         var linkColor: UIColor
         weak var selectionCoordinator: MarkdownSelectionCoordinator?
         var selectionSegment: MarkdownSelectionSegmentDescriptor?
+
+        var appliedPresentation: Presentation?
+        var presentationGeneration: UInt64 = 0
+        /// One-entry measurement cache scoped to the current presentation
+        /// generation. Invalidated by any generation bump; lives and dies
+        /// with the coordinator (i.e. the mounted view).
+        var cachedMeasurement: CachedMeasurement?
 
         init(
             linkColor: UIColor,

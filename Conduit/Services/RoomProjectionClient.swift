@@ -307,15 +307,19 @@ extension RoomProjectionClient {
     /// neither can serve a different dashboard or a different hub.
     static func forDashboard(
         _ dashboardID: UUID,
-        transport: RoomTransport = .urlSession()
+        transport: RoomTransport = .urlSession(),
+        credentialStore: RoomHubCredentialStore = .system
     ) throws -> RoomProjectionClient {
-        guard let credential = KeychainHelper.loadRoomHubCredential(dashboardID: dashboardID) else {
+        guard let credential = credentialStore.load(dashboardID: dashboardID) else {
             throw RoomProjectionError.missingCredential
         }
         return try RoomProjectionClient(
             credential: credential,
             transport: transport,
-            cloudflareAccess: KeychainHelper.loadCloudflareAccess(for: credential.hubBaseURL)
+            cloudflareAccess: KeychainHelper.loadCloudflareAccess(
+                dashboardID: dashboardID,
+                for: credential.hubBaseURL
+            )
         )
     }
 }

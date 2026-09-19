@@ -49,10 +49,10 @@ final class SherpaWakeWordService: WakeWordService {
             return .unavailable(descriptor.licenseReviewNote)
         }
         guard runtime != nil else {
-            return .unavailable("Wake-word runtime is not installed in this build.")
+            return .unavailable(AppLocalization.string("Wake-word runtime is not installed in this build."))
         }
         guard resolver.localURL(for: descriptor) != nil else {
-            return .unavailable("The reviewed wake model is not installed on this device.")
+            return .unavailable(AppLocalization.string("The reviewed wake model is not installed on this device."))
         }
         return .ready
     }
@@ -71,7 +71,7 @@ final class SherpaWakeWordService: WakeWordService {
         guard !phrases.isEmpty else { throw WakeWordServiceError.notPrepared }
         guard case .ready = availability, let runtime, let modelURL = resolver.localURL(for: descriptor) else {
             if case .unavailable(let reason) = availability { throw WakeWordServiceError.unavailable(reason) }
-            throw WakeWordServiceError.unavailable("Wake-word runtime is unavailable.")
+            throw WakeWordServiceError.unavailable(AppLocalization.string("Wake-word runtime is unavailable."))
         }
         configuredPhrases = phrases
         aliases = Dictionary(uniqueKeysWithValues: phrases.map { ($0.alias, $0) })
@@ -82,7 +82,7 @@ final class SherpaWakeWordService: WakeWordService {
     func arm() throws {
         guard case .ready = availability, let runtime else {
             if case .unavailable(let reason) = availability { throw WakeWordServiceError.unavailable(reason) }
-            throw WakeWordServiceError.unavailable("Wake-word runtime is unavailable.")
+            throw WakeWordServiceError.unavailable(AppLocalization.string("Wake-word runtime is unavailable."))
         }
         guard !configuredPhrases.isEmpty else { throw WakeWordServiceError.notPrepared }
         guard !runtime.isListening else { return }

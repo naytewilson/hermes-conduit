@@ -15,14 +15,18 @@ final class SessionPresentationCache {
     static let shared = SessionPresentationCache()
     static let maxUnconfirmedPendingDecisionAge: TimeInterval = 24 * 60 * 60
 
-    /// Returns whether a clarification or approval presentation still needs a
-    /// user decision. Keep this rule shared by resume pruning and cache saves.
+    /// Returns whether a clarification presentation still needs a user
+    /// decision. Keep this rule shared by resume pruning and cache saves. A
+    /// retryable `.error` question is still unanswered — it must survive as
+    /// an unresolved decision, never be pruned as completed.
     static func isPendingDecision(_ status: ClarifyActivity.Status) -> Bool {
-        status == .pending || status == .submitting
+        status == .pending || status == .submitting || status == .error
     }
 
     static func isPendingDecision(_ status: ApprovalActivity.Status) -> Bool {
-        status == .pending || status == .submitting
+        // An errored approval is still retryable (the card re-arms its
+        // controls), so it remains an unresolved decision for pruning.
+        status == .pending || status == .submitting || status == .error
     }
 
     /// Stable identity for a decision card, regardless of whether it is still
@@ -33,7 +37,8 @@ final class SessionPresentationCache {
             return "clarify:\(clarify.requestId)"
         }
         if let approval = message.approval {
-            return "approval:\(approval.sessionId)"
+            return approval.requestId.map { "approval-request:\($0)" }
+                ?? "approval:\(approval.sessionId)"
         }
         return nil
     }
@@ -43,7 +48,8 @@ final class SessionPresentationCache {
             return "clarify:\(clarify.requestId)"
         }
         if let approval = message.approval, isPendingDecision(approval.status) {
-            return "approval:\(approval.sessionId)"
+            return approval.requestId.map { "approval-request:\($0)" }
+                ?? "approval:\(approval.sessionId)"
         }
         return nil
     }
@@ -67,7 +73,8 @@ final class SessionPresentationCache {
             }
             if let approval = message.approval,
                isPendingDecision(approval.status),
-               keys.contains("approval:\(approval.sessionId)") {
+               keys.contains(approval.requestId.map { "approval-request:\($0)" }
+                    ?? "approval:\(approval.sessionId)") {
                 message.approval = nil
             }
             if message.role == .clarify, message.clarify == nil { return nil }
@@ -82,9 +89,12 @@ final class SessionPresentationCache {
         var signature: String
         var timestamp: String
         var toolName: String?
+        var toolDisplayName: String?
+        var toolID: String?
         var toolInputSignature: String?
         var toolOutputSignature: String?
         var toolPreview: String?
+        var toolStatus: ToolActivity.Status?
         var attachments: [Attachment]?
         var clarify: ClarifyActivity?
         var approval: ApprovalActivity?
@@ -104,9 +114,12 @@ final class SessionPresentationCache {
             signature = SessionPresentationCache.fingerprint(message.content)
             timestamp = message.timestamp
             toolName = tool.map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            toolDisplayName = tool?.name
+            toolID = tool?.id
             toolInputSignature = tool?.input.map(SessionPresentationCache.fingerprint)
             toolOutputSignature = tool?.output.map(SessionPresentationCache.fingerprint)
             toolPreview = preview
+            toolStatus = tool?.status
             attachments = message.attachments
             clarify = message.clarify
             approval = message.approval
@@ -126,6 +139,7 @@ final class SessionPresentationCache {
     private let defaults: UserDefaults
     private let now: () -> Date
     private let storageKey = "conduit.sessionPresentation.v1"
+    private let pendingToolsStorageKey = "conduit.sessionPresentation.pendingTools.v1"
     private let maxSessions = 32
     private let maxMessagesPerSession = 320
 
@@ -157,12 +171,50 @@ final class SessionPresentationCache {
         profile: String,
         sessionIDs: [String],
         includePendingClarifications: Bool = false,
-        includePendingApprovals: Bool = false
+        includePendingApprovals: Bool = false,
+        includePendingTools: Bool = false
     ) -> [ChatMessage] {
         let stored = load()
-        let cached = sessionIDs
-            .compactMap { stored[key(profile: profile, sessionID: $0)] }
-            .flatMap { session in
+        // Resolve every supplied alias, but let each LOGICAL cached snapshot
+        // enter the matching pool exactly once. save(...sessionIDs:) writes
+        // equivalent records under every alias, so a requested+resolved
+        // lookup used to flatten the same rows twice and the matcher could
+        // consume stale duplicates as though they were distinct historical
+        // messages (fingerprint and positional scoring especially). Aliases
+        // are resolved in supplied order; when several aliases hold the same
+        // logical snapshot — including one rewritten later with only fresh
+        // presentation stamps — the freshest write wins.
+        //
+        // Ordering contract (review-gate W1): DIVERGENT snapshots that
+        // outscore equally tie-break by earliest pool position, which is
+        // this call's argument order. The sole production caller passes
+        // [resolvedId, requestedId] so the live write leads; keep callers
+        // passing the most-current alias first.
+        var resolutionOrder: [String] = []
+        var snapshotByID: [String: CachedSession] = [:]
+        var seenCacheKeys = Set<String>()
+        for rawSessionID in sessionIDs {
+            let trimmed = rawSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard seenCacheKeys.insert(trimmed).inserted else { continue }
+            guard let session = stored[
+                key(profile: profile, sessionID: trimmed)
+            ] else { continue }
+            let identity = Self.logicalSnapshotIdentity(for: session.messages)
+            if let existing = snapshotByID[identity] {
+                let isFresher =
+                    session.updatedAt == existing.updatedAt
+                    ? session.messages.count > existing.messages.count
+                    : session.updatedAt > existing.updatedAt
+                if isFresher {
+                    snapshotByID[identity] = session
+                }
+            } else {
+                resolutionOrder.append(identity)
+                snapshotByID[identity] = session
+            }
+        }
+        var cached = resolutionOrder.compactMap { snapshotByID[$0] }
+            .flatMap { session -> [CachedMessage] in
                 let unconfirmedExpired = isUnconfirmedPendingDecisionExpired(
                     since: session.unconfirmedPendingDecisionAt
                 )
@@ -170,6 +222,9 @@ final class SessionPresentationCache {
                     ? removingPendingDecisionPresentation(from: session.messages)
                     : session.messages
             }
+        var cachedIDs = Set(cached.map(\.id))
+        cached.append(contentsOf: pendingToolRecords(profile: profile, sessionIDs: sessionIDs)
+            .filter { cachedIDs.insert($0.id).inserted })
         guard !cached.isEmpty else { return messages }
 
         var remaining = Set(cached.indices)
@@ -225,6 +280,51 @@ final class SessionPresentationCache {
             return message
         }
 
+        if includePendingTools {
+            var eligibleIDLessRunningByName: [String: Set<String>] = [:]
+            for index in remaining {
+                let presentation = cached[index]
+                guard presentation.role == .tool,
+                      presentation.toolStatus == .running,
+                      stableToolID(presentation.toolID) == nil,
+                      let name = normalizedToolName(name: presentation.toolName, displayName: presentation.toolDisplayName) else {
+                    continue
+                }
+                eligibleIDLessRunningByName[name, default: []].insert(presentation.id)
+            }
+            let uniqueIDLessRunningNames = Set(
+                eligibleIDLessRunningByName.compactMap { name, ids in
+                    ids.count == 1 ? name : nil
+                }
+            )
+
+            for index in remaining.sorted() {
+                let presentation = cached[index]
+                guard presentation.role == .tool,
+                      presentation.toolStatus == .running,
+                      !containsResolvedTool(
+                          for: presentation,
+                          gatewayMessages: messages,
+                          uniqueIDLessRunningNames: uniqueIDLessRunningNames
+                      ) else {
+                    continue
+                }
+                merged.append(ChatMessage(
+                    id: presentation.id,
+                    role: .tool,
+                    content: "",
+                    timestamp: presentation.timestamp,
+                    tool: ToolActivity(
+                        id: presentation.toolID,
+                        name: presentation.toolDisplayName ?? presentation.toolName ?? "Tool",
+                        input: presentation.toolPreview,
+                        output: nil,
+                        status: .running
+                    )
+                ))
+            }
+        }
+
         if includePendingClarifications {
             let pendingClarifications = cached.compactMap(\.clarify).filter {
                 Self.isPendingDecision($0.status)
@@ -246,7 +346,7 @@ final class SessionPresentationCache {
                     merged.append(ChatMessage(
                         id: cachedMessage?.id ?? "clarify-\(clarify.requestId)",
                         role: .clarify,
-                        content: clarify.question,
+                        content: clarify.displayQuestion,
                         timestamp: cachedMessage?.timestamp ?? "",
                         clarify: clarify
                     ))
@@ -258,10 +358,37 @@ final class SessionPresentationCache {
             let pendingApprovals = cached.compactMap(\.approval).filter {
                 Self.isPendingDecision($0.status)
             }
-            for approval in pendingApprovals where !merged.contains(where: {
-                $0.approval?.sessionId == approval.sessionId
-            }) {
-                let cachedMessage = cached.last { $0.approval?.sessionId == approval.sessionId }
+            // Hermes approvals are a single gate per conversation. When the
+            // gateway transcript already announces a pending approval under
+            // ANY identity of this conversation (the supplied lookup set),
+            // a promoted push card for the same gate — keyed by the durable
+            // id after routing rewrite — would render as a duplicate.
+            let suppliedIDs = Set(sessionIDs.map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            })
+            let gatewayAnnouncesPendingGate = merged.contains { message in
+                guard let approval = message.approval else { return false }
+                return Self.isPendingDecision(approval.status)
+                    && suppliedIDs.contains(
+                        approval.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+                    )
+            }
+            for approval in pendingApprovals {
+                let alreadyPresent = merged.contains { message in
+                    guard let existing = message.approval else { return false }
+                    if let requestId = approval.requestId {
+                        return existing.requestId == requestId
+                    }
+                    return existing.requestId == nil
+                        && existing.sessionId == approval.sessionId
+                }
+                if alreadyPresent || (approval.requestId == nil && gatewayAnnouncesPendingGate) {
+                    continue
+                }
+                let cachedMessage = cached.last {
+                    $0.approval?.requestId == approval.requestId
+                        && $0.approval?.sessionId == approval.sessionId
+                }
                 merged.append(ChatMessage(
                     id: cachedMessage?.id ?? "approval-\(approval.sessionId)",
                     role: .approval,
@@ -272,6 +399,276 @@ final class SessionPresentationCache {
             }
         }
         return merged
+    }
+
+    private func containsResolvedTool(
+        for cached: CachedMessage,
+        gatewayMessages: [ChatMessage],
+        uniqueIDLessRunningNames: Set<String> = []
+    ) -> Bool {
+        let cachedToolID = stableToolID(cached.toolID)
+        let cachedNormalizedName = normalizedToolName(name: cached.toolName, displayName: cached.toolDisplayName)
+        return gatewayMessages.contains { message in
+            guard message.role == .tool,
+                  let tool = message.tool else {
+                return false
+            }
+            if message.id == cached.id { return true }
+            let gatewayToolID = stableToolID(tool.id)
+            if let cachedToolID, let gatewayToolID {
+                return cachedToolID == gatewayToolID
+            }
+            if cachedToolID == nil,
+               gatewayToolID != nil,
+               tool.status == .complete,
+               let cachedNormalizedName,
+               uniqueIDLessRunningNames.contains(cachedNormalizedName),
+               normalizedToolName(name: tool.name, displayName: nil) == cachedNormalizedName {
+                return true
+            }
+            return false
+        }
+    }
+
+    private func normalizedToolName(name: String?, displayName: String?) -> String? {
+        if let name {
+            let trimmed = normalized(name)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        if let displayName {
+            let trimmed = normalized(displayName)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return nil
+    }
+
+    private func stableToolID(_ id: String?) -> String? {
+        guard let id else { return nil }
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Records the crash-recovery marker synchronously, without decoding and
+    /// rewriting the much larger presentation store. The next ordinary,
+    /// debounced `save` folds this bounded side record into the full snapshot.
+    func recordPendingToolStart(
+        _ message: ChatMessage,
+        profile: String,
+        sessionIDs: [String]
+    ) {
+        guard message.role == .tool, message.tool?.status == .running else { return }
+        let ids = Set(sessionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+        guard !ids.isEmpty else { return }
+        let record = CachedMessage(message)
+        var pendingStore = loadPendingTools()
+        for id in ids {
+            let cacheKey = key(profile: profile, sessionID: id)
+            var records = pendingStore[cacheKey] ?? []
+            if let toolID = stableToolID(record.toolID) {
+                records.removeAll { stableToolID($0.toolID) == toolID }
+            }
+            records.append(record)
+            pendingStore[cacheKey] = Array(records.suffix(maxMessagesPerSession))
+        }
+        persistPendingTools(pendingStore)
+    }
+
+    /// A completion event makes the local running projection obsolete. An
+    /// exact message id or stable tool id resolves only its exact record.
+    /// Legacy id-less events are inherently ambiguous when same-name calls
+    /// overlap; resolving is only performed when exactly one unambiguous
+    /// running candidate exists, avoiding destructive mis-matches when multiple
+    /// calls are in flight.
+    func resolvePendingTool(
+        named name: String,
+        toolID: String? = nil,
+        messageID: String? = nil,
+        profile: String,
+        sessionIDs: [String]
+    ) {
+        let ids = Set(sessionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+        guard !ids.isEmpty else { return }
+        let normalizedName = normalized(name)
+        let trimmedToolID = toolID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stableToolID = trimmedToolID.isEmpty ? nil : trimmedToolID
+        let trimmedMessageID = messageID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stableMessageID = trimmedMessageID.isEmpty ? nil : trimmedMessageID
+
+        // Exact-identity paths (messageID or stableToolID) are deterministic
+        // and handle each store independently — the first match wins.
+        // The ID-less fallback must inspect BOTH stores before mutating
+        // either, deduplicating by message ID, and only resolve when the
+        // combined logical candidate count is exactly one.
+
+        let hasExactIdentity = stableMessageID != nil || stableToolID != nil
+
+        var pendingStore = loadPendingTools()
+        var pendingChanged = false
+        var matchedPendingKeys = Set<String>()
+
+        if hasExactIdentity {
+            // --- Exact-identity resolution (unchanged) ---
+            for id in ids {
+                let cacheKey = key(profile: profile, sessionID: id)
+                guard var records = pendingStore[cacheKey] else { continue }
+                let index: Int?
+                if let stableMessageID {
+                    index = records.lastIndex(where: {
+                        $0.id == stableMessageID && $0.toolStatus == .running
+                    })
+                } else {
+                    index = records.lastIndex(where: {
+                        $0.toolStatus == .running && self.stableToolID($0.toolID) == stableToolID
+                    })
+                }
+                guard let resolvedIndex = index else { continue }
+                records.remove(at: resolvedIndex)
+                pendingStore[cacheKey] = records.isEmpty ? nil : records
+                pendingChanged = true
+                matchedPendingKeys.insert(cacheKey)
+            }
+            if pendingChanged { persistPendingTools(pendingStore) }
+
+            let unresolvedIDs = ids.filter { !matchedPendingKeys.contains(key(profile: profile, sessionID: $0)) }
+            guard !unresolvedIDs.isEmpty else { return }
+
+            var store = load()
+            var changed = false
+            for id in unresolvedIDs {
+                let cacheKey = key(profile: profile, sessionID: id)
+                guard var session = store[cacheKey] else { continue }
+                let index: Int?
+                if let stableMessageID {
+                    index = session.messages.lastIndex(where: {
+                        $0.role == .tool
+                            && $0.toolStatus == .running
+                            && $0.id == stableMessageID
+                    })
+                } else {
+                    index = session.messages.lastIndex(where: {
+                        $0.role == .tool
+                            && $0.toolStatus == .running
+                            && self.stableToolID($0.toolID) == stableToolID
+                    })
+                }
+                guard let resolvedIndex = index else { continue }
+                session.messages.remove(at: resolvedIndex)
+                session.updatedAt = now()
+                store[cacheKey] = session
+                changed = true
+            }
+            if changed { persist(store) }
+        } else {
+            // --- ID-less fallback: cross-store deduplication ---
+            // Gather ALL running same-name candidates from both stores across
+            // all session aliases, deduplicate by message ID, and only mutate
+            // when the combined logical candidate count is exactly one.
+
+            struct CandidateLocation {
+                enum Store { case pending, full }
+                let store: Store
+                let cacheKey: String
+                let index: Int
+                let messageID: String
+            }
+
+            var allCandidates: [CandidateLocation] = []
+            let store = load()
+
+            for id in ids {
+                let cacheKey = key(profile: profile, sessionID: id)
+
+                if let records = pendingStore[cacheKey] {
+                    for idx in records.indices {
+                        let msg = records[idx]
+                        guard msg.toolStatus == .running,
+                              msg.toolName == normalizedName else { continue }
+                        allCandidates.append(CandidateLocation(
+                            store: .pending, cacheKey: cacheKey, index: idx, messageID: msg.id
+                        ))
+                    }
+                }
+
+                if let session = store[cacheKey] {
+                    for idx in session.messages.indices {
+                        let msg = session.messages[idx]
+                        guard msg.role == .tool,
+                              msg.toolStatus == .running,
+                              msg.toolName == normalizedName else { continue }
+                        allCandidates.append(CandidateLocation(
+                            store: .full, cacheKey: cacheKey, index: idx, messageID: msg.id
+                        ))
+                    }
+                }
+            }
+
+            // Deduplicate by message ID — the same logical record exists under
+            // every session alias and may be mirrored between pending and full.
+            var seenMessageIDs = Set<String>()
+            let uniqueCandidates = allCandidates.filter { seenMessageIDs.insert($0.messageID).inserted }
+
+            guard uniqueCandidates.count == 1, let winner = uniqueCandidates.first else { return }
+
+            // Remove the unique winner from every alias across BOTH stores
+            // (a single logical candidate may be mirrored between pending and full).
+            for id in ids {
+                let cacheKey = key(profile: profile, sessionID: id)
+                guard var records = pendingStore[cacheKey] else { continue }
+                if let idx = records.lastIndex(where: { $0.id == winner.messageID && $0.toolStatus == .running }) {
+                    records.remove(at: idx)
+                    pendingStore[cacheKey] = records.isEmpty ? nil : records
+                    pendingChanged = true
+                }
+            }
+            if pendingChanged { persistPendingTools(pendingStore) }
+
+            var mutableStore = store
+            var changed = false
+            for id in ids {
+                let cacheKey = key(profile: profile, sessionID: id)
+                guard var session = mutableStore[cacheKey] else { continue }
+                if let idx = session.messages.lastIndex(where: {
+                    $0.role == .tool && $0.toolStatus == .running && $0.id == winner.messageID
+                }) {
+                    session.messages.remove(at: idx)
+                    session.updatedAt = now()
+                    mutableStore[cacheKey] = session
+                    changed = true
+                }
+            }
+            if changed { persist(mutableStore) }
+        }
+    }
+
+    /// An explicitly idle resume is authoritative: any local tool-start
+    /// projection that has not been committed is stale and must not become a
+    /// permanently-running card on later launches.
+    func removePendingTools(profile: String, sessionIDs: [String]) {
+        let ids = Set(sessionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+        guard !ids.isEmpty else { return }
+        var pendingStore = loadPendingTools()
+        var pendingChanged = false
+        for id in ids {
+            let cacheKey = key(profile: profile, sessionID: id)
+            if pendingStore.removeValue(forKey: cacheKey) != nil {
+                pendingChanged = true
+            }
+        }
+        if pendingChanged { persistPendingTools(pendingStore) }
+        guard defaults.data(forKey: storageKey) != nil else { return }
+        var store = load()
+        var changed = false
+        for id in ids {
+            let cacheKey = key(profile: profile, sessionID: id)
+            guard var session = store[cacheKey] else { continue }
+            let originalCount = session.messages.count
+            session.messages.removeAll { $0.role == .tool && $0.toolStatus == .running }
+            guard session.messages.count != originalCount else { continue }
+            session.updatedAt = now()
+            store[cacheKey] = session
+            changed = true
+        }
+        if changed { persist(store) }
     }
 
     /// Pending decision keys currently held in the store for the given
@@ -424,6 +821,14 @@ final class SessionPresentationCache {
             from: existingRecords,
             matching: unconfirmedPendingDecisionKeys
         )
+        let pendingRecords = pendingToolRecords(profile: profile, sessionIDs: Array(ids)).filter { pending in
+            guard let pendingID = stableToolID(pending.toolID) else { return true }
+            return !freshRecords.contains { fresh in
+                stableToolID(fresh.toolID) == pendingID && fresh.toolStatus != .running
+            }
+        }
+        let recordIDs = Set(records.map(\.id))
+        records.append(contentsOf: pendingRecords.filter { !recordIDs.contains($0.id) })
         if !preservePendingDecisionCards {
             records = removingPendingDecisionPresentation(
                 from: records,
@@ -446,6 +851,7 @@ final class SessionPresentationCache {
         }
         trim(&store)
         persist(store)
+        removePendingToolSideRecords(profile: profile, sessionIDs: Array(ids))
     }
 
     /// A resume without an explicit active-turn signal may temporarily show a
@@ -465,7 +871,8 @@ final class SessionPresentationCache {
             }
             if let approval = message.approval,
                Self.isPendingDecision(approval.status),
-               !keys.contains("approval:\(approval.sessionId)") {
+               !keys.contains(approval.requestId.map { "approval-request:\($0)" }
+                    ?? "approval:\(approval.sessionId)") {
                 message.approval = nil
             }
             if message.role == .clarify, message.clarify == nil { return nil }
@@ -479,7 +886,8 @@ final class SessionPresentationCache {
             return "clarify:\(clarify.requestId)"
         }
         if let approval = message.approval {
-            return "approval:\(approval.sessionId)"
+            return approval.requestId.map { "approval-request:\($0)" }
+                ?? "approval:\(approval.sessionId)"
         }
         return nil
     }
@@ -489,7 +897,8 @@ final class SessionPresentationCache {
             return "clarify:\(clarify.requestId)"
         }
         if let approval = message.approval, Self.isPendingDecision(approval.status) {
-            return "approval:\(approval.sessionId)"
+            return approval.requestId.map { "approval-request:\($0)" }
+                ?? "approval:\(approval.sessionId)"
         }
         return nil
     }
@@ -516,6 +925,7 @@ final class SessionPresentationCache {
     func clear(profile: String? = nil) {
         guard let profile else {
             defaults.removeObject(forKey: storageKey)
+            defaults.removeObject(forKey: pendingToolsStorageKey)
             return
         }
 
@@ -523,6 +933,227 @@ final class SessionPresentationCache {
         var store = load()
         store.keys.filter { $0.hasPrefix(prefix) }.forEach { store.removeValue(forKey: $0) }
         persist(store)
+        var pendingStore = loadPendingTools()
+        pendingStore.keys.filter { $0.hasPrefix(prefix) }.forEach { pendingStore.removeValue(forKey: $0) }
+        persistPendingTools(pendingStore)
+    }
+
+    /// Removes the cached records for the given sessions inside `profile`,
+    /// for exactly the keys passed (callers must pass every alias — see
+    /// `revokeDeletedConversationIdentity`). The delete path calls this so a
+    /// deleted conversation cannot resurrect its presentation (including any
+    /// pending decision cards) from a stale alias.
+    func removeSessions(profile: String, sessionIDs: [String]) {
+        let prefix = normalized(profile) + "|"
+        let ids = Set(sessionIDs.compactMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        })
+        guard !ids.isEmpty else { return }
+        var store = load()
+        var changed = false
+        for sessionID in ids {
+            let cacheKey = prefix + sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if store.removeValue(forKey: cacheKey) != nil {
+                changed = true
+            }
+        }
+        if changed { persist(store) }
+        removePendingToolSideRecords(profile: profile, sessionIDs: Array(ids))
+    }
+
+    /// Durable-owned persistence: once this conversation's durable identity
+    /// is positively established, the durable key is its ONLY persistent
+    /// presentation key. Moves the conversation's cached presentation from
+    /// its runtime-alias keys into the durable key, then REMOVES every alias
+    /// key. Retiring the mutable runtime keys is the point: a runtime id the
+    /// gateway later re-attributes to a different conversation must not
+    /// carry this conversation's timestamps, attachments, tool metadata, or
+    /// pending decision cards with it.
+    ///
+    /// Merge semantics when the durable record already exists: the durable
+    /// record stays AUTHORITATIVE for transcript presentation — an alias
+    /// snapshot never overwrites its timestamps, tool metadata, or rows.
+    /// Only NEW pending decision content (approval/clarify/batch by stable
+    /// decision key, deduped) is promoted from alias records — the fresh
+    /// notification-delivered card must survive, the stale alias transcript
+    /// must not leak. On establishment (no durable record yet) the FRESHEST
+    /// alias record migrates whole so runtime-only history is not lost.
+    ///
+    /// Approval cards whose embedded `sessionId` names a retired runtime
+    /// alias are rewritten to the durable id, so answering a restored card
+    /// dispatches to the durable session even after later rotations.
+    /// Clarify request ids are relay-minted (`conduit-push-…`), not session
+    /// ids, and are never rewritten.
+    func consolidateUnderDurableKey(
+        profile: String,
+        durableSessionID: String,
+        runtimeAliases: [String]
+    ) {
+        let durableKey = key(profile: profile, sessionID: durableSessionID)
+        let aliasKeys = Set(
+            runtimeAliases.map { key(profile: profile, sessionID: $0) }
+        ).subtracting([durableKey])
+        guard !aliasKeys.isEmpty else { return }
+        var pendingStore = loadPendingTools()
+        var durablePending = pendingStore[durableKey] ?? []
+        var pendingIDs = Set(durablePending.map(\.id))
+        for aliasKey in aliasKeys {
+            for record in pendingStore.removeValue(forKey: aliasKey) ?? []
+                where pendingIDs.insert(record.id).inserted {
+                durablePending.append(record)
+            }
+        }
+        if !durablePending.isEmpty {
+            pendingStore[durableKey] = Array(durablePending.suffix(maxMessagesPerSession))
+        }
+        persistPendingTools(pendingStore)
+        var store = load()
+        if store[durableKey] == nil {
+            let freshest = aliasKeys
+                .compactMap { store[$0] }
+                .max { lhs, rhs in
+                    lhs.updatedAt == rhs.updatedAt
+                        ? lhs.messages.count < rhs.messages.count
+                        : lhs.updatedAt < rhs.updatedAt
+                }
+            if var freshest {
+                rewriteRoutingIdentities(in: &freshest, durableSessionID: durableSessionID, runtimeAliases: runtimeAliases)
+                store[durableKey] = freshest
+            }
+        } else {
+            promotePendingDecisionsFromAliases(
+                into: &store,
+                durableKey: durableKey,
+                aliasKeys: aliasKeys,
+                durableSessionID: durableSessionID,
+                runtimeAliases: runtimeAliases
+            )
+        }
+        var changed = store[durableKey] != nil
+        for aliasKey in aliasKeys where store.removeValue(forKey: aliasKey) != nil {
+            changed = true
+        }
+        guard changed else { return }
+        if var durableSession = store[durableKey] {
+            rewriteRoutingIdentities(
+                in: &durableSession,
+                durableSessionID: durableSessionID,
+                runtimeAliases: runtimeAliases
+            )
+            store[durableKey] = durableSession
+        }
+        persist(store)
+    }
+
+    /// Promotes NEW pending decision presentation from alias records into an
+    /// existing durable record. The durable transcript rows, timestamps, and
+    /// tool metadata are never touched: only pending decisions the durable
+    /// record does not already hold (deduped by stable decision key, after
+    /// routing-identity rewrite) are appended, and the bounded
+    /// unconfirmed-expiry marker is adopted when the durable record has none.
+    private func promotePendingDecisionsFromAliases(
+        into store: inout [String: CachedSession],
+        durableKey: String,
+        aliasKeys: Set<String>,
+        durableSessionID: String,
+        runtimeAliases: [String]
+    ) {
+        guard var durableSession = store[durableKey] else { return }
+        let aliases = Set(runtimeAliases.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        })
+        var knownKeys = Set(durableSession.messages.compactMap(decisionKey(for:)))
+        var promoted = false
+        // The freshest unconfirmed marker among aliases that actually
+        // contributed a card. Markers from cardless aliases are ignored:
+        // adopting one could expire the just-promoted card immediately.
+        var freshestContributedMarker: Date?
+        for aliasKey in aliasKeys {
+            guard let aliasEntry = store[aliasKey] else { continue }
+            var aliasContributed = false
+            for message in aliasEntry.messages {
+                guard pendingDecisionKey(for: message) != nil else { continue }
+                var candidate = message
+                // Rewrite BEFORE dedup so a runtime-keyed card cannot
+                // duplicate a decision the durable record already holds
+                // under the durable id.
+                if let approval = candidate.approval,
+                   aliases.contains(approval.sessionId) {
+                    candidate.approval?.sessionId = durableSessionID
+                }
+                let key = decisionKey(for: candidate)
+                guard let key else { continue }
+                if let existingIndex = durableSession.messages.firstIndex(where: {
+                    decisionKey(for: $0) == key
+                }) {
+                    // Same decision already persisted. The durable row stays
+                    // authoritative unless its unconfirmed marker has
+                    // expired — a dead durable card is replaced by the fresh
+                    // alias copy rather than duplicated or silently dropped.
+                    if isUnconfirmedPendingDecisionExpired(
+                        since: durableSession.unconfirmedPendingDecisionAt
+                    ) {
+                        durableSession.messages[existingIndex] = candidate
+                        aliasContributed = true
+                    }
+                    continue
+                }
+                durableSession.messages.append(candidate)
+                knownKeys.insert(key)
+                promoted = true
+                aliasContributed = true
+            }
+            // Replacement (the duplicate branch above) counts as promotion:
+            // without it a fresh alias copy of an expired durable card would
+            // be discarded and the marker refresh skipped.
+            if aliasContributed { promoted = true }
+            guard aliasContributed,
+                  let aliasMarker = aliasEntry.unconfirmedPendingDecisionAt else { continue }
+            if freshestContributedMarker == nil || aliasMarker > freshestContributedMarker! {
+                freshestContributedMarker = aliasMarker
+            }
+        }
+        guard promoted else { return }
+        // Expiry semantics: only touch the marker when cards were promoted.
+        // Adopt the freshest contributing marker when the durable record has
+        // none, and REFRESH an expired durable marker — a stale marker would
+        // make merge strip the freshly promoted card on the next read,
+        // silently losing it after successful promotion. A live durable
+        // marker is left alone: legitimately-expired durable cards without
+        // fresh arrivals stay expired.
+        if let freshestContributedMarker,
+           durableSession.unconfirmedPendingDecisionAt == nil
+            || isUnconfirmedPendingDecisionExpired(since: durableSession.unconfirmedPendingDecisionAt) {
+            durableSession.unconfirmedPendingDecisionAt = freshestContributedMarker
+        }
+        durableSession.updatedAt = now()
+        store[durableKey] = durableSession
+    }
+
+    /// Points migrated approval cards at the durable session id when they
+    /// were keyed by one of the retired runtime aliases. Clarify request ids
+    /// live in a different namespace and are intentionally untouched.
+    private func rewriteRoutingIdentities(
+        in session: inout CachedSession,
+        durableSessionID: String,
+        runtimeAliases: [String]
+    ) {
+        let aliases = Set(runtimeAliases.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        })
+        var mutated = false
+        for index in session.messages.indices {
+            var message = session.messages[index]
+            if let approval = message.approval,
+               aliases.contains(approval.sessionId) {
+                message.approval?.sessionId = durableSessionID
+                session.messages[index] = message
+                mutated = true
+            }
+        }
+        if mutated {
+            session.updatedAt = now()
+        }
     }
 
     private func load() -> [String: CachedSession] {
@@ -536,6 +1167,39 @@ final class SessionPresentationCache {
     private func persist(_ store: [String: CachedSession]) {
         guard let data = try? JSONEncoder().encode(store) else { return }
         defaults.set(data, forKey: storageKey)
+    }
+
+    private func loadPendingTools() -> [String: [CachedMessage]] {
+        guard let data = defaults.data(forKey: pendingToolsStorageKey),
+              let decoded = try? JSONDecoder().decode([String: [CachedMessage]].self, from: data) else {
+            return [:]
+        }
+        return decoded
+    }
+
+    private func persistPendingTools(_ store: [String: [CachedMessage]]) {
+        guard !store.isEmpty else {
+            defaults.removeObject(forKey: pendingToolsStorageKey)
+            return
+        }
+        guard let data = try? JSONEncoder().encode(store) else { return }
+        defaults.set(data, forKey: pendingToolsStorageKey)
+    }
+
+    private func pendingToolRecords(profile: String, sessionIDs: [String]) -> [CachedMessage] {
+        let store = loadPendingTools()
+        var seen = Set<String>()
+        return sessionIDs.flatMap { store[key(profile: profile, sessionID: $0)] ?? [] }
+            .filter { seen.insert($0.id).inserted }
+    }
+
+    private func removePendingToolSideRecords(profile: String, sessionIDs: [String]) {
+        var store = loadPendingTools()
+        var changed = false
+        for sessionID in sessionIDs {
+            changed = store.removeValue(forKey: key(profile: profile, sessionID: sessionID)) != nil || changed
+        }
+        if changed { persistPendingTools(store) }
     }
 
     private func trim(_ store: inout [String: CachedSession]) {
@@ -560,37 +1224,71 @@ final class SessionPresentationCache {
         remaining: Set<Int>,
         preferredPosition: Int
     ) -> Int? {
-        let ranked = remaining.compactMap { index -> (index: Int, score: Int)? in
+        var bestIndex: Int?
+        var bestScore = Int.min
+        // Scan candidates in ascending pool order and keep the FIRST highest
+        // score. Equal-scoring rows (repeated content, repeated tool calls)
+        // must resolve deterministically to the earliest row; iterating the
+        // `remaining` set unordered made enrichment order arbitrary.
+        for index in remaining.sorted() {
             let candidate = cached[index]
-            guard candidate.role == message.role else { return nil }
+            guard candidate.role == message.role else { continue }
+            var score = Int.min
 
-            if candidate.id == message.id { return (index, 1_000) }
-
-            if let tool = message.tool {
-                guard candidate.toolName == normalized(tool.name) else { return nil }
-                var score = 50
+            if candidate.id == message.id {
+                // Absolute maximum; no later candidate can outrank it.
+                return index
+            } else if let tool = message.tool {
+                let cachedToolID = stableToolID(candidate.toolID)
+                let gatewayToolID = stableToolID(tool.id)
+                let hasStableMatch: Bool
+                if let cachedToolID, let gatewayToolID {
+                    guard cachedToolID == gatewayToolID else { continue }
+                    hasStableMatch = true
+                } else if cachedToolID != nil || gatewayToolID != nil {
+                    // ID-bearing tools must not fall back to name matching.
+                    continue
+                } else {
+                    guard candidate.toolName == normalized(tool.name) else { continue }
+                    // A locally recorded start belongs after the cached history.
+                    // Do not let any generic same-name gateway row consume it:
+                    // without a shared row or tool id, it can be a distinct
+                    // invocation that happens to have the same input.
+                    if candidate.toolStatus == .running {
+                        continue
+                    }
+                    hasStableMatch = false
+                }
+                score = hasStableMatch ? 80 : 50
+                if candidate.toolName == normalized(tool.name) { score += 10 }
                 if let input = tool.input, candidate.toolInputSignature == Self.fingerprint(input) { score += 30 }
                 if let output = tool.output, candidate.toolOutputSignature == Self.fingerprint(output) { score += 30 }
                 if (tool.input ?? "").isEmpty, candidate.toolPreview?.isEmpty == false { score += 5 }
-                return (index, score)
+            } else if candidate.signature == Self.fingerprint(message.content) {
+                score = 100
+            } else {
+                // Hermes can re-render a completed response before placing it in
+                // history. The text may therefore differ even though it is the
+                // same chronological row. This is only a fallback for missing
+                // presentation metadata within the same bounded session cache.
+                let distance = abs(index - preferredPosition)
+                guard distance <= 3,
+                      !candidate.timestamp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    continue
+                }
+                score = 20 - distance
             }
 
-            if candidate.signature == Self.fingerprint(message.content) { return (index, 100) }
-
-            // Hermes can re-render a completed response before placing it in
-            // history. The text may therefore differ even though it is the
-            // same chronological row. This is only a fallback for missing
-            // presentation metadata within the same bounded session cache.
-            let distance = abs(index - preferredPosition)
-            guard distance <= 3,
-                  !candidate.timestamp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return nil
+            // Strict > : the first highest-scoring candidate in ascending
+            // index order wins the tie, never arbitrary Set iteration order.
+            if score > bestScore {
+                bestScore = score
+                bestIndex = index
             }
-            return (index, 20 - distance)
         }
-
-        return ranked.max { $0.score < $1.score }?.index
+        return bestIndex
     }
+
 
     /// Never replace a cached timestamp/preview with a newer history record
     /// that simply omits it. Exact content wins; matching row position is only
@@ -649,5 +1347,36 @@ final class SessionPresentationCache {
             hash &*= 1_099_511_628_211
         }
         return String(hash, radix: 16)
+    }
+
+    /// Stable logical identity of one cached snapshot: the (role, id,
+    /// content-signature) sequence of its rows. Deliberately EXCLUDES
+    /// volatile presentation stamps (timestamps, tool previews) so a
+    /// re-stamped rewrite of the same transcript through another alias is
+    /// recognized as the same snapshot and deduplicated to its freshest
+    /// write — while snapshots whose rows genuinely differ keep separate
+    /// identities and all stay available to the matcher. Identity is
+    /// value-derived; two records collapse only when their entire row
+    /// sequences agree structurally.
+    private static func logicalSnapshotIdentity(
+        for messages: [CachedMessage]
+    ) -> String {
+        // Review-gate W2: encode the row matrix as JSON before fingerprinting
+        // so no separator/field content can ever alias two structurally
+        // different sequences onto one identity.
+        let rowIdentity = messages.map { message -> [String] in
+            [
+                String(describing: message.role),
+                message.id,
+                message.signature,
+                message.toolName ?? ""
+            ]
+        }
+        guard let data = try? JSONEncoder().encode(rowIdentity) else {
+            // Encoding cannot fail for [ [String] ]; failing open can only
+            // ever ADD a candidate, never silently drop a real one.
+            return UUID().uuidString
+        }
+        return fingerprint(String(decoding: data, as: UTF8.self))
     }
 }
