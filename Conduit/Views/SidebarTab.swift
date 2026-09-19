@@ -7,6 +7,7 @@ enum SidebarTab: String, CaseIterable, Identifiable {
     case bots = "Bots"
     case cron = "Cron"
     case kanban = "Kanban"
+    case rooms = "Rooms"
 
     var id: String { rawValue }
 
@@ -17,6 +18,7 @@ enum SidebarTab: String, CaseIterable, Identifiable {
         case .bots: return AppLocalization.string("Bots")
         case .cron: return AppLocalization.string("Cron")
         case .kanban: return AppLocalization.string("Kanban")
+        case .rooms: return AppLocalization.string("Rooms")
         }
     }
 
@@ -26,6 +28,7 @@ enum SidebarTab: String, CaseIterable, Identifiable {
         case .bots: return "person.2"
         case .cron: return "clock"
         case .kanban: return "rectangle.3.group"
+        case .rooms: return "rectangle.stack"
         }
     }
 

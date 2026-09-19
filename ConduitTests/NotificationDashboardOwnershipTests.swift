@@ -315,3 +315,90 @@ extension NotificationDashboardOwnershipTests {
         XCTAssertNil(service.relayGatewayID(forRequestID: "anything"))
     }
 }
+
+// MARK: - Room wake channel (I4: wake-only, never authority)
+
+extension NotificationDashboardOwnershipTests {
+
+    private func wakePayload(roomID: Any? = "room-1", dashboardID: Any? = nil) -> [String: Any] {
+        var payload: [String: Any] = [:]
+        if let roomID { payload["room_id"] = roomID }
+        if let dashboardID { payload["dashboard_id"] = dashboardID }
+        return payload
+    }
+
+    func testRoomWakeParsesRoomAndDashboard() throws {
+        let wake = try XCTUnwrap(PushNotificationService.parseRoomWakeTarget(
+            from: ["conduit": wakePayload(
+                roomID: "room-42",
+                dashboardID: dashboardA.uuidString
+            )]
+        ))
+        XCTAssertEqual(wake.roomID, "room-42")
+        XCTAssertEqual(wake.dashboardID, dashboardA)
+    }
+
+    func testRoomWakeReadsNestedBodyStubToo() throws {
+        let nested = PushNotificationService.parseRoomWakeTarget(
+            from: ["body": ["conduit": wakePayload(roomID: "room-9")]]
+        )
+        XCTAssertEqual(nested?.roomID, "room-9")
+        XCTAssertNil(nested?.dashboardID)
+    }
+
+    func testRoomWakeWithMalformedDashboardIDFailsClosed() {
+        // A wake that cannot name its dashboard parses to nothing — the
+        // payload is never trusted enough to route blind.
+        XCTAssertNil(PushNotificationService.parseRoomWakeTarget(
+            from: ["conduit": wakePayload(dashboardID: "not-a-uuid")]
+        ))
+    }
+
+    func testRoomWakeRequiresARoomID() {
+        XCTAssertNil(PushNotificationService.parseRoomWakeTarget(
+            from: ["conduit": wakePayload(roomID: nil, dashboardID: dashboardA.uuidString)]
+        ))
+        XCTAssertNil(PushNotificationService.parseRoomWakeTarget(
+            from: ["conduit": wakePayload(roomID: "   ")]
+        ))
+    }
+
+    func testRoomWakeIsRoutingMetadataOnly() {
+        // The wake struct carries no action, grant, or authority material —
+        // this test pins the shape so a future field cannot smuggle a
+        // mutable directive through the wake channel.
+        let wake = PushNotificationService.parseRoomWakeTarget(
+            from: ["conduit": [
+                "room_id": "room-7",
+                "action": "cancel",              // must be ignored
+                "grant_id": "forged",            // must be ignored
+                "execution_id": "exec-1",
+            ]]
+        )
+        XCTAssertEqual(wake?.roomID, "room-7")
+        XCTAssertEqual(wake?.executionID, "exec-1")
+        // Nothing in RoomWakeTarget can express an action or a grant.
+    }
+
+    func testRoomWakeQueuesSeparatelyFromDecisionRouting() {
+        // A push that names both a room and a session decision lands on the
+        // wake queue AND the routing queue — one payload, two meanings, the
+        // wake still carrying zero authority.
+        let service = PushNotificationService()
+        service.receiveNotificationPayload(["conduit": [
+            "room_id": "room-5",
+            "session_id": "runtime-1",
+            "dashboard_id": dashboardA.uuidString,
+            "type": "approval.needed",
+            "decision": [
+                "kind": "approval",
+                "session_key": "default",
+                "description": "Run?",
+                "choices": ["once"],
+            ],
+        ]])
+        XCTAssertEqual(service.pendingRoomWake?.roomID, "room-5")
+        XCTAssertEqual(service.pendingRoomWake?.dashboardID, dashboardA)
+        XCTAssertNotNil(service.pendingTarget)
+    }
+}
