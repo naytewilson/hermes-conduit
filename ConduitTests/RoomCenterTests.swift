@@ -638,12 +638,14 @@ final class RoomCenterTests: XCTestCase {
     private static func opRecordBody(op: String, status: String, replayed: Bool = false) -> Data {
         let replayedField = replayed ? "\"replayed\":true," : ""
         return Data(#"""
-        {"operationId":"\#(operationID)","op":"\#(op)","status":"\#(status)",
-         \#(replayedField)"idempotencyKey":"conduit:dash-1:intent-9",
-         "executionId":"\#(executionID)","capability":"control.\#(op)",
-         "subject":"device:hub-credential:cred-7","correlationId":null,
-         "effect":null,
-         "createdAt":"2026-09-19T10:00:00.000Z","updatedAt":"2026-09-19T10:00:01.000Z"}
+        {"operation":{
+          "operationId":"\#(operationID)","op":"\#(op)","status":"\#(status)",
+          \#(replayedField)"idempotencyKey":"conduit:dash-1:intent-9",
+          "executionId":"\#(executionID)","capability":"control.\#(op)",
+          "subject":"device:hub-credential:cred-7","correlationId":null,
+          "effect":null,
+          "createdAt":"2026-09-19T10:00:00.000Z","updatedAt":"2026-09-19T10:00:01.000Z"
+        }}
         """#.utf8)
     }
 
