@@ -14,8 +14,8 @@
 //  - NO mutable call happens before a fresh successful biometric step-up;
 //    a failed/cancelled step-up ends the intent with zero network I/O;
 //  - Conduit never mints grants — `grant_id` is always a server-minted
-//    reference returned by POST /execution-grants;
-//  - `idempotency_key` is minted once per INTENT (at confirmation), so a
+//    reference returned by POST /executions/{id}/capability-grants;
+//  - `request_id` is minted once per INTENT (at confirmation), so a
 //    retried intent can never double-apply;
 //  - after any accepted action the Room is re-synced from authority — the
 //    client never writes its own idea of the new state into the timeline;
@@ -34,8 +34,9 @@ struct RoomControlIntent: Equatable, Identifiable {
     let id: UUID
     let dashboardID: UUID
     let roomID: String
-    /// Nil only for `start` — the Hub mints the execution id into the grant.
-    let executionID: String?
+    /// The bound execution id — required for every action per the i3
+    /// contract (`start` acts on a `queued` execution like the rest).
+    let executionID: String
     let action: RoomControlAction
     let idempotencyKey: String
 }
@@ -218,7 +219,7 @@ final class RoomCenter: ObservableObject {
     func makeIntent(
         dashboardID: UUID,
         roomID: String,
-        executionID: String?,
+        executionID: String,
         action: RoomControlAction
     ) -> RoomControlIntent {
         RoomControlIntent(
@@ -252,20 +253,19 @@ final class RoomCenter: ObservableObject {
 
             let grant = try await client.requestGrant(
                 action: intent.action,
-                executionID: intent.executionID,
-                roomID: intent.roomID
+                executionID: intent.executionID
             )
             let ack = try await client.performAction(
                 executionID: grant.executionID,
                 action: intent.action,
                 grantID: grant.grantID,
-                idempotencyKey: intent.idempotencyKey
+                requestID: intent.idempotencyKey
             )
             outcome = Self.outcome(
                 intent,
                 kind: ack.isDuplicateReplay ? .duplicateRejected : .applied,
                 principal: grant.principal,
-                detail: ack.status,
+                detail: ack.state,
                 at: clock()
             )
             // Authority re-read: the Room timeline, not the ack, is the

@@ -6,8 +6,11 @@
 //  answers BOTH seams (H1 reads + I4 mutations) so the test can assert the
 //  exact call order and the exact wire traffic each path produces:
 //
-//    intent → biometric step-up → POST /execution-grants → POST
-//    /executions/{id}/actions → GET resync (snapshot + replay)
+//    intent → biometric step-up → POST /executions/{id}/capability-grants
+//    → POST /executions/{id}/{action} → GET resync (snapshot + replay)
+//
+//  Wire shapes per anvil-i17-i3's published endpoint-contract-i4.md (v1
+//  DRAFT).
 //
 //  Proved here:
 //  - a rejected step-up performs ZERO network I/O (fail closed);
@@ -214,8 +217,10 @@ final class RoomCenterTests: XCTestCase {
 
     func testSuccessfulActionOrderGrantThenActionThenResync() async {
         hub.postHandler = { path in
-            if path == "/api/v1/execution-grants" { return (200, Self.grantBody) }
-            if path.hasSuffix("/actions") { return (200, Self.ackBody(status: "applied", state: "running")) }
+            if path.hasSuffix("/capability-grants") { return (201, Self.grantBody) }
+            if path.hasSuffix("/resume") {
+                return (200, Self.ackBody(state: "running"))
+            }
             return nil
         }
         let center = await makeCenter()
@@ -227,30 +232,36 @@ final class RoomCenterTests: XCTestCase {
         let outcome = await center.perform(intent)
 
         XCTAssertEqual(outcome.kind, .applied)
-        XCTAssertEqual(outcome.principal, "device:nayte-iphone")
-        XCTAssertEqual(outcome.detail, "applied")
+        XCTAssertEqual(outcome.principal, "device:hub-credential:cred-7")
+        XCTAssertEqual(outcome.detail, "running")
 
         let methods = hub.requests.map { "\($0.method) \($0.path)" }
         // Grant → action → snapshot+events resync. The resync re-reads
         // authority; the client never writes timeline state itself.
-        XCTAssertEqual(methods[0], "POST /api/v1/execution-grants")
-        XCTAssertEqual(methods[1], "POST /api/v1/executions/\(Self.executionID)/actions")
+        XCTAssertEqual(
+            methods[0],
+            "POST /api/v1/executions/\(Self.executionID)/capability-grants"
+        )
+        XCTAssertEqual(
+            methods[1],
+            "POST /api/v1/executions/\(Self.executionID)/resume"
+        )
         XCTAssertTrue(methods.dropFirst(2).allSatisfy { $0.hasPrefix("GET ") })
-        XCTAssertEqual(hub.requests[1].body?["idempotency_key"]?.stringValue, intent.idempotencyKey)
+        XCTAssertEqual(hub.requests[1].body?["request_id"]?.stringValue, intent.idempotencyKey)
     }
 
     func testRetriedIntentReusesIdempotencyKey() async {
         var actionCalls = 0
         hub.postHandler = { path in
-            if path == "/api/v1/execution-grants" { return (200, Self.grantBody) }
-            if path.hasSuffix("/actions") {
+            if path.hasSuffix("/capability-grants") { return (201, Self.grantBody) }
+            if path.hasSuffix("/resume") {
                 actionCalls += 1
                 // First attempt: a 500 — the Hub may not have applied it, so
                 // a manual retry of the SAME intent must present the SAME
-                // idempotency key. Second: the Hub reports the dedupe.
+                // request_id. Second: the Hub reports the dedupe.
                 return actionCalls == 1
                     ? (500, Self.problemBody(status: 500, code: "internal_error"))
-                    : (200, Self.ackBody(status: "duplicate_rejected", state: "running"))
+                    : (200, Self.ackBody(state: "running", duplicate: true))
             }
             return nil
         }
@@ -264,8 +275,8 @@ final class RoomCenterTests: XCTestCase {
         _ = await center.perform(intent)
 
         let actionKeys = hub.requests
-            .filter { $0.path.hasSuffix("/actions") }
-            .compactMap { $0.body?["idempotency_key"]?.stringValue }
+            .filter { $0.method == "POST" && !$0.path.hasSuffix("/capability-grants") }
+            .compactMap { $0.body?["request_id"]?.stringValue }
         XCTAssertEqual(actionCalls, 2)
         XCTAssertEqual(actionKeys, [intent.idempotencyKey, intent.idempotencyKey])
         let finalOutcome = await center.controlOutcomes[intent.id]
@@ -274,10 +285,8 @@ final class RoomCenterTests: XCTestCase {
 
     func testExpiredGrantSurfacesCapabilityDenied() async {
         hub.postHandler = { path in
-            if path.hasSuffix("/actions") {
-                return (403, Self.problemBody(status: 403, code: "capability_denied"))
-            }
-            return (200, Self.grantBody)
+            if path.hasSuffix("/capability-grants") { return (201, Self.grantBody) }
+            return (403, Self.problemBody(status: 403, code: "capability_denied"))
         }
         let center = await makeCenter()
         let intent = await center.makeIntent(
@@ -322,10 +331,8 @@ final class RoomCenterTests: XCTestCase {
 
     func testStateConflictTriggersResync() async {
         hub.postHandler = { path in
-            if path.hasSuffix("/actions") {
-                return (409, Self.problemBody(status: 409, code: "state_conflict"))
-            }
-            return (200, Self.grantBody)
+            if path.hasSuffix("/capability-grants") { return (201, Self.grantBody) }
+            return (409, Self.problemBody(status: 409, code: "invalid_state"))
         }
         let center = await makeCenter()
         let intent = await center.makeIntent(
@@ -423,7 +430,8 @@ final class RoomCenterTests: XCTestCase {
           {"event_id":"20000000-0000-4000-8000-0000000000a9","room_id":"\#(roomID)",
            "room_seq":8,"kind":"execution.transition","producer":"hub:i3",
            "payload":{"execution_id":"\#(executionID)","from_state":"running","to_state":"paused",
-                      "granting_principal":"device:nayte-iphone"},
+                      "substate":null,"reason":"user requested pause",
+                      "actor":"device:hub-credential:cred-7","grant_id":"\#(grantID)"},
            "link":{},"correlation_id":"10000000-0000-4000-8000-0000000000d1",
            "causation_id":"paseo:evt-77","task_ref":null,"campaign_id":null,
            "idempotency_key":"hub:91","occurred_at":"2026-09-19T09:20:00.000Z",
@@ -436,16 +444,16 @@ final class RoomCenterTests: XCTestCase {
     private static var grantBody: Data {
         Data(#"""
         {"grant_id":"\#(grantID)","execution_id":"\#(executionID)","action":"resume",
-         "principal":"device:nayte-iphone","issued_at":"2026-09-19T10:00:00.000Z",
-         "expires_at":"2026-09-19T10:05:00.000Z","scope_hash":"sha256:9f2c"}
+         "principal":"device:hub-credential:cred-7","issued_at":"2026-09-19T10:00:00.000Z",
+         "expires_at":"2026-09-19T10:05:00.000Z","scope_hash":"9f2c"}
         """#.utf8)
     }
 
-    private static func ackBody(status: String, state: String) -> Data {
+    private static func ackBody(state: String, duplicate: Bool = false) -> Data {
         Data(#"""
-        {"execution_id":"\#(executionID)","action":"resume","status":"\#(status)",
-         "state":"\#(state)","room_seq":9,
-         "correlation_id":"10000000-0000-4000-8000-0000000000d1"}
+        {"execution_id":"\#(executionID)","state":"\#(state)","substate":null,
+         "room_seq":9,"event_id":"50000000-0000-4000-8000-0000000000e0",
+         "duplicate":\#(duplicate)}
         """#.utf8)
     }
 

@@ -73,10 +73,12 @@ final class RoomExecutionIndexTests: XCTestCase {
     }
 
     func testPrincipalTaskAndCorrelationPropagate() {
+        // The contract's transition payload names the granting principal
+        // `actor`.
         let transition = event(seq: 5, payload: [
             "execution_id": .string(Self.executionID),
             "to_state": .string("paused"),
-            "granting_principal": .string("device:nayte-iphone")
+            "actor": .string("device:hub-credential:cred-7")
         ])
         var withRef = transition
         // RoomEvent is immutable — rebuild with task_ref for this fixture.
@@ -89,7 +91,7 @@ final class RoomExecutionIndexTests: XCTestCase {
             occurredAt: transition.occurredAt, createdAt: transition.createdAt
         )
         let projections = RoomExecutionIndex.projections(from: [withRef])
-        XCTAssertEqual(projections[0].principal, "device:nayte-iphone")
+        XCTAssertEqual(projections[0].principal, "device:hub-credential:cred-7")
         XCTAssertEqual(projections[0].taskRef, "anvil:task-9")
         XCTAssertEqual(projections[0].correlationID, "corr-1")
         XCTAssertEqual(projections[0].lastTransitionAt, "2026-09-19T09:20:00.000Z")
@@ -133,6 +135,24 @@ final class RoomExecutionIndexTests: XCTestCase {
         var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 7)
         projection.state = "paused"
         XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.resume, .cancel])
+    }
+
+    func testQueuedExecutionOffersStartAndCancel() {
+        // Contract action semantics: `start` is valid from `queued` — it
+        // begins dispatch of an already-bound execution.
+        var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 1)
+        projection.state = "queued"
+        XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.start, .cancel])
+    }
+
+    func testToolWaitOffersResumeAmongAcknowledgePauseCancel() {
+        // Contract: `resume` is valid from running+tool_wait.
+        var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 6)
+        projection.state = "tool_wait"
+        XCTAssertEqual(
+            RoomControlPolicy.candidates(for: projection),
+            [.acknowledge, .resume, .pause, .cancel]
+        )
     }
 
     func testTerminalStatesOfferOnlyRetryOrNothing() {

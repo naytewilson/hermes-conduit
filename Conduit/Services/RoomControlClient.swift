@@ -2,17 +2,15 @@
 //  RoomControlClient.swift
 //  Conduit
 //
-//  Mutable client for the Hub I4 control seam (DESIGN-I1-I7 §5). The exact
-//  endpoint contract is anvil-i17-i3's to publish; the shapes implemented
-//  here are the design-doc contract:
+//  Mutable client for the Hub I4 control seam, implemented against
+//  anvil-i17-i3's published contract (endpoint-contract-i4.md, v1 DRAFT):
 //
-//    POST /api/v1/execution-grants
-//      {action, execution_id}        — grant for an existing execution
-//      {action: "start", room_id}    — start grant; Hub mints execution_id
-//      → 200 CapabilityGrant
+//    POST /api/v1/executions/{execution_id}/capability-grants
+//      {action, ttl_seconds?}        — mint a grant bound to the execution
+//      → 201 CapabilityGrant
 //
-//    POST /api/v1/executions/{execution_id}/actions
-//      {action, grant_id, idempotency_key}
+//    POST /api/v1/executions/{execution_id}/{action}
+//      {grant_id, request_id?}       — act on the grant
 //      → 200 ExecutionActionAck
 //
 //  Authority boundary (unchangeable):
@@ -43,10 +41,6 @@ enum RoomControlError: LocalizedError, Equatable {
     /// A 2xx answer carried no decodable payload — a contract breach, never
     /// silently nil data.
     case undecodable(status: Int, detail: String)
-    /// The request would need a body field the caller does not hold (e.g. an
-    /// action on an execution with no known execution_id). Fail-closed
-    /// before any network I/O.
-    case missingSubject
     /// 401 — bearer missing, malformed, or revoked (`unauthorized`).
     case unauthorized(RoomProblem)
     /// 403 `insufficient_scope` — the bearer lacks the control scope.
@@ -81,8 +75,6 @@ enum RoomControlError: LocalizedError, Equatable {
             return AppLocalization.string("The Room response exceeded \(String(limit)) bytes.")
         case .undecodable(let status, let detail):
             return AppLocalization.string("The Room hub answered HTTP \(String(status)) with an unreadable payload: \(detail)")
-        case .missingSubject:
-            return AppLocalization.string("The action has no execution to act on.")
         case .unauthorized:
             return AppLocalization.string("The Room hub credential was rejected. Sign in again or replace the saved credential.")
         case .insufficientScope(let problem):
@@ -135,43 +127,38 @@ struct RoomControlClient {
         self.encoder = JSONEncoder()
     }
 
-    /// Asks the Hub to mint a capability grant for (action, execution). The
-    /// Hub decides whether the bound principal MAY hold that grant — a
-    /// denial is `capability_denied`/`insufficient_scope`, not an empty
-    /// grant. For `.start`, pass `roomID` and no `executionID`; the returned
-    /// grant carries the Hub-assigned execution id.
+    /// Asks the Hub to mint a capability grant for (action, execution) —
+    /// `POST /executions/{id}/capability-grants`. The Hub decides whether the
+    /// credential-derived principal MAY hold that grant — a denial is
+    /// `capability_denied`/`insufficient_scope`, not an empty grant. `start`
+    /// acts on an existing `queued` execution like every other action; the
+    /// contract has no room-scoped mint.
     func requestGrant(
         action: RoomControlAction,
-        executionID: String?,
-        roomID: String?
+        executionID: String,
+        ttlSeconds: Int? = nil
     ) async throws -> CapabilityGrant {
-        guard executionID != nil || roomID != nil else {
-            throw RoomControlError.missingSubject
-        }
-        let body = ExecutionGrantRequest(action: action, executionID: executionID, roomID: roomID)
+        let body = ExecutionGrantRequest(action: action, ttlSeconds: ttlSeconds)
         return try await post(
-            "\(Self.apiPrefix)/execution-grants",
+            "\(Self.apiPrefix)/executions/\(try pathComponent(executionID))/capability-grants",
             body: body,
             as: CapabilityGrant.self
         )
     }
 
-    /// Invokes a granted action. The grant is referenced by server-minted id
-    /// only; `idempotencyKey` is the caller's per-intent dedupe token and is
-    /// stable across retries of the same intent.
+    /// Invokes a granted action — `POST /executions/{id}/{action}`. The grant
+    /// is referenced by server-minted id only; `requestID` is the caller's
+    /// opaque per-intent dedupe token, stable across retries of the same
+    /// intent.
     func performAction(
         executionID: String,
         action: RoomControlAction,
         grantID: String,
-        idempotencyKey: String
+        requestID: String
     ) async throws -> ExecutionActionAck {
-        let body = ExecutionActionRequest(
-            action: action,
-            grantID: grantID,
-            idempotencyKey: idempotencyKey
-        )
+        let body = ExecutionActionRequest(grantID: grantID, requestID: requestID)
         return try await post(
-            "\(Self.apiPrefix)/executions/\(try pathComponent(executionID))/actions",
+            "\(Self.apiPrefix)/executions/\(try pathComponent(executionID))/\(try pathComponent(action.rawValue))",
             body: body,
             as: ExecutionActionAck.self
         )
@@ -259,7 +246,9 @@ struct RoomControlClient {
             return .unauthorized(problem ?? Self.fallbackProblem(status: status, code: "unauthorized"))
         case 403:
             switch problem?.code {
-            case "capability_denied":
+            // `grant_not_found` is subsumed under capability_denied on the
+            // wire per the published contract — same denial family.
+            case "capability_denied", "grant_not_found":
                 return .capabilityDenied(problem!)
             case "insufficient_scope":
                 return .insufficientScope(problem!)

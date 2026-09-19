@@ -2,18 +2,22 @@
 //  RoomControlClientTests.swift
 //  Conduit
 //
-//  Fake-transport contract tests for the ANVIL Room CONTROL seam (I4,
-//  DESIGN-I1-I7 §5). The fixtures implement the design-doc contract shape
-//  pending anvil-i17-i3's published endpoints:
+//  Fake-transport contract tests for the ANVIL Room CONTROL seam (I4),
+//  implementing anvil-i17-i3's published contract
+//  (cells/anvil-i17-i3/context/endpoint-contract-i4.md, v1 DRAFT):
 //
-//    POST /api/v1/execution-grants            → CapabilityGrant
-//    POST /api/v1/executions/{id}/actions     → ExecutionActionAck
+//    POST /api/v1/executions/{execution_id}/capability-grants
+//      {action, ttl_seconds?}                 → 201 CapabilityGrant
+//    POST /api/v1/executions/{execution_id}/{action}
+//      {grant_id, request_id?}                → 200 ExecutionActionAck
 //
-//  What is proved here: request shapes, server-owned grant fields passing
-//  through verbatim, the idempotency key riding the action call, and the
-//  error taxonomy keeping `insufficient_scope` (missing API scope) and
-//  `capability_denied` (grant/principal/expiry check failed — including an
-//  EXPIRED grant) as distinct, never-collapsed failures.
+//  What is proved here: request shapes (execution and action bound in the
+//  PATH, never the body), server-owned grant fields passing through
+//  verbatim, the caller idempotency token riding the action call, and the
+//  error taxonomy keeping `insufficient_scope` (missing `executions:control`
+//  API scope) and `capability_denied` (grant/principal/expiry check failed —
+//  including an EXPIRED grant and a subsumed `grant_not_found`) as distinct,
+//  never-collapsed failures.
 //
 
 import Foundation
@@ -77,122 +81,144 @@ final class RoomControlClientTests: XCTestCase {
 
     // MARK: - Grant request shape
 
-    func testGrantRequestPostsActionAndExecutionSubject() async throws {
-        hub.handler = { _ in (200, Self.grantBody) }
+    func testGrantRequestPostsActionWithExecutionInPath() async throws {
+        hub.handler = { _ in (201, Self.grantBody) }
         let grant = try await makeClient(token: "secret-control-token")
-            .requestGrant(action: .resume, executionID: Self.executionID, roomID: nil)
+            .requestGrant(action: .resume, executionID: Self.executionID)
 
         let request = try XCTUnwrap(hub.requests.first)
         XCTAssertEqual(request.method, "POST")
-        XCTAssertEqual(request.path, "/api/v1/execution-grants")
+        XCTAssertEqual(
+            request.path,
+            "/api/v1/executions/\(Self.executionID)/capability-grants"
+        )
         XCTAssertEqual(request.body?["action"]?.stringValue, "resume")
-        XCTAssertEqual(request.body?["execution_id"]?.stringValue, Self.executionID)
+        // The execution is bound in the PATH per contract — the body carries
+        // no subject fields.
+        XCTAssertNil(request.body?["execution_id"])
         XCTAssertNil(request.body?["room_id"])
+        XCTAssertNil(request.body?["ttl_seconds"])
 
         // The grant is authority-minted: every field passes through verbatim.
         XCTAssertEqual(grant.grantID, Self.grantID)
         XCTAssertEqual(grant.executionID, Self.executionID)
         XCTAssertEqual(grant.action, .resume)
-        XCTAssertEqual(grant.principal, "device:nayte-iphone")
+        XCTAssertEqual(grant.principal, "device:hub-credential:cred-7")
         XCTAssertEqual(grant.issuedAt, "2026-09-19T10:00:00.000Z")
         XCTAssertEqual(grant.expiresAt, "2026-09-19T10:05:00.000Z")
-        XCTAssertEqual(grant.scopeHash, "sha256:9f2c")
+        XCTAssertEqual(grant.scopeHash, "9f2c")
     }
 
     func testGrantRequestCarriesBearerCredential() async throws {
         var captured: URLRequest?
         hub.handler = { request in
             captured = request
-            return (200, Self.grantBody)
+            return (201, Self.grantBody)
         }
         _ = try await makeClient(token: "secret-control-token")
-            .requestGrant(action: .resume, executionID: Self.executionID, roomID: nil)
+            .requestGrant(action: .resume, executionID: Self.executionID)
         XCTAssertEqual(
             captured?.value(forHTTPHeaderField: "Authorization"),
             "Bearer secret-control-token"
         )
     }
 
-    func testStartGrantRequestCarriesRoomSubject() async throws {
-        hub.handler = { _ in (200, Self.startGrantBody) }
+    func testStartGrantTargetsQueuedExecutionInPath() async throws {
+        // The contract's `start` acts on an existing `queued` execution like
+        // every other action — there is no room-scoped mint.
+        hub.handler = { _ in (201, Self.startGrantBody) }
         let grant = try await makeClient()
-            .requestGrant(action: .start, executionID: nil, roomID: Self.roomID)
+            .requestGrant(action: .start, executionID: Self.executionID)
 
         let request = try XCTUnwrap(hub.requests.first)
+        XCTAssertEqual(
+            request.path,
+            "/api/v1/executions/\(Self.executionID)/capability-grants"
+        )
         XCTAssertEqual(request.body?["action"]?.stringValue, "start")
-        XCTAssertEqual(request.body?["room_id"]?.stringValue, Self.roomID)
-        XCTAssertNil(request.body?["execution_id"])
-        // Start's execution id is Hub-minted inside the grant — the client
-        // never invents one.
-        XCTAssertEqual(grant.executionID, "30000000-0000-4000-8000-0000000000ff")
+        XCTAssertEqual(grant.action, .start)
+        XCTAssertEqual(grant.executionID, Self.executionID)
     }
 
-    func testGrantRequestWithNoSubjectFailsClosed() async throws {
-        hub.handler = { _ in (200, Self.grantBody) }
-        do {
-            _ = try await makeClient().requestGrant(action: .resume, executionID: nil, roomID: nil)
-            XCTFail("Expected missingSubject")
-        } catch let error as RoomControlError {
-            guard case .missingSubject = error else {
-                return XCTFail("Expected .missingSubject, got \(error)")
-            }
-        }
-        // Fail-closed BEFORE any network I/O.
-        XCTAssertTrue(hub.requests.isEmpty)
+    func testGrantRequestCarriesOptionalTTL() async throws {
+        hub.handler = { _ in (201, Self.grantBody) }
+        _ = try await makeClient()
+            .requestGrant(action: .resume, executionID: Self.executionID, ttlSeconds: 120)
+        XCTAssertEqual(hub.requests.first?.body?["ttl_seconds"]?.intValue, 120)
     }
 
     // MARK: - Action request shape
 
-    func testActionRequestReferencesGrantByIDAndCarriesIdempotencyKey() async throws {
+    func testActionRequestBindsGrantByIDAndCarriesRequestID() async throws {
         hub.handler = { _ in (200, Self.ackBody) }
         let ack = try await makeClient().performAction(
             executionID: Self.executionID,
             action: .cancel,
             grantID: Self.grantID,
-            idempotencyKey: "conduit:dashboard-1:intent-9"
+            requestID: "conduit:dashboard-1:intent-9"
         )
 
         let request = try XCTUnwrap(hub.requests.first)
         XCTAssertEqual(request.method, "POST")
-        XCTAssertEqual(request.path, "/api/v1/executions/\(Self.executionID)/actions")
-        XCTAssertEqual(request.body?["action"]?.stringValue, "cancel")
+        // The action verb is the PATH leaf per contract.
+        XCTAssertEqual(
+            request.path,
+            "/api/v1/executions/\(Self.executionID)/cancel"
+        )
         XCTAssertEqual(request.body?["grant_id"]?.stringValue, Self.grantID)
-        XCTAssertEqual(request.body?["idempotency_key"]?.stringValue, "conduit:dashboard-1:intent-9")
+        XCTAssertEqual(request.body?["request_id"]?.stringValue, "conduit:dashboard-1:intent-9")
         // Grant material is never constructed client-side — only the
         // server-minted id is referenced.
+        XCTAssertNil(request.body?["action"])
 
         XCTAssertEqual(ack.executionID, Self.executionID)
-        XCTAssertEqual(ack.action, .cancel)
-        XCTAssertEqual(ack.status, "applied")
         XCTAssertEqual(ack.state, "cancelled")
         XCTAssertEqual(ack.roomSeq, 12)
-        XCTAssertEqual(ack.correlationID, "10000000-0000-4000-8000-0000000000d1")
+        XCTAssertEqual(ack.eventID, "50000000-0000-4000-8000-0000000000e1")
         XCTAssertFalse(ack.isDuplicateReplay)
     }
 
-    func testDuplicateRejectedAckIsRecognized() async throws {
+    func testDuplicateAckIsRecognized() async throws {
+        // Contract: duplicate:true means the same (execution, action, grant)
+        // was already committed — room_seq/event_id are the ORIGINAL commit.
         hub.handler = { _ in (200, Self.duplicateAckBody) }
         let ack = try await makeClient().performAction(
             executionID: Self.executionID,
             action: .resume,
             grantID: Self.grantID,
-            idempotencyKey: "conduit:dashboard-1:intent-9"
+            requestID: "conduit:dashboard-1:intent-9"
         )
         XCTAssertTrue(ack.isDuplicateReplay)
-        XCTAssertEqual(ack.status, "duplicate_rejected")
+        XCTAssertEqual(ack.roomSeq, 9)
     }
 
-    func testExecutionIDIsPathEncoded() async throws {
+    func testRetryAckCarriesNewExecutionID() async throws {
+        // `retry` mints a new attempt; the ack names it.
+        hub.handler = { _ in (200, Self.retryAckBody) }
+        let ack = try await makeClient().performAction(
+            executionID: Self.executionID,
+            action: .retry,
+            grantID: Self.grantID,
+            requestID: "k"
+        )
+        XCTAssertEqual(ack.retryExecutionID, "30000000-0000-4000-8000-0000000000f2")
+        XCTAssertEqual(ack.state, "queued")
+    }
+
+    func testExecutionIDAndActionArePathEncoded() async throws {
         hub.handler = { _ in (200, Self.ackBody) }
         _ = try await makeClient().performAction(
             executionID: "../admin",
-            action: .cancel,
+            action: RoomControlAction(rawValue: "../grant"),
             grantID: Self.grantID,
-            idempotencyKey: "k"
+            requestID: "k"
         )
-        // The hostile id is encoded into ONE path segment — it can never
+        // Hostile values encode into single path segments — they can never
         // rewrite the route.
-        XCTAssertEqual(hub.requests.first?.path, "/api/v1/executions/..%2Fadmin/actions")
+        XCTAssertEqual(
+            hub.requests.first?.path,
+            "/api/v1/executions/..%2Fadmin/..%2Fgrant"
+        )
     }
 
     // MARK: - Authority distinctions
@@ -214,7 +240,7 @@ final class RoomControlClientTests: XCTestCase {
                 executionID: Self.executionID,
                 action: .resume,
                 grantID: Self.grantID,
-                idempotencyKey: "k"
+                requestID: "k"
             )
             XCTFail("Expected capability_denied")
         } catch let error as RoomControlError {
@@ -226,6 +252,27 @@ final class RoomControlClientTests: XCTestCase {
         }
     }
 
+    func testGrantNotFoundSubsumesToCapabilityDenied() async throws {
+        // Contract: `grant_not_found` is subsumed under capability_denied on
+        // the wire — same denial family, never .insufficientScope.
+        hub.handler = { _ in
+            (403, Self.problemBody(status: 403, code: "grant_not_found", title: "Forbidden"))
+        }
+        do {
+            _ = try await makeClient().performAction(
+                executionID: Self.executionID,
+                action: .resume,
+                grantID: Self.grantID,
+                requestID: "k"
+            )
+            XCTFail("Expected capability_denied")
+        } catch let error as RoomControlError {
+            guard case .capabilityDenied = error else {
+                return XCTFail("Expected .capabilityDenied, got \(error)")
+            }
+        }
+    }
+
     func testInsufficientScopeStaysDistinctFromCapabilityDenied() async throws {
         for (code, expectDenied) in [("insufficient_scope", false), ("capability_denied", true)] {
             hub.handler = { _ in
@@ -233,7 +280,7 @@ final class RoomControlClientTests: XCTestCase {
             }
             do {
                 _ = try await makeClient().requestGrant(
-                    action: .cancel, executionID: Self.executionID, roomID: nil
+                    action: .cancel, executionID: Self.executionID
                 )
                 XCTFail("Expected forbidden for \(code)")
             } catch let error as RoomControlError {
@@ -255,7 +302,7 @@ final class RoomControlClientTests: XCTestCase {
             (401, Self.problemBody(status: 401, code: "unauthorized", title: "Authentication required"))
         }
         do {
-            _ = try await makeClient().requestGrant(action: .resume, executionID: Self.executionID, roomID: nil)
+            _ = try await makeClient().requestGrant(action: .resume, executionID: Self.executionID)
             XCTFail("Expected unauthorized")
         } catch let error as RoomControlError {
             guard case .unauthorized(let problem) = error else {
@@ -272,7 +319,7 @@ final class RoomControlClientTests: XCTestCase {
         do {
             _ = try await makeClient().performAction(
                 executionID: Self.executionID, action: .resume,
-                grantID: Self.grantID, idempotencyKey: "k"
+                grantID: Self.grantID, requestID: "k"
             )
             XCTFail("Expected notFound")
         } catch let error as RoomControlError {
@@ -284,50 +331,57 @@ final class RoomControlClientTests: XCTestCase {
     }
 
     func testStateConflict409() async throws {
-        hub.handler = { _ in
-            (409, Self.problemBody(
-                status: 409, code: "state_conflict", title: "Conflict",
-                detail: "execution is cancelled; resume is invalid"
-            ))
-        }
-        do {
-            _ = try await makeClient().performAction(
-                executionID: Self.executionID, action: .resume,
-                grantID: Self.grantID, idempotencyKey: "k"
-            )
-            XCTFail("Expected stateConflict")
-        } catch let error as RoomControlError {
-            guard case .stateConflict(let problem) = error else {
-                return XCTFail("Expected .stateConflict, got \(error)")
+        // Contract 409s: `invalid_state` (action can't apply in the current
+        // state) and `execution_not_bound` (no authority binding) — both are
+        // state conflicts surfaced with the authority's verbatim detail.
+        for code in ["invalid_state", "execution_not_bound"] {
+            hub.handler = { _ in
+                (409, Self.problemBody(
+                    status: 409, code: code, title: "Conflict",
+                    detail: "execution is cancelled; resume is invalid"
+                ))
             }
-            XCTAssertEqual(problem.code, "state_conflict")
+            do {
+                _ = try await makeClient().performAction(
+                    executionID: Self.executionID, action: .resume,
+                    grantID: Self.grantID, requestID: "k"
+                )
+                XCTFail("Expected stateConflict for \(code)")
+            } catch let error as RoomControlError {
+                guard case .stateConflict(let problem) = error else {
+                    return XCTFail("Expected .stateConflict, got \(error)")
+                }
+                XCTAssertEqual(problem.code, code)
+            }
         }
     }
 
-    func testControlUnavailable503() async throws {
+    func testInfrastructureUnavailable503() async throws {
+        // Contract 503 `infrastructure_unavailable` — the authority seam is
+        // unconfigured/unreachable; fail closed.
         hub.handler = { _ in
-            (503, Self.problemBody(status: 503, code: "room_control_unavailable", title: "Unavailable"))
+            (503, Self.problemBody(status: 503, code: "infrastructure_unavailable", title: "Unavailable"))
         }
         do {
-            _ = try await makeClient().requestGrant(action: .resume, executionID: Self.executionID, roomID: nil)
-            XCTFail("Expected controlUnavailable")
+            _ = try await makeClient().requestGrant(action: .resume, executionID: Self.executionID)
+            XCTFail("Expected infrastructureUnavailable")
         } catch let error as RoomControlError {
-            guard case .controlUnavailable = error else {
-                return XCTFail("Expected .controlUnavailable, got \(error)")
+            guard case .infrastructureUnavailable = error else {
+                return XCTFail("Expected .infrastructureUnavailable, got \(error)")
             }
         }
     }
 
     func testUndecodableGrantIsATypedFailure() async throws {
-        hub.handler = { _ in (200, Data("<html>not json</html>".utf8)) }
+        hub.handler = { _ in (201, Data("<html>not json</html>".utf8)) }
         do {
-            _ = try await makeClient().requestGrant(action: .resume, executionID: Self.executionID, roomID: nil)
+            _ = try await makeClient().requestGrant(action: .resume, executionID: Self.executionID)
             XCTFail("Expected undecodable")
         } catch let error as RoomControlError {
             guard case .undecodable(let status, _) = error else {
                 return XCTFail("Expected .undecodable, got \(error)")
             }
-            XCTAssertEqual(status, 200)
+            XCTAssertEqual(status, 201)
         }
     }
 
@@ -347,35 +401,42 @@ final class RoomControlClientTests: XCTestCase {
     private static var grantBody: Data {
         Data(#"""
         {"grant_id":"\#(grantID)","execution_id":"\#(executionID)","action":"resume",
-         "principal":"device:nayte-iphone","issued_at":"2026-09-19T10:00:00.000Z",
-         "expires_at":"2026-09-19T10:05:00.000Z","scope_hash":"sha256:9f2c"}
+         "principal":"device:hub-credential:cred-7","issued_at":"2026-09-19T10:00:00.000Z",
+         "expires_at":"2026-09-19T10:05:00.000Z","scope_hash":"9f2c"}
         """#.utf8)
     }
 
     private static var startGrantBody: Data {
         Data(#"""
-        {"grant_id":"\#(grantID)","execution_id":"30000000-0000-4000-8000-0000000000ff",
-         "action":"start","principal":"device:nayte-iphone",
+        {"grant_id":"\#(grantID)","execution_id":"\#(executionID)",
+         "action":"start","principal":"device:hub-credential:cred-7",
          "issued_at":"2026-09-19T10:00:00.000Z","expires_at":"2026-09-19T10:05:00.000Z",
-         "scope_hash":"sha256:aa01"}
+         "scope_hash":"aa01"}
         """#.utf8)
     }
 
     private static var ackBody: Data {
         Data(#"""
-        {"execution_id":"\#(executionID)","action":"cancel","status":"applied",
-         "state":"cancelled","room_seq":12,
-         "correlation_id":"10000000-0000-4000-8000-0000000000d1",
-         "duplicate_rejected":false}
+        {"execution_id":"\#(executionID)","state":"cancelled","substate":null,
+         "room_seq":12,"event_id":"50000000-0000-4000-8000-0000000000e1",
+         "duplicate":false}
         """#.utf8)
     }
 
     private static var duplicateAckBody: Data {
         Data(#"""
-        {"execution_id":"\#(executionID)","action":"resume","status":"duplicate_rejected",
-         "state":"running","room_seq":9,
-         "correlation_id":"10000000-0000-4000-8000-0000000000d1",
-         "duplicate_rejected":true}
+        {"execution_id":"\#(executionID)","state":"running","substate":null,
+         "room_seq":9,"event_id":"50000000-0000-4000-8000-0000000000e0",
+         "duplicate":true}
+        """#.utf8)
+    }
+
+    private static var retryAckBody: Data {
+        Data(#"""
+        {"execution_id":"\#(executionID)","state":"queued","substate":null,
+         "room_seq":13,"event_id":"50000000-0000-4000-8000-0000000000e2",
+         "duplicate":false,
+         "retry_execution_id":"30000000-0000-4000-8000-0000000000f2"}
         """#.utf8)
     }
 

@@ -222,7 +222,7 @@ struct RoomDetailSheet: View {
 
     private struct PendingControl: Equatable {
         let action: RoomControlAction
-        let executionID: String?
+        let executionID: String
     }
 
     private var dashboardID: UUID? { appState.activeDashboardID }
@@ -362,21 +362,6 @@ struct RoomDetailSheet: View {
 
             ForEach(executions) { execution in
                 executionBlock(execution)
-            }
-
-            if room.status == .active {
-                Divider()
-                Button {
-                    Haptics.selection()
-                    pendingAction = PendingControl(action: .start, executionID: nil)
-                } label: {
-                    Label(AppLocalization.string("Start execution"), systemImage: "play.circle")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 40)
-                }
-                .conduitGlassControl(cornerRadius: 14, tint: .conduitAccent.opacity(0.14))
-                .disabled(!controlsEnabled)
             }
         }
     }

@@ -3,27 +3,28 @@
 //  Conduit
 //
 //  ANVIL Room control wire models — the client side of the Hub I4 mutable
-//  seam (DESIGN-I1-I7 §5). The endpoint contract is anvil-i17-i3's to publish;
-//  the shapes here implement the design-doc contract verbatim so integration
-//  is a field-level diff, not a redesign:
+//  seam, implemented against anvil-i17-i3's published contract
+//  (cells/anvil-i17-i3/context/endpoint-contract-i4.md, v1 DRAFT):
 //
-//    POST /api/v1/execution-grants            → CapabilityGrant (Hub-minted)
-//    POST /api/v1/executions/{id}/actions     → ExecutionActionAck
+//    POST /api/v1/executions/{execution_id}/capability-grants
+//      {action, ttl_seconds?}            → 201 CapabilityGrant (Hub-minted)
+//    POST /api/v1/executions/{execution_id}/{action}
+//      {grant_id, request_id?}           → 200 ExecutionActionAck
 //
 //  Authority boundary (unchangeable): Conduit NEVER mints grants. It asks the
-//  Hub for a grant scoped to (execution_id, action, principal), then invokes
-//  the action by grant_id. Every grant field is server-owned and passed
-//  through verbatim — Conduit cannot widen, extend, or reinterpret one. The
-//  only client-minted value on the wire is `idempotency_key`, which is a
-//  dedupe token, never authority.
+//  Hub for a grant bound to (execution_id, action, principal) — the principal
+//  is derived server-side from the Hub credential — then invokes the action
+//  by grant_id reference. Every grant field is server-owned and passed
+//  through verbatim. The only client-minted value on the wire is
+//  `request_id`, an opaque idempotency token — never authority.
 //
 
 import Foundation
 
-/// The mutable action vocabulary. `RoomControlAction` is RawRepresentable so
-/// a Hub action the client doesn't know yet still round-trips in diagnostics
-/// without breaking decode — but candidate UI actions are only ever the
-/// named statics.
+/// The mutable action vocabulary (contract §Endpoints: the six legal path
+/// verbs). `RoomControlAction` is RawRepresentable so a Hub action the client
+/// doesn't know yet still round-trips in diagnostics without breaking decode —
+/// but candidate UI actions are only ever the named statics.
 struct RoomControlAction: RawRepresentable, Codable, Equatable, Hashable {
     let rawValue: String
 
@@ -39,9 +40,9 @@ struct RoomControlAction: RawRepresentable, Codable, Equatable, Hashable {
         try container.encode(rawValue)
     }
 
-    /// The I4 action family (DESIGN §5). `pause` is required by terminal
-    /// acceptance A4 (pause → resume → cancel) alongside the five named
-    /// endpoints.
+    /// The contract's action family: {start, pause, resume, cancel, retry,
+    /// acknowledge}. `pause` completes the A4 sequence (pause → resume →
+    /// cancel).
     static let acknowledge = RoomControlAction(rawValue: "acknowledge")
     static let pause = RoomControlAction(rawValue: "pause")
     static let resume = RoomControlAction(rawValue: "resume")
@@ -52,14 +53,17 @@ struct RoomControlAction: RawRepresentable, Codable, Equatable, Hashable {
     var isDestructive: Bool { self == .cancel }
 }
 
-/// The Hub-minted capability grant (DESIGN §5): scoped to
-/// (execution_id, action, principal), persisted server-side in Neo
-/// `capability_grants`. Every field is authority-owned — Conduit stores and
-/// echoes `grant_id`, never constructs one.
+/// The Hub-minted capability grant (contract §Model): bound to
+/// (execution_id, action, principal), persisted server-side in
+/// `anvil.capability_grants`. Every field is authority-owned — Conduit stores
+/// and echoes `grant_id`, never constructs one. `scope_hash` is advisory only;
+/// the durable grant row is authoritative.
 struct CapabilityGrant: Codable, Equatable {
     let grantID: String
     let executionID: String
     let action: RoomControlAction
+    /// `device:hub-credential:<credentialId>` — derived by the Hub from the
+    /// caller's credential; Conduit cannot choose or widen it.
     let principal: String
     let issuedAt: String
     let expiresAt: String
@@ -76,67 +80,64 @@ struct CapabilityGrant: Codable, Equatable {
     }
 }
 
-/// `POST /api/v1/execution-grants` request body. For existing-execution
-/// actions the subject is `execution_id`; for `start` (no execution exists
-/// yet) the subject is `room_id` and the Hub mints the execution id into the
-/// returned grant.
+/// `POST /api/v1/executions/{execution_id}/capability-grants` request body —
+/// the execution is the path subject; the body carries the action and an
+/// optional TTL (contract default 300s, max 3600s).
 struct ExecutionGrantRequest: Codable, Equatable {
     let action: RoomControlAction
-    let executionID: String?
-    let roomID: String?
+    let ttlSeconds: Int?
 
     enum CodingKeys: String, CodingKey {
         case action
-        case executionID = "execution_id"
-        case roomID = "room_id"
+        case ttlSeconds = "ttl_seconds"
     }
 }
 
-/// `POST /api/v1/executions/{execution_id}/actions` request body. The grant
+/// `POST /api/v1/executions/{execution_id}/{action}` request body. The grant
 /// is referenced by server-minted id only — the client never sends grant
-/// material it constructed. `idempotency_key` is stable per user intent:
-/// retries of one intent reuse it so a re-sent request can never duplicate
-/// the semantic effect.
+/// material it constructed. `request_id` is the caller's opaque per-intent
+/// idempotency token, stable across retries of one intent.
 struct ExecutionActionRequest: Codable, Equatable {
-    let action: RoomControlAction
     let grantID: String
-    let idempotencyKey: String
+    let requestID: String?
 
     enum CodingKeys: String, CodingKey {
-        case action
         case grantID = "grant_id"
-        case idempotencyKey = "idempotency_key"
+        case requestID = "request_id"
     }
 }
 
-/// The mutable endpoint's acknowledgement. `status` is the server-owned
-/// outcome vocabulary (`applied`, `duplicate_rejected`, …) kept as a raw
-/// string — Conduit never maps it into its own state machine. Optional
-/// fields are tolerated absent: the authoritative record of the action is
-/// the Room timeline the client re-reads after success.
+/// The mutable endpoint's acknowledgement (contract §Endpoints). `state` is
+/// the authority's execution-state vocabulary kept as a raw string — Conduit
+/// never maps it into its own state machine. `duplicate: true` means the same
+/// (execution, action, grant) was already committed — the returned
+/// `room_seq`/`event_id` are the ORIGINAL commit. `retry` additionally returns
+/// `retry_execution_id` naming the new attempt. Optional fields tolerate
+/// absence: the authoritative record of the action is the Room timeline the
+/// client re-reads after success.
 struct ExecutionActionAck: Codable, Equatable {
     let executionID: String
-    let action: RoomControlAction
-    let status: String
     let state: String?
+    let substate: String?
     let roomSeq: Int?
-    let correlationID: String?
-    let duplicateRejected: Bool?
+    let eventID: String?
+    let duplicate: Bool?
+    let retryExecutionID: String?
 
     enum CodingKeys: String, CodingKey {
         case executionID = "execution_id"
-        case action
-        case status
         case state
+        case substate
         case roomSeq = "room_seq"
-        case correlationID = "correlation_id"
-        case duplicateRejected = "duplicate_rejected"
+        case eventID = "event_id"
+        case duplicate
+        case retryExecutionID = "retry_execution_id"
     }
 
     /// Whether the server reports this request as a deduped replay of an
-    /// already-applied intent — success-adjacent, rendered distinctly.
+    /// already-committed intent — success-adjacent, rendered distinctly.
     var isDuplicateReplay: Bool {
-        duplicateRejected == true || status == "duplicate_rejected"
+        duplicate == true
     }
 }
 
@@ -155,7 +156,7 @@ struct RoomExecutionProjection: Equatable, Identifiable {
     var lastSeq: Int
     var lastTransitionAt: String?
     /// The granting principal on the most recent control action, when the
-    /// authority recorded one.
+    /// authority recorded one (`actor` in the contract's transition payload).
     var principal: String?
     var taskRef: String?
     var correlationID: String?
@@ -173,15 +174,17 @@ struct RoomExecutionProjection: Equatable, Identifiable {
 }
 
 /// Folds committed room events into per-execution projections. Tolerant by
-/// contract: the I3 convergence machine's exact payload shape lands with its
-/// endpoint publication, so extraction reads several key spellings and
-/// ignores events that carry no execution identity. Pure — no I/O — so the
-/// fold is exhaustively testable.
+/// contract: the transition payload per i3's contract is
+/// `{execution_id, from_state, to_state, substate, reason, actor, grant_id}`,
+/// so extraction reads those spellings first and ignores events that carry
+/// no execution identity. Pure — no I/O — so the fold is exhaustively
+/// testable.
 enum RoomExecutionIndex {
     /// Payload keys consulted for each field, in priority order.
     private static let executionIDKeys = ["execution_id", "executionId"]
     private static let stateKeys = ["to_state", "state", "status", "to"]
-    private static let principalKeys = ["granting_principal", "principal", "actor", "requested_by"]
+    /// The contract's transition payload names the principal `actor`.
+    private static let principalKeys = ["actor", "granting_principal", "principal", "requested_by"]
     private static let actionListKeys = ["available_actions", "allowed_actions", "actions"]
 
     /// Folds `events` (expected ascending room_seq, but order-tolerant: the
@@ -241,25 +244,28 @@ enum RoomExecutionIndex {
     }
 }
 
-/// Which controls to render for a derived execution state. This is a
-/// PRESENTATION policy only — authority is never inferred from a button.
-/// Every tap still runs biometric step-up → grant request → Hub arbitration;
-/// a state the policy misjudges surfaces the Hub's denial verbatim.
-/// Server-advertised `available_actions`, when present, replace this map
-/// entirely.
+/// Which controls to render for a derived execution state, mirroring the
+/// contract's action-semantics table. This is a PRESENTATION policy only —
+/// authority is never inferred from a button. Every tap still runs biometric
+/// step-up → grant mint → Hub arbitration; a state the policy misjudges
+/// surfaces the Hub's denial verbatim. Server-advertised `available_actions`,
+/// when present, replace this map entirely.
 enum RoomControlPolicy {
-    /// Candidate actions for one execution, in display order.
+    /// Candidate actions for one execution, in display order. Mirrors the
+    /// contract's "valid from" column per action.
     static func candidates(for execution: RoomExecutionProjection) -> [RoomControlAction] {
         if let advertised = execution.advertisedActions {
             return advertised.map { RoomControlAction(rawValue: $0) }
         }
         switch execution.state {
         case "queued":
-            return [.cancel]
+            // start: begin dispatch of the bound execution.
+            return [.start, .cancel]
         case "running":
             return [.pause, .acknowledge, .cancel]
         case "tool_wait", "requires_attention":
-            return [.acknowledge, .pause, .cancel]
+            // resume is valid from running+tool_wait per the contract.
+            return [.acknowledge, .resume, .pause, .cancel]
         case "paused", "parked":
             return [.resume, .cancel]
         case "handed_off":
@@ -268,8 +274,6 @@ enum RoomControlPolicy {
             return [.retry]
         case "succeeded":
             return []
-        case "agent_interrupted", "orphaned":
-            return [.retry, .acknowledge]
         default:
             // Unknown/unpublished state: show nothing rather than imply
             // authority the Hub never advertised.
