@@ -15040,6 +15040,146 @@
           }
         }
       }
+    },
+    "Could not reach the Room hub: %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法连接到 Room hub：%@"
+          }
+        }
+      }
+    },
+    "No HTTP response" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无 HTTP 响应"
+          }
+        }
+      }
+    },
+    "No Room hub credential is saved for this dashboard." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此仪表盘未保存 Room hub 凭据。"
+          }
+        }
+      }
+    },
+    "Room hub authentication is unavailable. Retry later." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room hub 认证不可用，请稍后重试。"
+          }
+        }
+      }
+    },
+    "The Room credential lacks the rooms:read scope." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room 凭据缺少 rooms:read 权限范围。"
+          }
+        }
+      }
+    },
+    "The Room does not exist." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "该 Room 不存在。"
+          }
+        }
+      }
+    },
+    "The Room hub address is invalid." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room hub 地址无效。"
+          }
+        }
+      }
+    },
+    "The Room hub answered HTTP %@ with an unreadable payload: %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room hub 返回 HTTP %@，但载荷无法解析：%@"
+          }
+        }
+      }
+    },
+    "The Room hub answered HTTP %@." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room hub 返回 HTTP %@。"
+          }
+        }
+      }
+    },
+    "The Room hub credential was rejected. Sign in again or replace the saved credential." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room hub 凭据被拒绝，请重新登录或更换已保存的凭据。"
+          }
+        }
+      }
+    },
+    "The Room hub is temporarily unavailable." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room hub 暂时不可用。"
+          }
+        }
+      }
+    },
+    "The Room response exceeded %@ bytes." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Room 响应超过 %@ 字节。"
+          }
+        }
+      }
+    },
+    "The hub's ANVIL subject holds no room.read grant on this Room." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "该 hub 的 ANVIL 主体对此 Room 没有 room.read 授权。"
+          }
+        }
+      }
+    },
+    "This hub does not expose the ANVIL Room projection." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 hub 未公开 ANVIL Room 投影。"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"
