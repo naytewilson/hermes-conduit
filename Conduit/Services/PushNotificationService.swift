@@ -363,6 +363,12 @@ final class PushNotificationService: ObservableObject {
     @Published private(set) var pairingCode: String?
     @Published private(set) var pairingExpiry: String?
     @Published private(set) var pendingTarget: ConduitNotificationTarget?
+    /// The Room wake queue (I4): a push that names a `room_id` parks here.
+    /// WAKE-ONLY — the payload is routing metadata, never authority. It may
+    /// cause a fresh authority re-read (resync) and navigation, and nothing
+    /// else: no mutation, no grant, no assumed effect can be derived from
+    /// push content.
+    @Published private(set) var pendingRoomWake: RoomWakeTarget?
     @Published private(set) var navigationAttempt = 0
     @Published var preferences = ConduitNotificationPreferences()
     @Published private(set) var relayMeta: RelayMetaInfo?
@@ -733,6 +739,11 @@ final class PushNotificationService: ObservableObject {
     }
 
     func receiveNotificationPayload(_ userInfo: [AnyHashable: Any]) {
+        // Room wakes park on their own queue even when the payload also
+        // routes a session target — one push can carry both meanings.
+        if let wake = Self.parseRoomWakeTarget(from: userInfo) {
+            pendingRoomWake = wake
+        }
         guard let target = Self.parseNotificationTarget(from: userInfo) else { return }
         retainRelayGatewayID(for: target)
         navigationRetryTask?.cancel()
@@ -740,6 +751,45 @@ final class PushNotificationService: ObservableObject {
         pendingTarget = target
         pendingRetryCount = 0
         navigationAttempt += 1
+    }
+
+    func clearPendingRoomWake(_ target: RoomWakeTarget) {
+        guard pendingRoomWake == target else { return }
+        pendingRoomWake = nil
+    }
+
+    /// Parses the wake-only Room channel out of a push payload. The payload
+    /// is trusted for ONE thing only — naming the room to resync. A
+    /// malformed `dashboard_id` fails closed (no wake at all), mirroring the
+    /// routing path's dashboard scoping.
+    static func parseRoomWakeTarget(from userInfo: [AnyHashable: Any]) -> RoomWakeTarget? {
+        let direct = userInfo["conduit"] as? [String: Any]
+        let nested = (userInfo["body"] as? [String: Any])?["conduit"] as? [String: Any]
+        for payload in [direct, nested].compactMap({ $0 }) {
+            guard let roomID = (payload["room_id"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !roomID.isEmpty else { continue }
+            let executionID = (payload["execution_id"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawDashboardID = (payload["dashboard_id"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let dashboardID: UUID?
+            if let rawDashboardID, !rawDashboardID.isEmpty {
+                guard let parsed = UUID(uuidString: rawDashboardID) else {
+                    // Malformed dashboard identity: fail closed, no wake.
+                    return nil
+                }
+                dashboardID = parsed
+            } else {
+                dashboardID = nil
+            }
+            return RoomWakeTarget(
+                roomID: roomID,
+                executionID: executionID?.isEmpty == false ? executionID : nil,
+                dashboardID: dashboardID
+            )
+        }
+        return nil
     }
 
     /// Retains the push's relay gateway discriminator for every relay

@@ -23,13 +23,42 @@ enum RoomStatus: String, Codable, Equatable {
     case closed
 }
 
-enum RoomEventKind: String, Codable, Equatable {
-    case message
-    case handoff
-    case approval
-    case evidenceRef = "evidence_ref"
-    case execution
-    case system
+/// `room_events.kind` is an OPEN taxonomy owned by the authority: the Hub
+/// adds kinds as the Nervous System integration lands (`dispatch.received`,
+/// `execution.bound`, `execution.transition`, `sieve.projection`, …) and a
+/// closed client enum would fail the whole page decode on the first new
+/// kind — marking a healthy projection stale. The raw wire value is kept
+/// verbatim so unknown kinds decode, persist, and re-encode losslessly;
+/// known kinds are named statics for call sites.
+struct RoomEventKind: RawRepresentable, Codable, Equatable, Hashable {
+    let rawValue: String
+
+    init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        rawValue = try container.decode(String.self)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    static let message = RoomEventKind(rawValue: "message")
+    static let handoff = RoomEventKind(rawValue: "handoff")
+    static let approval = RoomEventKind(rawValue: "approval")
+    static let evidenceRef = RoomEventKind(rawValue: "evidence_ref")
+    static let execution = RoomEventKind(rawValue: "execution")
+    static let system = RoomEventKind(rawValue: "system")
+    // I1 spine + I3 convergence + I2 projection kinds (DESIGN-I1-I7 §2–§5).
+    static let dispatchReceived = RoomEventKind(rawValue: "dispatch.received")
+    static let executionBound = RoomEventKind(rawValue: "execution.bound")
+    static let executionRebound = RoomEventKind(rawValue: "execution.rebound")
+    static let executionTransition = RoomEventKind(rawValue: "execution.transition")
+    static let sieveProjection = RoomEventKind(rawValue: "sieve.projection")
 }
 
 /// Projection of `anvil.rooms`. `latestSeq` is the committed high-water
@@ -126,6 +155,18 @@ struct RoomEventKey: Hashable, Codable {
         case roomID = "room_id"
         case roomSeq = "room_seq"
     }
+}
+
+extension ProjectedRoom: Identifiable {
+    var id: String { roomID }
+}
+
+extension RoomParticipant: Identifiable {
+    var id: String { participantID }
+}
+
+extension RoomEvent: Identifiable {
+    var id: String { eventID }
 }
 
 /// `GET /api/v1/rooms` — the Rooms readable by the bound ANVIL subject.
