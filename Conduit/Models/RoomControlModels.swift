@@ -287,15 +287,27 @@ enum RoomControlPolicy {
     /// Candidate actions for one execution, in display order.
     static func candidates(for execution: RoomExecutionProjection) -> [RoomControlAction] {
         if let advertised = execution.advertisedActions {
-            return advertised.map { RoomControlAction(rawValue: $0) }
+            // Room projections may outlive the Hub control contract that produced
+            // them. Never let a stale/future advertised verb manufacture a
+            // client control surface that frozen V1 cannot dispatch.
+            let supported: Set<RoomControlAction> = [.acknowledge, .resume, .retry, .cancel]
+            return advertised
+                .map { RoomControlAction(rawValue: $0) }
+                .filter { supported.contains($0) }
         }
         switch execution.state {
         case "spawning", "running":
             return [.acknowledge, .cancel]
         case "tool_wait", "requires_attention":
             return [.acknowledge, .cancel]
-        case "failed", "cancelled":
+        case "failed":
             return [.retry, .resume]
+        case "cancelled":
+            // Frozen V1 retry/resume precondition is status == failed.
+            // A cancelled execution may later converge to failed after the
+            // daemon reports the interruption, but the client must not
+            // pre-empt that authority transition.
+            return []
         default:
             // queued / paused / parked / handed_off / succeeded / unknown:
             // no frozen op is valid from these states — show nothing rather
