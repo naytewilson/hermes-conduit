@@ -222,7 +222,14 @@ final class RoomCenterTests: XCTestCase {
         let center = RoomCenter(
             credentialStore: credentialStore,
             transport: hub.transport,
-            replayStore: replayStore,
+            replayStore: RoomReplayStore(
+                defaults: defaults,
+                storageKey: "test.productionShape.roomReplay"
+            ),
+            controlJournal: RoomControlJournal(
+                defaults: defaults,
+                storageKey: "test.productionShape.roomControls"
+            ),
             authenticate: { _ in true },
             clock: { Date(timeIntervalSince1970: 1_789_813_200) },
             idempotencyKeyMint: { productionUUID },
