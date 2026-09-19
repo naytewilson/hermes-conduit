@@ -163,6 +163,7 @@ final class RoomCenterTests: XCTestCase {
             credentialStore: credentialStore,
             transport: hub.transport,
             replayStore: RoomReplayStore(defaults: defaults, storageKey: "test.roomReplay"),
+            controlJournal: RoomControlJournal(defaults: defaults, storageKey: "test.roomControls"),
             authenticate: { [weak self] reason in
                 self?.biometricReasons.append(reason)
                 return self?.biometricResults.isEmpty == false
@@ -240,6 +241,106 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertFalse(intent.idempotencyKey.contains(dashboardID.uuidString.lowercased()))
     }
 
+    func testAmbiguousFailureReusesSameIntentAndKeyAfterRestart() async {
+        var posts = 0
+        hub.postHandler = { path in
+            guard path.hasSuffix("/resume") else { return nil }
+            posts += 1
+            return posts == 1
+                ? (500, Self.problemBody(status: 500, code: "internal_error"))
+                : (200, Self.opRecordBody(op: "resume", status: "applied", replayed: true))
+        }
+
+        let firstCenter = await makeCenter()
+        let first = await firstCenter.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .resume,
+            correlationID: "corr-restart"
+        )
+        let firstOutcome = await firstCenter.perform(first)
+        XCTAssertEqual(firstOutcome.kind, .failed)
+        XCTAssertEqual(posts, 1)
+
+        hub.requests = []
+        let secondCenter = await makeCenter()
+        let recovered = await secondCenter.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .resume,
+            correlationID: "corr-restart"
+        )
+        XCTAssertEqual(recovered.id, first.id)
+        XCTAssertEqual(recovered.idempotencyKey, first.idempotencyKey)
+
+        let replay = await secondCenter.perform(recovered)
+        XCTAssertEqual(replay.kind, .duplicateRejected)
+        XCTAssertEqual(posts, 2)
+        XCTAssertEqual(
+            hub.requests.first?.body?["idempotencyKey"]?.stringValue,
+            first.idempotencyKey
+        )
+        XCTAssertEqual(
+            hub.requests.first?.body?["correlationId"]?.stringValue,
+            "corr-restart"
+        )
+    }
+
+    func testRecordedOperationResumesByGETAfterRestartWithoutSecondPOST() async {
+        hub.postHandler = { path in
+            guard path.hasSuffix("/retry") else { return nil }
+            return (202, Self.opRecordBody(op: "retry", status: "recorded"))
+        }
+
+        let firstCenter = await makeCenter(pollAttempts: 0)
+        let first = await firstCenter.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .retry,
+            correlationID: "corr-recorded"
+        )
+        let recorded = await firstCenter.perform(first)
+        XCTAssertEqual(recorded.kind, .recorded)
+        XCTAssertEqual(hub.postCount, 1)
+
+        hub.requests = []
+        hub.operationPollResponses = [
+            (200, Self.opRecordBody(op: "retry", status: "applied"))
+        ]
+        let secondCenter = await makeCenter(pollAttempts: 0)
+        let recovered = await secondCenter.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .retry,
+            correlationID: "corr-recorded"
+        )
+        XCTAssertEqual(recovered.id, first.id)
+        XCTAssertEqual(recovered.idempotencyKey, first.idempotencyKey)
+
+        let applied = await secondCenter.perform(recovered)
+        XCTAssertEqual(applied.kind, .applied)
+        XCTAssertEqual(hub.postCount, 0)
+        XCTAssertEqual(
+            hub.requests.first?.path,
+            "/api/v1/controls/operations/\(Self.operationID)"
+        )
+
+        let thirdCenter = await makeCenter(pollAttempts: 0)
+        let fresh = await thirdCenter.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .retry,
+            correlationID: "corr-recorded"
+        )
+        XCTAssertNotEqual(fresh.id, first.id)
+        XCTAssertNotEqual(fresh.idempotencyKey, first.idempotencyKey)
+    }
+
     func testBiometricRejectionPerformsZeroNetworkIO() async {
         biometricResults = [false]
         let center = await makeCenter()
@@ -265,8 +366,11 @@ final class RoomCenterTests: XCTestCase {
         }
         let center = await makeCenter()
         let intent = await center.makeIntent(
-            dashboardID: dashboardID, roomID: Self.roomID,
-            executionID: Self.executionID, action: .cancel
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .cancel,
+            correlationID: "corr-control"
         )
 
         let outcome = await center.perform(intent)
@@ -286,6 +390,7 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertFalse(methods.contains { $0.contains("capability-grants") })
         XCTAssertTrue(methods.dropFirst().allSatisfy { $0.hasPrefix("GET ") })
         XCTAssertEqual(hub.requests[0].body?["idempotencyKey"]?.stringValue, intent.idempotencyKey)
+        XCTAssertEqual(hub.requests[0].body?["correlationId"]?.stringValue, "corr-control")
     }
 
     func testRetriedIntentReusesIdempotencyKey() async {
