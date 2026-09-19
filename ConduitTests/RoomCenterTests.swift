@@ -217,6 +217,7 @@ final class RoomCenterTests: XCTestCase {
 
     // MARK: - Control flow
 
+    @MainActor
     func testProductionShapeIdempotencyKeyFitsFrozenContractLimit() async {
         let productionUUID = "12345678-1234-1234-1234-123456789abc"
         let center = RoomCenter(
