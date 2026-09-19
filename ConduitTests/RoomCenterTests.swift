@@ -270,10 +270,14 @@ final class RoomCenterTests: XCTestCase {
             roomID: Self.roomID,
             executionID: Self.executionID,
             action: .resume,
-            correlationID: "corr-restart"
+            // Correlation is descriptive lineage, not idempotency target
+            // identity. Recovery must still reuse the original intent/key if
+            // the refreshed projection reports a changed value.
+            correlationID: "corr-after-restart"
         )
         XCTAssertEqual(recovered.id, first.id)
         XCTAssertEqual(recovered.idempotencyKey, first.idempotencyKey)
+        XCTAssertEqual(recovered.correlationID, "corr-restart")
 
         let replay = await secondCenter.perform(recovered)
         XCTAssertEqual(replay.kind, .duplicateRejected)
