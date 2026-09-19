@@ -267,7 +267,10 @@ final class RoomCenter: ObservableObject {
             attentionKind: attentionKind,
             trigger: trigger,
             projectSlug: projectSlug,
-            idempotencyKey: "conduit:\(dashboardID.uuidString.lowercased()):\(idempotencyKeyMint())"
+            // Hub V1 caps idempotencyKey at 64 characters. A UUID plus
+            // this short producer prefix is globally collision-resistant
+            // without embedding the 36-character dashboard UUID as well.
+            idempotencyKey: "conduit:\(idempotencyKeyMint())"
         )
     }
 
