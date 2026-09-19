@@ -457,23 +457,27 @@ final class RoomControlClientTests: XCTestCase {
     ) -> Data {
         let replayedField = replayed ? "\"replayed\":true," : ""
         return Data(#"""
-        {"operationId":"\#(operationID)","op":"\#(op)","status":"\#(status)",
-         \#(replayedField)"idempotencyKey":"conduit:dash-1:intent-9",
-         "executionId":"\#(executionID)","capability":"control.\#(op)",
-         "subject":"device:hub-credential:cred-7","correlationId":"corr-1",
-         "effect":{"state":"cancelled"},
-         "createdAt":"2026-09-19T10:00:00.000Z","updatedAt":"2026-09-19T10:00:01.000Z"}
+        {"operation":{
+          "operationId":"\#(operationID)","op":"\#(op)","status":"\#(status)",
+          \#(replayedField)"idempotencyKey":"conduit:dash-1:intent-9",
+          "executionId":"\#(executionID)","capability":"control.\#(op)",
+          "subject":"device:hub-credential:cred-7","correlationId":"corr-1",
+          "effect":{"state":"cancelled"},
+          "createdAt":"2026-09-19T10:00:00.000Z","updatedAt":"2026-09-19T10:00:01.000Z"
+        }}
         """#.utf8)
     }
 
     private static var startOpRecordBody: Data {
         Data(#"""
-        {"operationId":"\#(operationID)","op":"execution_start","status":"applied",
-         "idempotencyKey":"k-start","executionId":null,"capability":"control.execution_start",
-         "subject":"device:hub-credential:cred-7","correlationId":null,
-         "effect":{"triggerRunId":"70000000-0000-4000-8000-0000000000d1",
-                   "providerEventReceiptId":"80000000-0000-4000-8000-0000000000e1"},
-         "createdAt":"2026-09-19T10:00:00.000Z","updatedAt":"2026-09-19T10:00:01.000Z"}
+        {"operation":{
+          "operationId":"\#(operationID)","op":"execution_start","status":"applied",
+          "idempotencyKey":"k-start","executionId":null,"capability":"control.execution_start",
+          "subject":"device:hub-credential:cred-7","correlationId":null,
+          "effect":{"triggerRunId":"70000000-0000-4000-8000-0000000000d1",
+                    "providerEventReceiptId":"80000000-0000-4000-8000-0000000000e1"},
+          "createdAt":"2026-09-19T10:00:00.000Z","updatedAt":"2026-09-19T10:00:01.000Z"
+        }}
         """#.utf8)
     }
 
