@@ -130,7 +130,10 @@ struct RoomControlJournal {
             && lhs.attentionKind == rhs.attentionKind
             && lhs.trigger == rhs.trigger
             && lhs.projectSlug == rhs.projectSlug
-            && lhs.correlationID == rhs.correlationID
+        // correlationID is descriptive lineage, not Hub idempotency target
+        // identity. If a refreshed projection carries a different/absent
+        // correlation value after restart, the same op+target must still
+        // recover the original key rather than risk a second mutation.
     }
 
     private func persist() {
