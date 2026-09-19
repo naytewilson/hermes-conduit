@@ -561,7 +561,7 @@ final class RoomCenter: ObservableObject {
     private func resyncAndResolveJournal(_ intent: RoomControlIntent) async {
         await syncRoom(dashboardID: intent.dashboardID, roomID: intent.roomID)
         let key = scopeKey(dashboardID: intent.dashboardID, roomID: intent.roomID)
-        if case .live = projections[key]?.freshness {
+        if let freshness = projections[key]?.freshness, freshness == .live {
             controlJournal.remove(intentID: intent.id)
         }
     }
