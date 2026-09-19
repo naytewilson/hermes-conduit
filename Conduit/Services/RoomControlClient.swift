@@ -231,10 +231,11 @@ struct RoomControlClient {
     /// GET /operations/{operationId} → 200 op record. The replayable
     /// projection surface: poll this for recorded→applied transitions.
     func getOperation(operationID: String) async throws -> ControlOperationRecord {
-        try await get(
+        let response = try await get(
             "/operations/\(try pathComponent(operationID))",
-            as: ControlOperationRecord.self
+            as: ControlOperationResponse.self
         )
+        return response.operation
     }
 
     /// GET /operations?executionId?&op?&status?&limit? → 200
@@ -275,7 +276,7 @@ struct RoomControlClient {
         switch http.statusCode {
         case 200, 201, 202:
             do {
-                return try decoder.decode(ControlOperationRecord.self, from: data)
+                return try decoder.decode(ControlOperationResponse.self, from: data).operation
             } catch {
                 throw RoomControlError.undecodable(
                     status: http.statusCode,
