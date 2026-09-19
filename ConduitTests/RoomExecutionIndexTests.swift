@@ -3,10 +3,12 @@
 //  Conduit
 //
 //  Pure-fold tests for the control surface's execution derivation and its
-//  presentation policy. The Room timeline is the authority (DESIGN-I1-I7
-//  §4): `RoomExecutionIndex` folds committed events into per-execution
-//  projections, and `RoomControlPolicy` only decides which REQUEST buttons
-//  to render — it never grants authority. Two properties matter most:
+//  presentation policy, against the FROZEN contract
+//  (docs/contracts/HUB_CONTROL_CONTRACT_V1.md). The Room timeline is the
+//  authority (DESIGN §4): `RoomExecutionIndex` folds committed events into
+//  per-execution projections, and `RoomControlPolicy` only decides which
+//  REQUEST buttons to render — it never grants authority. Two properties
+//  matter most:
 //
 //  - the fold takes the event with the HIGHEST room_seq as truth regardless
 //    of arrival order (the projection sort is canonical);
@@ -72,12 +74,13 @@ final class RoomExecutionIndexTests: XCTestCase {
         XCTAssertEqual(projections[0].state, "queued")
     }
 
-    func testPrincipalTaskAndCorrelationPropagate() {
-        // The contract's transition payload names the granting principal
-        // `actor`.
+    func testSubjectTaskAndCorrelationPropagate() {
+        // The transition payload names the actor `actor`; the fold carries
+        // it as the projection's `subject` — the identity the op record and
+        // the Room timeline agree on.
         let transition = event(seq: 5, payload: [
             "execution_id": .string(Self.executionID),
-            "to_state": .string("paused"),
+            "to_state": .string("running"),
             "actor": .string("device:hub-credential:cred-7")
         ])
         var withRef = transition
@@ -91,7 +94,7 @@ final class RoomExecutionIndexTests: XCTestCase {
             occurredAt: transition.occurredAt, createdAt: transition.createdAt
         )
         let projections = RoomExecutionIndex.projections(from: [withRef])
-        XCTAssertEqual(projections[0].principal, "device:hub-credential:cred-7")
+        XCTAssertEqual(projections[0].subject, "device:hub-credential:cred-7")
         XCTAssertEqual(projections[0].taskRef, "anvil:task-9")
         XCTAssertEqual(projections[0].correlationID, "corr-1")
         XCTAssertEqual(projections[0].lastTransitionAt, "2026-09-19T09:20:00.000Z")
@@ -100,11 +103,11 @@ final class RoomExecutionIndexTests: XCTestCase {
     func testServerAdvertisedActionsAreCaptured() {
         let transition = event(seq: 4, payload: [
             "execution_id": .string(Self.executionID),
-            "to_state": .string("paused"),
-            "available_actions": .array([.string("resume"), .string("cancel")])
+            "to_state": .string("running"),
+            "available_actions": .array([.string("acknowledge"), .string("cancel")])
         ])
         let projections = RoomExecutionIndex.projections(from: [transition])
-        XCTAssertEqual(projections[0].advertisedActions, ["resume", "cancel"])
+        XCTAssertEqual(projections[0].advertisedActions, ["acknowledge", "cancel"])
     }
 
     func testUnknownAuthorityKindsDecodeLosslessly() throws {
@@ -129,46 +132,49 @@ final class RoomExecutionIndexTests: XCTestCase {
         XCTAssertEqual(projections.first?.state, "running")
     }
 
-    // MARK: - Presentation policy
+    // MARK: - Presentation policy (frozen §2 preconditions)
 
-    func testPausedExecutionOffersResumeAndCancel() {
-        var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 7)
-        projection.state = "paused"
-        XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.resume, .cancel])
+    func testActiveExecutionOffersAcknowledgeAndCancel() {
+        // Cancel is valid from spawning/running; acknowledge needs only an
+        // existing execution. Both render as requests the Hub can deny.
+        for state in ["spawning", "running", "tool_wait", "requires_attention"] {
+            var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 6)
+            projection.state = state
+            XCTAssertEqual(
+                RoomControlPolicy.candidates(for: projection),
+                [.acknowledge, .cancel],
+                "state: \(state)"
+            )
+        }
     }
 
-    func testQueuedExecutionOffersStartAndCancel() {
-        // Contract action semantics: `start` is valid from `queued` — it
-        // begins dispatch of an already-bound execution.
-        var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 1)
-        projection.state = "queued"
-        XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.start, .cancel])
+    func testFailedExecutionOffersRetryAndResume() {
+        // retry/resume are valid from failed — 202 `recorded`, queued with
+        // the execution authority, never "running again".
+        var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 9)
+        projection.state = "failed"
+        XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.retry, .resume])
     }
 
-    func testToolWaitOffersResumeAmongAcknowledgePauseCancel() {
-        // Contract: `resume` is valid from running+tool_wait.
-        var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 6)
-        projection.state = "tool_wait"
-        XCTAssertEqual(
-            RoomControlPolicy.candidates(for: projection),
-            [.acknowledge, .resume, .pause, .cancel]
-        )
-    }
-
-    func testTerminalStatesOfferOnlyRetryOrNothing() {
-        var failed = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 9)
-        failed.state = "failed"
-        XCTAssertEqual(RoomControlPolicy.candidates(for: failed), [.retry])
-
+    func testTerminalSucceededOffersNothing() {
         var succeeded = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 9)
         succeeded.state = "succeeded"
         XCTAssertTrue(RoomControlPolicy.candidates(for: succeeded).isEmpty)
         XCTAssertTrue(succeeded.isTerminal)
     }
 
+    func testQueuedExecutionOffersNoPerExecutionControls() {
+        // Frozen contract: `start` is a separate manual-run-shaped op with
+        // trigger/projectSlug — it is NOT an action on an existing queued
+        // execution, so no per-execution buttons render from `queued`.
+        var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 1)
+        projection.state = "queued"
+        XCTAssertTrue(RoomControlPolicy.candidates(for: projection).isEmpty)
+    }
+
     func testServerAdvertisedActionsOverrideTheLocalMap() {
         var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 4)
-        projection.state = "paused"
+        projection.state = "running"
         projection.advertisedActions = ["acknowledge"]
         // The authority's advertisement replaces the presentation map.
         XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.acknowledge])
@@ -182,14 +188,19 @@ final class RoomExecutionIndexTests: XCTestCase {
     }
 
     func testAllFiveRequiredActionsAreNamed() {
-        // A4 coverage: the I4 action family exists as wire values.
+        // The frozen V1 op family: five ops, no `pause`.
         XCTAssertEqual(RoomControlAction.resume.rawValue, "resume")
         XCTAssertEqual(RoomControlAction.cancel.rawValue, "cancel")
         XCTAssertEqual(RoomControlAction.retry.rawValue, "retry")
         XCTAssertEqual(RoomControlAction.acknowledge.rawValue, "acknowledge")
         XCTAssertEqual(RoomControlAction.start.rawValue, "start")
-        XCTAssertEqual(RoomControlAction.pause.rawValue, "pause")
+        // `start` records under its own op value; the rest record as-is.
+        XCTAssertEqual(RoomControlAction.start.recordOpValue, "execution_start")
+        XCTAssertEqual(RoomControlAction.cancel.recordOpValue, "cancel")
         XCTAssertTrue(RoomControlAction.cancel.isDestructive)
         XCTAssertFalse(RoomControlAction.resume.isDestructive)
+        // RawRepresentable round-trips unknown future ops for diagnostics —
+        // they just never become candidate UI actions.
+        XCTAssertEqual(RoomControlAction(rawValue: "pause").rawValue, "pause")
     }
 }

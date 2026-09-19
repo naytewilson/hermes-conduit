@@ -859,6 +859,16 @@
         }
       }
     },
+    "Already recorded — duplicate suppressed" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已记录——重复请求已抑制"
+          }
+        }
+      }
+    },
     "Always allow" : {
       "localizations" : {
         "zh-Hans" : {
@@ -1669,6 +1679,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "二进制文件"
+          }
+        }
+      }
+    },
+    "Biometric step-up authorizes this op with the Hub. The Hub instance's bound subject applies its own durable capability grant — Conduit never holds one." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "生物识别升级授权此操作发送至 Hub。Hub 实例绑定的主体使用其自身的持久能力授权——Conduit 从不持有该授权。"
           }
         }
       }
@@ -5031,6 +5051,16 @@
         }
       }
     },
+    "Execution or operation not found" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未找到执行或操作"
+          }
+        }
+      }
+    },
     "Existing HTTPS domain" : {
       "localizations" : {
         "zh-Hans" : {
@@ -6145,6 +6175,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "想法（可选）"
+          }
+        }
+      }
+    },
+    "Idempotency conflict — key bound to a different op" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "幂等键冲突——该键已绑定到其他操作"
+          }
+        }
+      }
+    },
+    "Idle" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "空闲"
           }
         }
       }
@@ -8027,6 +8077,16 @@
         }
       }
     },
+    "No longer actionable — timeline refreshed" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "操作已不再适用——时间线已刷新"
+          }
+        }
+      }
+    },
     "No longer active" : {
       "localizations" : {
         "zh-Hans" : {
@@ -9769,6 +9829,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "录制 ASR"
+          }
+        }
+      }
+    },
+    "Recorded — queued with the execution authority" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已记录——已加入执行权限方队列"
           }
         }
       }
@@ -12367,6 +12437,16 @@
         }
       }
     },
+    "Terminal" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "终止"
+          }
+        }
+      }
+    },
     "Test and fix the failed connection, then reconnect" : {
       "localizations" : {
         "zh-Hans" : {
@@ -12569,6 +12649,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "网关返回了无效的文件载荷。"
+          }
+        }
+      }
+    },
+    "The Hub's control capability was denied." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 的控制能力授权被拒绝。"
+          }
+        }
+      }
+    },
+    "The idempotency key is already bound to a different operation." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "幂等键已绑定到其他操作。"
           }
         }
       }
@@ -12965,6 +13065,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "此文件为空。"
+          }
+        }
+      }
+    },
+    "This hub's control plane is not configured." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 Hub 的控制平面未配置。"
           }
         }
       }
@@ -14583,6 +14693,16 @@
         }
       }
     },
+    "Invalid control request" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无效的控制请求"
+          }
+        }
+      }
+    },
     "invalid response" : {
       "localizations" : {
         "zh-Hans" : {
@@ -15191,6 +15311,26 @@
         }
       }
     },
+    "Acknowledge %@ on this execution?" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "确认此执行上的 %@？"
+          }
+        }
+      }
+    },
+    "Acknowledge which state?" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "确认哪种状态？"
+          }
+        }
+      }
+    },
     "Action applied" : {
       "localizations" : {
         "zh-Hans" : {
@@ -15681,12 +15821,42 @@
         }
       }
     },
+    "The execution or operation does not exist." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "执行或操作不存在。"
+          }
+        }
+      }
+    },
     "The execution's state changed — timeline refreshed" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "执行状态已变更——时间线已刷新"
+          }
+        }
+      }
+    },
+    "The Hub denied the control capability" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 拒绝了控制能力授权"
+          }
+        }
+      }
+    },
+    "The Hub records which attention state you are acknowledging." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 会记录你正在确认的注意状态。"
           }
         }
       }

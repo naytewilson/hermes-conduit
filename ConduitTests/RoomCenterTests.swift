@@ -2,21 +2,22 @@
 //  RoomCenterTests.swift
 //  Conduit
 //
-//  Orchestration acceptance for the I4 control flow. The scripted Hub
+//  Orchestration acceptance for the I4 control flow against the FROZEN
+//  contract (docs/contracts/HUB_CONTROL_CONTRACT_V1.md). The scripted Hub
 //  answers BOTH seams (H1 reads + I4 mutations) so the test can assert the
 //  exact call order and the exact wire traffic each path produces:
 //
-//    intent → biometric step-up → POST /executions/{id}/capability-grants
-//    → POST /executions/{id}/{action} → GET resync (snapshot + replay)
-//
-//  Wire shapes per anvil-i17-i3's published endpoint-contract-i4.md (v1
-//  DRAFT).
+//    intent → biometric step-up → POST /api/v1/controls/executions/{id}/{op}
+//    → (202 recorded? poll GET /api/v1/controls/operations/{opId} → applied)
+//    → authority resync (snapshot + replay)
 //
 //  Proved here:
 //  - a rejected step-up performs ZERO network I/O (fail closed);
 //  - idempotency keys are minted per intent and stable across its retries;
-//  - `capability_denied` (expired grant) and `insufficient_scope` surface
-//    as different outcome kinds;
+//  - 202 `recorded` is polled to `applied` (bounded); a never-applying op
+//    surfaces as `.recorded` with its operation id, never as applied;
+//  - `control_capability_denied` and `insufficient_scope` surface as
+//    different outcome kinds;
 //  - a successful action triggers an authority re-read (resync), never a
 //    client-side timeline write;
 //  - APNs wakes resync only — never a POST;
@@ -41,7 +42,7 @@ private final class InMemoryRoomHubBackend: RoomHubCredentialBackend {
 }
 
 /// One Hub serving read + control routes; `requests` is the ground truth for
-/// ordering assertions (grant before action, reads only on wake).
+/// ordering assertions (op before resync reads, reads only on wake).
 private final class CombinedHub {
     struct RecordedRequest {
         let method: String
@@ -52,6 +53,8 @@ private final class CombinedHub {
     var requests: [RecordedRequest] = []
     /// Route overrides: path → (status, body). Unmatched POSTs 500.
     var postHandler: (String) -> (Int, Data)? = { _ in nil }
+    /// GET /operations/{id} answers in FIFO order (for polling tests).
+    var operationPollResponses: [(Int, Data)] = []
     var roomsList: Data
     var snapshot: Data
     var eventPage: Data
@@ -83,6 +86,16 @@ private final class CombinedHub {
                 }
                 status = fixture.0
                 payload = fixture.1
+            } else if path.contains("/api/v1/controls/operations/") {
+                // Polled op records — FIFO so tests script recorded→applied.
+                if !self.operationPollResponses.isEmpty {
+                    let fixture = self.operationPollResponses.removeFirst()
+                    status = fixture.0
+                    payload = fixture.1
+                } else {
+                    status = 404
+                    payload = Data()
+                }
             } else if path == "/api/v1/rooms" {
                 payload = self.roomsList
             } else if path.hasSuffix("/events") {
@@ -105,7 +118,7 @@ private final class CombinedHub {
 final class RoomCenterTests: XCTestCase {
     static let roomID = "10000000-0000-4000-8000-0000000000a1"
     static let executionID = "30000000-0000-4000-8000-0000000000f1"
-    static let grantID = "40000000-0000-4000-8000-0000000000aa"
+    static let operationID = "60000000-0000-4000-8000-0000000000c1"
 
     private var hub: CombinedHub!
     private var backend: InMemoryRoomHubBackend!
@@ -142,7 +155,10 @@ final class RoomCenterTests: XCTestCase {
         super.tearDown()
     }
 
-    @MainActor private func makeCenter() -> RoomCenter {
+    @MainActor private func makeCenter(
+        pollAttempts: Int = 5,
+        pollInterval: TimeInterval = 0
+    ) -> RoomCenter {
         RoomCenter(
             credentialStore: credentialStore,
             transport: hub.transport,
@@ -157,7 +173,9 @@ final class RoomCenterTests: XCTestCase {
                 let key = "mint-\(self?.mintedKeys.count ?? 0)"
                 self?.mintedKeys.append(key)
                 return key
-            }
+            },
+            operationPollMaxAttempts: pollAttempts,
+            operationPollInterval: pollInterval
         )
     }
 
@@ -200,7 +218,6 @@ final class RoomCenterTests: XCTestCase {
 
     func testBiometricRejectionPerformsZeroNetworkIO() async {
         biometricResults = [false]
-        hub.postHandler = { _ in (200, Self.grantBody) }
         let center = await makeCenter()
         let intent = await center.makeIntent(
             dashboardID: dashboardID, roomID: Self.roomID,
@@ -210,58 +227,54 @@ final class RoomCenterTests: XCTestCase {
         let outcome = await center.perform(intent)
 
         XCTAssertEqual(outcome.kind, .biometricRejected)
-        // The ENTIRE mutable flow is gated: not even the grant request ran.
+        // The ENTIRE mutable flow is gated: not even the op POST ran.
         XCTAssertTrue(hub.requests.isEmpty)
         XCTAssertEqual(biometricReasons.count, 1)
     }
 
-    func testSuccessfulActionOrderGrantThenActionThenResync() async {
+    func testSuccessfulActionPostsOpThenResyncs() async {
         hub.postHandler = { path in
-            if path.hasSuffix("/capability-grants") { return (201, Self.grantBody) }
-            if path.hasSuffix("/resume") {
-                return (200, Self.ackBody(state: "running"))
+            if path.hasSuffix("/cancel") {
+                return (200, Self.opRecordBody(op: "cancel", status: "applied"))
             }
             return nil
         }
         let center = await makeCenter()
         let intent = await center.makeIntent(
             dashboardID: dashboardID, roomID: Self.roomID,
-            executionID: Self.executionID, action: .resume
+            executionID: Self.executionID, action: .cancel
         )
 
         let outcome = await center.perform(intent)
 
         XCTAssertEqual(outcome.kind, .applied)
-        XCTAssertEqual(outcome.principal, "device:hub-credential:cred-7")
-        XCTAssertEqual(outcome.detail, "running")
+        XCTAssertEqual(outcome.subject, "device:hub-credential:cred-7")
+        XCTAssertEqual(outcome.detail, Self.operationID)
 
         let methods = hub.requests.map { "\($0.method) \($0.path)" }
-        // Grant → action → snapshot+events resync. The resync re-reads
-        // authority; the client never writes timeline state itself.
+        // Op POST → snapshot+events resync. The resync re-reads authority;
+        // the client never writes timeline state itself. No grant-mint call
+        // exists on the frozen wire.
         XCTAssertEqual(
             methods[0],
-            "POST /api/v1/executions/\(Self.executionID)/capability-grants"
+            "POST /api/v1/controls/executions/\(Self.executionID)/cancel"
         )
-        XCTAssertEqual(
-            methods[1],
-            "POST /api/v1/executions/\(Self.executionID)/resume"
-        )
-        XCTAssertTrue(methods.dropFirst(2).allSatisfy { $0.hasPrefix("GET ") })
-        XCTAssertEqual(hub.requests[1].body?["request_id"]?.stringValue, intent.idempotencyKey)
+        XCTAssertFalse(methods.contains { $0.contains("capability-grants") })
+        XCTAssertTrue(methods.dropFirst().allSatisfy { $0.hasPrefix("GET ") })
+        XCTAssertEqual(hub.requests[0].body?["idempotencyKey"]?.stringValue, intent.idempotencyKey)
     }
 
     func testRetriedIntentReusesIdempotencyKey() async {
         var actionCalls = 0
         hub.postHandler = { path in
-            if path.hasSuffix("/capability-grants") { return (201, Self.grantBody) }
             if path.hasSuffix("/resume") {
                 actionCalls += 1
                 // First attempt: a 500 — the Hub may not have applied it, so
                 // a manual retry of the SAME intent must present the SAME
-                // request_id. Second: the Hub reports the dedupe.
+                // idempotency key. Second: the Hub reports the replay.
                 return actionCalls == 1
                     ? (500, Self.problemBody(status: 500, code: "internal_error"))
-                    : (200, Self.ackBody(state: "running", duplicate: true))
+                    : (200, Self.opRecordBody(op: "resume", status: "applied", replayed: true))
             }
             return nil
         }
@@ -275,18 +288,99 @@ final class RoomCenterTests: XCTestCase {
         _ = await center.perform(intent)
 
         let actionKeys = hub.requests
-            .filter { $0.method == "POST" && !$0.path.hasSuffix("/capability-grants") }
-            .compactMap { $0.body?["request_id"]?.stringValue }
+            .filter { $0.method == "POST" }
+            .compactMap { $0.body?["idempotencyKey"]?.stringValue }
         XCTAssertEqual(actionCalls, 2)
         XCTAssertEqual(actionKeys, [intent.idempotencyKey, intent.idempotencyKey])
         let finalOutcome = await center.controlOutcomes[intent.id]
         XCTAssertEqual(finalOutcome?.kind, .duplicateRejected)
     }
 
-    func testExpiredGrantSurfacesCapabilityDenied() async {
+    func testRecordedOpIsPolledToApplied() async {
+        // 202 `recorded`: the op is queued with the execution authority.
+        // The center polls GET /operations/{id} until it turns applied.
         hub.postHandler = { path in
-            if path.hasSuffix("/capability-grants") { return (201, Self.grantBody) }
-            return (403, Self.problemBody(status: 403, code: "capability_denied"))
+            if path.hasSuffix("/retry") {
+                return (202, Self.opRecordBody(op: "retry", status: "recorded"))
+            }
+            return nil
+        }
+        hub.operationPollResponses = [
+            (200, Self.opRecordBody(op: "retry", status: "recorded")),
+            (200, Self.opRecordBody(op: "retry", status: "applied")),
+        ]
+        let center = await makeCenter(pollAttempts: 5)
+        let intent = await center.makeIntent(
+            dashboardID: dashboardID, roomID: Self.roomID,
+            executionID: Self.executionID, action: .retry
+        )
+
+        let outcome = await center.perform(intent)
+
+        XCTAssertEqual(outcome.kind, .applied)
+        let polls = hub.requests.filter {
+            $0.method == "GET" && $0.path == "/api/v1/controls/operations/\(Self.operationID)"
+        }
+        XCTAssertEqual(polls.count, 2)
+    }
+
+    func testRecordedOpThatNeverAppliesSurfacesRecorded() async {
+        // The op stays `recorded` through every poll attempt: the outcome
+        // is `.recorded` with the operation id — never presented as applied.
+        hub.postHandler = { path in
+            if path.hasSuffix("/retry") {
+                return (202, Self.opRecordBody(op: "retry", status: "recorded"))
+            }
+            return nil
+        }
+        hub.operationPollResponses = [
+            (200, Self.opRecordBody(op: "retry", status: "recorded")),
+            (200, Self.opRecordBody(op: "retry", status: "recorded")),
+        ]
+        let center = await makeCenter(pollAttempts: 2)
+        let intent = await center.makeIntent(
+            dashboardID: dashboardID, roomID: Self.roomID,
+            executionID: Self.executionID, action: .retry
+        )
+
+        let outcome = await center.perform(intent)
+
+        XCTAssertEqual(outcome.kind, .recorded)
+        XCTAssertEqual(outcome.detail, Self.operationID)
+        let polls = hub.requests.filter {
+            $0.method == "GET" && $0.path == "/api/v1/controls/operations/\(Self.operationID)"
+        }
+        XCTAssertEqual(polls.count, 2)
+    }
+
+    func testForbiddenCodesSurfaceSeparately() async {
+        // 403 `control_capability_denied` (the bound subject's grant check
+        // failed) and `insufficient_scope` (the Bearer lacks the API scope)
+        // are different failures — never collapsed.
+        for (code, expected) in [
+            ("control_capability_denied", RoomControlOutcome.Kind.capabilityDenied),
+            ("insufficient_scope", RoomControlOutcome.Kind.insufficientScope),
+        ] {
+            hub.requests = []
+            hub.postHandler = { _ in
+                (403, Self.problemBody(status: 403, code: code))
+            }
+            let center = await makeCenter()
+            let intent = await center.makeIntent(
+                dashboardID: dashboardID, roomID: Self.roomID,
+                executionID: Self.executionID, action: .cancel
+            )
+
+            let outcome = await center.perform(intent)
+            XCTAssertEqual(outcome.kind, expected, "code: \(code)")
+            // Denied at the op POST — nothing else ran.
+            XCTAssertEqual(hub.postCount, 1)
+        }
+    }
+
+    func testPreconditionFailedTriggersResync() async {
+        hub.postHandler = { _ in
+            (409, Self.problemBody(status: 409, code: "control_precondition_failed"))
         }
         let center = await makeCenter()
         let intent = await center.makeIntent(
@@ -295,23 +389,9 @@ final class RoomCenterTests: XCTestCase {
         )
 
         let outcome = await center.perform(intent)
-        XCTAssertEqual(outcome.kind, .capabilityDenied)
-    }
-
-    func testInsufficientScopeSurfacesSeparately() async {
-        hub.postHandler = { _ in
-            (403, Self.problemBody(status: 403, code: "insufficient_scope"))
-        }
-        let center = await makeCenter()
-        let intent = await center.makeIntent(
-            dashboardID: dashboardID, roomID: Self.roomID,
-            executionID: Self.executionID, action: .cancel
-        )
-
-        let outcome = await center.perform(intent)
-        XCTAssertEqual(outcome.kind, .insufficientScope)
-        // Denied at the grant request — the action call never ran.
-        XCTAssertEqual(hub.postCount, 1)
+        XCTAssertEqual(outcome.kind, .preconditionFailed)
+        // The timeline moved underneath — the client re-reads authority.
+        XCTAssertTrue(hub.requests.contains { $0.method == "GET" })
     }
 
     func testMissingCredentialFailsClosed() async {
@@ -329,23 +409,6 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertTrue(biometricReasons.isEmpty)
     }
 
-    func testStateConflictTriggersResync() async {
-        hub.postHandler = { path in
-            if path.hasSuffix("/capability-grants") { return (201, Self.grantBody) }
-            return (409, Self.problemBody(status: 409, code: "invalid_state"))
-        }
-        let center = await makeCenter()
-        let intent = await center.makeIntent(
-            dashboardID: dashboardID, roomID: Self.roomID,
-            executionID: Self.executionID, action: .resume
-        )
-
-        let outcome = await center.perform(intent)
-        XCTAssertEqual(outcome.kind, .stateConflict)
-        // The timeline moved underneath — the client re-reads authority.
-        XCTAssertTrue(hub.requests.contains { $0.method == "GET" })
-    }
-
     // MARK: - Wake-only
 
     func testWakeResyncsAndNeverMutates() async {
@@ -358,16 +421,14 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertEqual(hub.postCount, 0)
         let wakeProjection = await center.projection(dashboardID: dashboardID, roomID: Self.roomID)
         XCTAssertEqual(wakeProjection.freshness, .live)
-    }
 
-    func testWakeWithoutCredentialDoesNotMintAuthority() async {
+        // Unconfigured dashboards fail closed — a wake is not a credential.
+        hub.requests = []
         let other = UUID()
-        let center = await makeCenter()
         await center.handleWake(
             RoomWakeTarget(roomID: Self.roomID, dashboardID: other),
             activeDashboardID: other
         )
-        // Unconfigured dashboards fail closed — a wake is not a credential.
         XCTAssertEqual(hub.postCount, 0)
         XCTAssertEqual(hub.getCount, 0)
     }
@@ -429,9 +490,9 @@ final class RoomCenterTests: XCTestCase {
          "events":[
           {"event_id":"20000000-0000-4000-8000-0000000000a9","room_id":"\#(roomID)",
            "room_seq":8,"kind":"execution.transition","producer":"hub:i3",
-           "payload":{"execution_id":"\#(executionID)","from_state":"running","to_state":"paused",
-                      "substate":null,"reason":"user requested pause",
-                      "actor":"device:hub-credential:cred-7","grant_id":"\#(grantID)"},
+           "payload":{"execution_id":"\#(executionID)","from_state":"running","to_state":"running",
+                      "substate":null,"reason":"still running",
+                      "actor":"device:hub-credential:cred-7"},
            "link":{},"correlation_id":"10000000-0000-4000-8000-0000000000d1",
            "causation_id":"paseo:evt-77","task_ref":null,"campaign_id":null,
            "idempotency_key":"hub:91","occurred_at":"2026-09-19T09:20:00.000Z",
@@ -441,19 +502,15 @@ final class RoomCenterTests: XCTestCase {
         """#.utf8)
     }
 
-    private static var grantBody: Data {
-        Data(#"""
-        {"grant_id":"\#(grantID)","execution_id":"\#(executionID)","action":"resume",
-         "principal":"device:hub-credential:cred-7","issued_at":"2026-09-19T10:00:00.000Z",
-         "expires_at":"2026-09-19T10:05:00.000Z","scope_hash":"9f2c"}
-        """#.utf8)
-    }
-
-    private static func ackBody(state: String, duplicate: Bool = false) -> Data {
-        Data(#"""
-        {"execution_id":"\#(executionID)","state":"\#(state)","substate":null,
-         "room_seq":9,"event_id":"50000000-0000-4000-8000-0000000000e0",
-         "duplicate":\#(duplicate)}
+    private static func opRecordBody(op: String, status: String, replayed: Bool = false) -> Data {
+        let replayedField = replayed ? "\"replayed\":true," : ""
+        return Data(#"""
+        {"operationId":"\#(operationID)","op":"\#(op)","status":"\#(status)",
+         \#(replayedField)"idempotencyKey":"conduit:dash-1:intent-9",
+         "executionId":"\#(executionID)","capability":"control.\#(op)",
+         "subject":"device:hub-credential:cred-7","correlationId":null,
+         "effect":null,
+         "createdAt":"2026-09-19T10:00:00.000Z","updatedAt":"2026-09-19T10:00:01.000Z"}
         """#.utf8)
     }
 

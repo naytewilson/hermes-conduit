@@ -7,16 +7,23 @@
 //  renderable state the Rooms views read, and runs the one allowed mutable
 //  flow:
 //
-//      user intent → biometric step-up → Hub-minted grant → action call
+//      user intent → biometric step-up → POST /api/v1/controls/… (op)
+//                  → recorded? poll GET /operations/{id} → applied
 //                  → authority re-read (Room resync)
 //
 //  Invariants (unchangeable):
 //  - NO mutable call happens before a fresh successful biometric step-up;
 //    a failed/cancelled step-up ends the intent with zero network I/O;
-//  - Conduit never mints grants — `grant_id` is always a server-minted
-//    reference returned by POST /executions/{id}/capability-grants;
-//  - `request_id` is minted once per INTENT (at confirmation), so a
-//    retried intent can never double-apply;
+//  - Conduit never holds or presents a capability grant — transport auth
+//    (Bearer + scope) is the only client credential; the Hub instance's
+//    bound ANVIL subject carries the durable grant server-side;
+//  - `idempotencyKey` is minted once per INTENT (at confirmation), so a
+//    retried intent can never double-apply; a replayed key surfaces as
+//    `.duplicateRejected`, never as a fresh effect;
+//  - 202 `recorded` is "authorized and queued with the execution authority",
+//    never "the agent is running again" — the center polls the op record
+//    until it turns `applied` (bounded) or surfaces `.recorded` with the
+//    operation id for the UI to keep watching;
 //  - after any accepted action the Room is re-synced from authority — the
 //    client never writes its own idea of the new state into the timeline;
 //  - APNs is wake-only: a push can trigger a resync + navigation, never a
@@ -29,45 +36,62 @@ import Foundation
 
 /// One user-confirmed control intent. `idempotencyKey` is minted once here —
 /// retries of this intent reuse it, so reconnects and manual retries cannot
-/// duplicate the semantic effect server-side.
+/// duplicate the semantic effect server-side. Execution-targeted ops need
+/// `executionID`; `acknowledge` additionally needs `attentionKind`; `start`
+/// needs `trigger` + `projectSlug` instead of an execution.
 struct RoomControlIntent: Equatable, Identifiable {
     let id: UUID
     let dashboardID: UUID
     let roomID: String
-    /// The bound execution id — required for every action per the i3
-    /// contract (`start` acts on a `queued` execution like the rest).
-    let executionID: String
+    let executionID: String?
     let action: RoomControlAction
+    let attentionKind: AttentionKind?
+    let trigger: String?
+    let projectSlug: String?
     let idempotencyKey: String
 }
 
 /// The outcome of one control intent, for banner rendering. The kinds keep
-/// the authority distinctions the contract draws: a denied/expired grant is
-/// NEVER the same failure as a bearer without scope.
+/// the authority distinctions the contract draws: a denied capability is
+/// NEVER the same failure as a Bearer scope problem, and a recorded op is
+/// NEVER presented as an applied one.
 struct RoomControlOutcome: Equatable, Identifiable {
     enum Kind: Equatable {
-        /// The Hub accepted the action; Room resync follows.
+        /// The Hub applied the op synchronously; Room resync follows.
         case applied
-        /// The intent's idempotency key matched an already-applied action —
+        /// The op was durably recorded but its effect is owned downstream
+        /// (retry/resume → 202). The operation id rides `detail` so the UI
+        /// can keep polling.
+        case recorded
+        /// The intent's idempotency key matched an already-recorded op —
         /// a retry that correctly did nothing new.
         case duplicateRejected
-        /// Grant/principal/expiry check failed server-side
-        /// (`capability_denied`) — including expired grants.
+        /// The Hub instance's bound subject lacks the durable capability
+        /// (`control_capability_denied`).
         case capabilityDenied
-        /// The bearer lacks the control scope (`insufficient_scope`).
+        /// The Bearer lacks the API scope (`insufficient_scope`).
         case insufficientScope
-        /// The action is not valid for the execution's current state (409).
-        case stateConflict
+        /// The target exists but is not actionable (409
+        /// `control_precondition_failed`).
+        case preconditionFailed
+        /// The idempotency key is bound to a different op/target (409
+        /// `idempotency_key_conflict`) — fail closed, never assume.
+        case idempotencyConflict
         /// Biometric step-up failed or was cancelled — nothing was sent.
         case biometricRejected
         /// No Hub credential is saved for this dashboard.
         case unconfigured
         /// The Hub credential was rejected (401).
         case unauthorized
-        /// The execution/room no longer exists (404).
+        /// The execution or operation no longer exists (404).
         case notFound
-        /// This Hub has no mutable control seam (503).
-        case controlUnavailable
+        /// The Hub's control plane is unconfigured (503
+        /// `control_plane_unavailable`) or its storage is down
+        /// (`infrastructure_unavailable`).
+        case controlPlaneUnavailable
+        /// The intent was malformed client-side (e.g. `start` without a
+        /// trigger) — nothing was sent.
+        case invalidIntent
         /// Transport or contract failure — the Hub may not have run the
         /// action; the next sync reconciles.
         case failed
@@ -76,10 +100,11 @@ struct RoomControlOutcome: Equatable, Identifiable {
     let intentID: UUID
     let action: RoomControlAction
     let kind: Kind
-    /// The Hub-minted grant's principal, when a grant was issued — the
-    /// identity the Room timeline will record for the action.
-    let principal: String?
-    /// Server detail: ack status or problem detail/code, verbatim.
+    /// The bound ANVIL subject that authorized the op (the op record's
+    /// `subject`) — the identity the Room timeline will record.
+    let subject: String?
+    /// Server detail: op status, problem detail/code, or operation id,
+    /// verbatim.
     let detail: String?
     let at: Date
 
@@ -138,7 +163,11 @@ final class RoomCenter: ObservableObject {
     private let authenticate: (String) async -> Bool
     private let clock: () -> Date
     private let idempotencyKeyMint: () -> String
+    private let operationPollMaxAttempts: Int
+    private let operationPollInterval: TimeInterval
 
+    /// Session caches, keyed by dashboard — the same scoping as the
+    /// credential store, so dashboard A's clients can never serve B.
     private var readClients: [UUID: RoomProjectionClient] = [:]
     private var controlClients: [UUID: RoomControlClient] = [:]
     private var coordinators: [UUID: RoomReplayCoordinator] = [:]
@@ -149,7 +178,9 @@ final class RoomCenter: ObservableObject {
         replayStore: RoomReplayStore = RoomReplayStore(),
         authenticate: @escaping (String) async -> Bool = BiometricAuth.authenticate,
         clock: @escaping () -> Date = Date.init,
-        idempotencyKeyMint: (() -> String)? = nil
+        idempotencyKeyMint: (() -> String)? = nil,
+        operationPollMaxAttempts: Int = 5,
+        operationPollInterval: TimeInterval = 1.0
     ) {
         self.credentialStore = credentialStore
         self.transport = transport
@@ -157,6 +188,8 @@ final class RoomCenter: ObservableObject {
         self.authenticate = authenticate
         self.clock = clock
         self.idempotencyKeyMint = idempotencyKeyMint ?? { UUID().uuidString }
+        self.operationPollMaxAttempts = operationPollMaxAttempts
+        self.operationPollInterval = operationPollInterval
     }
 
     // MARK: - Read surface
@@ -219,8 +252,11 @@ final class RoomCenter: ObservableObject {
     func makeIntent(
         dashboardID: UUID,
         roomID: String,
-        executionID: String,
-        action: RoomControlAction
+        executionID: String? = nil,
+        action: RoomControlAction,
+        attentionKind: AttentionKind? = nil,
+        trigger: String? = nil,
+        projectSlug: String? = nil
     ) -> RoomControlIntent {
         RoomControlIntent(
             id: UUID(),
@@ -228,13 +264,18 @@ final class RoomCenter: ObservableObject {
             roomID: roomID,
             executionID: executionID,
             action: action,
+            attentionKind: attentionKind,
+            trigger: trigger,
+            projectSlug: projectSlug,
             idempotencyKey: "conduit:\(dashboardID.uuidString.lowercased()):\(idempotencyKeyMint())"
         )
     }
 
     /// The one mutable flow. Order is the contract: biometric step-up FIRST
-    /// (a rejected step-up performs zero network I/O), then the Hub-minted
-    /// grant, then the action by grant reference, then an authority re-read.
+    /// (a rejected step-up performs zero network I/O), then the op POST
+    /// with the intent's idempotency key, then — for 202 `recorded` ops — a
+    /// bounded poll of the op record until it turns `applied`, then an
+    /// authority re-read.
     @discardableResult
     func perform(_ intent: RoomControlIntent) async -> RoomControlOutcome {
         inFlightControls.insert(intent.id)
@@ -251,25 +292,40 @@ final class RoomCenter: ObservableObject {
             }
             guard !Task.isCancelled else { throw CancellationError() }
 
-            let grant = try await client.requestGrant(
-                action: intent.action,
-                executionID: intent.executionID
-            )
-            let ack = try await client.performAction(
-                executionID: grant.executionID,
-                action: intent.action,
-                grantID: grant.grantID,
-                requestID: intent.idempotencyKey
-            )
-            outcome = Self.outcome(
-                intent,
-                kind: ack.isDuplicateReplay ? .duplicateRejected : .applied,
-                principal: grant.principal,
-                detail: ack.state,
-                at: clock()
-            )
-            // Authority re-read: the Room timeline, not the ack, is the
-            // record of what the action did.
+            let record = try await dispatch(intent, client: client)
+            if record.isReplay {
+                outcome = Self.outcome(
+                    intent,
+                    kind: .duplicateRejected,
+                    subject: record.subject,
+                    detail: record.operationId,
+                    at: clock()
+                )
+            } else if record.isRecorded {
+                // 202: authorized and queued with the execution authority.
+                // Poll the op record for the recorded→applied transition.
+                let applied = await pollToApplied(
+                    operationID: record.operationId,
+                    client: client
+                )
+                outcome = Self.outcome(
+                    intent,
+                    kind: applied ? .applied : .recorded,
+                    subject: record.subject,
+                    detail: record.operationId,
+                    at: clock()
+                )
+            } else {
+                outcome = Self.outcome(
+                    intent,
+                    kind: .applied,
+                    subject: record.subject,
+                    detail: record.operationId,
+                    at: clock()
+                )
+            }
+            // Authority re-read: the Room timeline, not the op record, is
+            // the record of what the action did.
             await syncRoom(dashboardID: intent.dashboardID, roomID: intent.roomID)
         } catch let error as RoomControlError {
             outcome = Self.outcome(
@@ -278,9 +334,9 @@ final class RoomCenter: ObservableObject {
                 detail: Self.detail(for: error),
                 at: clock()
             )
-            // A state conflict means the timeline moved under us — resync so
-            // the controls re-render against real state.
-            if case .stateConflict = error {
+            // A precondition failure means the timeline moved under us —
+            // resync so the controls re-render against real state.
+            if case .preconditionFailed = error {
                 await syncRoom(dashboardID: intent.dashboardID, roomID: intent.roomID)
             }
         } catch {
@@ -294,9 +350,21 @@ final class RoomCenter: ObservableObject {
         return record(outcome)
     }
 
+    /// Re-reads one op record — the UI's way to keep watching a `.recorded`
+    /// outcome after `perform` returned. Returns the latest record, or nil
+    /// when the read itself fails (the projection, not this call, is the
+    /// freshness surface).
+    func refreshOperation(
+        dashboardID: UUID,
+        operationID: String
+    ) async -> ControlOperationRecord? {
+        guard let client = try? controlClient(for: dashboardID) else { return nil }
+        return try? await client.getOperation(operationID: operationID)
+    }
+
     /// APNs wake-only handler: a room push can cause a resync of fresh
-    /// authority — and nothing else. It cannot mutate, cannot mint a grant,
-    /// and cannot be trusted for content beyond "this room moved".
+    /// authority — and nothing else. It cannot mutate and cannot be trusted
+    /// for content beyond "this room moved".
     func handleWake(_ target: RoomWakeTarget, activeDashboardID: UUID?) async {
         let dashboardID = target.dashboardID ?? activeDashboardID
         guard let dashboardID else { return }
@@ -317,6 +385,73 @@ final class RoomCenter: ObservableObject {
     }
 
     // MARK: - Private
+
+    /// Dispatches the intent to the frozen op surface. Malformed intents
+    /// fail here, before any network I/O.
+    private func dispatch(
+        _ intent: RoomControlIntent,
+        client: RoomControlClient
+    ) async throws -> ControlOperationRecord {
+        let key = intent.idempotencyKey
+        switch intent.action {
+        case .cancel:
+            guard let executionID = intent.executionID, !executionID.isEmpty else {
+                throw RoomControlError.undecodable(status: 0, detail: "cancel requires an executionID")
+            }
+            return try await client.cancelExecution(executionID: executionID, idempotencyKey: key)
+        case .retry:
+            guard let executionID = intent.executionID, !executionID.isEmpty else {
+                throw RoomControlError.undecodable(status: 0, detail: "retry requires an executionID")
+            }
+            return try await client.retryExecution(executionID: executionID, idempotencyKey: key)
+        case .resume:
+            guard let executionID = intent.executionID, !executionID.isEmpty else {
+                throw RoomControlError.undecodable(status: 0, detail: "resume requires an executionID")
+            }
+            return try await client.resumeExecution(executionID: executionID, idempotencyKey: key)
+        case .acknowledge:
+            guard let executionID = intent.executionID, !executionID.isEmpty,
+                  let kind = intent.attentionKind else {
+                throw RoomControlError.undecodable(status: 0, detail: "acknowledge requires an executionID and attentionKind")
+            }
+            return try await client.acknowledgeAttention(
+                executionID: executionID,
+                attentionKind: kind,
+                idempotencyKey: key
+            )
+        case .start:
+            guard let trigger = intent.trigger, !trigger.isEmpty,
+                  let projectSlug = intent.projectSlug, !projectSlug.isEmpty else {
+                throw RoomControlError.undecodable(status: 0, detail: "start requires a trigger and projectSlug")
+            }
+            return try await client.startApprovedExecution(
+                trigger: trigger,
+                projectSlug: projectSlug,
+                idempotencyKey: key
+            )
+        default:
+            throw RoomControlError.undecodable(status: 0, detail: "unknown action \(intent.action.rawValue)")
+        }
+    }
+
+    /// Bounded poll of GET /operations/{id} until the record turns `applied`.
+    /// Returns true on applied, false when attempts exhaust or the read
+    /// fails — the caller then surfaces `.recorded` with the operation id.
+    private func pollToApplied(
+        operationID: String,
+        client: RoomControlClient
+    ) async -> Bool {
+        for _ in 0..<operationPollMaxAttempts {
+            if operationPollInterval > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(operationPollInterval * 1_000_000_000))
+            }
+            guard let record = try? await client.getOperation(operationID: operationID) else {
+                return false
+            }
+            if record.status == .applied { return true }
+        }
+        return false
+    }
 
     private func scopeKey(dashboardID: UUID, roomID: String) -> String {
         RoomReplayStore.recordKey(dashboardID: dashboardID, roomID: roomID)
@@ -381,7 +516,7 @@ final class RoomCenter: ObservableObject {
     private static func outcome(
         _ intent: RoomControlIntent,
         kind: RoomControlOutcome.Kind,
-        principal: String? = nil,
+        subject: String? = nil,
         detail: String? = nil,
         at: Date
     ) -> RoomControlOutcome {
@@ -389,7 +524,7 @@ final class RoomCenter: ObservableObject {
             intentID: intent.id,
             action: intent.action,
             kind: kind,
-            principal: principal,
+            subject: subject,
             detail: detail,
             at: at
         )
@@ -399,11 +534,13 @@ final class RoomCenter: ObservableObject {
         switch error {
         case .capabilityDenied: return .capabilityDenied
         case .insufficientScope: return .insufficientScope
-        case .stateConflict: return .stateConflict
+        case .preconditionFailed: return .preconditionFailed
+        case .idempotencyConflict: return .idempotencyConflict
         case .missingCredential: return .unconfigured
         case .unauthorized: return .unauthorized
         case .notFound: return .notFound
-        case .controlUnavailable: return .controlUnavailable
+        case .controlPlaneUnavailable, .infrastructureUnavailable: return .controlPlaneUnavailable
+        case .undecodable(let status, _): return status == 0 ? .invalidIntent : .failed
         default: return .failed
         }
     }
@@ -412,11 +549,11 @@ final class RoomCenter: ObservableObject {
         switch error {
         case .capabilityDenied(let problem),
              .insufficientScope(let problem),
-             .stateConflict(let problem),
+             .preconditionFailed(let problem),
+             .idempotencyConflict(let problem),
              .unauthorized(let problem),
              .notFound(let problem),
-             .controlUnavailable(let problem),
-             .authenticationUnavailable(let problem),
+             .controlPlaneUnavailable(let problem),
              .infrastructureUnavailable(let problem):
             return problem.detail ?? problem.code
         case .problem(_, let problem):
