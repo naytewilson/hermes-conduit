@@ -237,6 +237,48 @@ final class ChatResumeCoordinator {
         store.clearResumeState()
     }
 
+    func removeSessions(profile: String, sessionIDs: [String]) {
+        store.removeSessions(profile: profile, sessionIDs: sessionIDs)
+        // Explicit deletion revokes restoration authority in memory as well
+        // as on disk: a conversation deleted while an automatic restoration
+        // targets it must never have that restoration published, completed,
+        // or resurrected. Scoped strictly to the deleted identities — pending
+        // work for any other conversation is untouched.
+        let normalizedProfile = ChatScrollIdentityNormalization.profile(profile)
+        let ids = Set(sessionIDs.compactMap(ChatScrollIdentityNormalization.sessionID))
+        guard let normalizedProfile, !ids.isEmpty else { return }
+        var invalidated = false
+        if let pendingKey = pendingSessionKey,
+           pendingKey.profile == normalizedProfile,
+           ids.contains(pendingKey.sessionID) {
+            // Staged (not yet published) automatic-return work for the
+            // deleted conversation, including its fallback-selection state.
+            pendingSessionKey = nil
+            pendingFallbackSelection = false
+            invalidated = true
+        }
+        if let restoration = pendingRestoration,
+           restoration.sessionKey.profile == normalizedProfile,
+           ids.contains(restoration.sessionKey.sessionID) {
+            // A published request: clearing it makes isCurrent(generation:)
+            // fail, so a late completion/abandon of the stale generation
+            // cannot resurrect navigation into the deleted conversation.
+            pendingRestoration = nil
+            invalidated = true
+        }
+        guard invalidated else { return }
+        // The deleted conversation can no longer own the freeze: unfreeze so
+        // viewport recording resumes for whatever is selected next.
+        viewportIsFrozen = false
+        // Abort in-flight automatic work that could still publish navigation
+        // for the deleted conversation. The epoch is deliberately coarse —
+        // deletion is rare, an aborted automatic sync re-runs against the
+        // live catalog, and per-conversation epochs would buy precision this
+        // path never needs.
+        automaticCancellationEpoch &+= 1
+        if automaticCancellationEpoch == 0 { automaticCancellationEpoch = 1 }
+    }
+
     func flush() {
         pendingFlushTask?.cancel()
         pendingFlushTask = nil

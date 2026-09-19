@@ -9,6 +9,11 @@ struct ChatMessageScrollTarget: Identifiable, Equatable {
     let message: ChatMessage
     let semanticID: String
     let restorationMetadata: ChatScrollAnchorMetadata
+    /// Transcript-order position, maintained by the cache so views can
+    /// iterate the targets collection directly (no Array(enumerated()) copy
+    /// per body evaluation) and still report stable row order to the
+    /// viewport geometry.
+    let order: Int
 
     /// SwiftUI keeps the existing source-row identity for rendering and
     /// controls. Only scroll targeting uses the source-independent ID.
@@ -21,118 +26,17 @@ enum ChatMessageScrollTargetCacheUpdate: Equatable {
     case semanticsChanged
 }
 
-enum ChatMessageScrollUpdatePolicy {
-    static func shouldReassertLatest(
-        after update: ChatMessageScrollTargetCacheUpdate,
-        followsLatest: Bool,
-        hasPendingRestoration: Bool,
-        hasNotificationHandoff: Bool
-    ) -> Bool {
-        update != .unchanged
-            && followsLatest
-            && !hasPendingRestoration
-            && !hasNotificationHandoff
-    }
-}
-
 struct ChatDragCompletionToken: Hashable {
     let dragGeneration: UInt64
     let sessionKey: ChatScrollSessionKey?
     let viewportTransitionGeneration: UInt64
 }
 
-struct ChatDragLifecycleState: Equatable {
-    private(set) var generation: UInt64 = 0
-    private var activeCompletion: ChatDragCompletionToken?
-    private var activeGestureInvalidated = false
-
-    mutating func begin(
-        sessionKey: ChatScrollSessionKey?,
-        viewportTransitionGeneration: UInt64
-    ) -> Bool {
-        guard activeCompletion == nil, !activeGestureInvalidated else { return false }
-        generation &+= 1
-        activeCompletion = ChatDragCompletionToken(
-            dragGeneration: generation,
-            sessionKey: sessionKey,
-            viewportTransitionGeneration: viewportTransitionGeneration
-        )
-        return true
-    }
-
-    mutating func invalidate(hasActiveGesture: Bool) {
-        generation &+= 1
-        if hasActiveGesture || activeCompletion != nil {
-            activeGestureInvalidated = true
-        }
-    }
-
-    mutating func abandon() {
-        generation &+= 1
-        activeCompletion = nil
-        activeGestureInvalidated = false
-    }
-
-    mutating func finish() -> ChatDragCompletionToken? {
-        defer {
-            activeCompletion = nil
-            activeGestureInvalidated = false
-        }
-        guard !activeGestureInvalidated else { return nil }
-        return activeCompletion
-    }
-
-    func currentToken(
-        sessionKey: ChatScrollSessionKey?,
-        viewportTransitionGeneration: UInt64
-    ) -> ChatDragCompletionToken {
-        ChatDragCompletionToken(
-            dragGeneration: generation,
-            sessionKey: sessionKey,
-            viewportTransitionGeneration: viewportTransitionGeneration
-        )
-    }
-}
-
-enum ChatFollowLatestRelatchPolicy {
-    static func shouldRelatch(
-        isNearBottom: Bool,
-        hasPendingRestoration: Bool,
-        hasNotificationHandoff: Bool,
-        isDragging: Bool
-    ) -> Bool {
-        isNearBottom
-            && !hasPendingRestoration
-            && !hasNotificationHandoff
-            && !isDragging
-    }
-
-    static func shouldFollowLatestAfterTransition(isDragging: Bool) -> Bool {
-        !isDragging
-    }
-
-    static func isCompletionCurrent(
-        completed: ChatDragCompletionToken,
-        current: ChatDragCompletionToken,
-        identity: ChatScrollSessionIdentity,
-        isDragging: Bool,
-        hasPendingRestoration: Bool,
-        hasNotificationHandoff: Bool
-    ) -> Bool {
-        // A new chat can acquire its first server session ID without replacing
-        // the viewport. The transition generation distinguishes that identity
-        // resolution from an actual transcript transition.
-        let sameSession = completed.sessionKey == nil
-            || completed.sessionKey == current.sessionKey
-            || identity.areEquivalent(completed.sessionKey, current.sessionKey)
-        return completed.dragGeneration == current.dragGeneration
-            && completed.viewportTransitionGeneration == current.viewportTransitionGeneration
-            && sameSession
-            && !isDragging
-            && !hasPendingRestoration
-            && !hasNotificationHandoff
-    }
-
+/// Support helpers retained from the pre-controller policies: canonical
+/// persistence-key resolution and the main-actor-turn yield used by the
+/// drag-evaluation executor. Everything else lives in
+/// ChatViewportController now.
+enum ChatViewportPersistenceSupport {
     static func persistenceSessionKey(
         currentKey: ChatScrollSessionKey?,
         identity: ChatScrollSessionIdentity
@@ -152,24 +56,6 @@ enum ChatFollowLatestRelatchPolicy {
             }
         }
     }
-
-    /// Defers completion until the next main-actor turn. A newer drag or
-    /// transcript transition invalidates the work via `isCurrent`; otherwise
-    /// persistence runs after the relatch decision.
-    @MainActor
-    static func completeDragAfterNextTurn(
-        suspend: @MainActor () async -> Void = {
-            await ChatFollowLatestRelatchPolicy.waitForNextMainActorTurn()
-        },
-        isCurrent: @MainActor () -> Bool,
-        relatch: @MainActor () -> Void,
-        persist: @MainActor () -> Void
-    ) async {
-        await suspend()
-        guard !Task.isCancelled, isCurrent() else { return }
-        relatch()
-        persist()
-    }
 }
 
 struct ChatMessageScrollTargetCache: Equatable {
@@ -179,20 +65,83 @@ struct ChatMessageScrollTargetCache: Equatable {
 
     @discardableResult
     mutating func update(for messages: [ChatMessage]) -> ChatMessageScrollTargetCacheUpdate {
-        let updatedFingerprints = ChatMessageScrollTargets.fingerprints(for: messages)
-        if updatedFingerprints == fingerprints, targets.count == messages.count {
-            guard targets.map(\.message) != messages else { return .unchanged }
-            targets = zip(messages, targets).map { message, target in
+        // Longest common prefix of equal messages: plain value compares,
+        // no hashing, no intermediate allocations.
+        var commonPrefix = 0
+        while commonPrefix < targets.count,
+              commonPrefix < messages.count,
+              targets[commonPrefix].message == messages[commonPrefix] {
+            commonPrefix += 1
+        }
+        TranscriptPerf.scrollTargetCommonPrefixComparisons += commonPrefix
+
+        // Identical transcripts: no work at all.
+        if commonPrefix == targets.count, commonPrefix == messages.count {
+            TranscriptPerf.lastFingerprintedMessageCount = 0
+            TranscriptPerf.lastFingerprintedByteCount = 0
+            return .unchanged
+        }
+
+        // Hash only the changed suffix.
+        let suffixStart = commonPrefix
+        let suffixMessages = Array(messages[suffixStart...])
+        let suffixFingerprints = ChatMessageScrollTargets.fingerprints(for: suffixMessages)
+        TranscriptPerf.lastFingerprintedMessageCount = suffixMessages.count
+        TranscriptPerf.lastFingerprintedByteCount = Self.fingerprintedBytes(of: suffixMessages)
+
+        // Same length and identical suffix fingerprints: a rendering-only
+        // replacement (equal semantics, different message objects). Swap the
+        // message values in place; semantic IDs, restoration metadata, and
+        // transcript order are untouched, so duplicate semantics cannot
+        // shift.
+        if targets.count == messages.count,
+           suffixFingerprints.elementsEqual(fingerprints[suffixStart...]) {
+            let replacement = zip(suffixMessages, targets[suffixStart...]).map { message, target in
                 ChatMessageScrollTarget(
                     message: message,
                     semanticID: target.semanticID,
-                    restorationMetadata: target.restorationMetadata
+                    restorationMetadata: target.restorationMetadata,
+                    order: target.order
                 )
             }
+            targets.replaceSubrange(suffixStart..., with: replacement)
             renderingRevision &+= 1
             return .renderingChanged
         }
 
+        // Incremental semantic rebuild of the suffix is safe only when
+        // duplicate-count semantics are provably local to the suffix: no
+        // fingerprint may cross the prefix/suffix boundary in either
+        // direction (old or new), and the suffix itself must be
+        // duplicate-free. Otherwise fall back to a full rebuild — correctness
+        // over exotic incremental cases.
+        TranscriptPerf.note(.scrollTargetPrefixSetBuild)
+        let prefixFingerprints = Set(fingerprints[..<suffixStart])
+        let oldSuffixFingerprints = fingerprints[suffixStart...]
+        let canRebuildSuffixIncrementally =
+            suffixFingerprints.allSatisfy { !prefixFingerprints.contains($0) }
+            && oldSuffixFingerprints.allSatisfy { !prefixFingerprints.contains($0) }
+            && Set(suffixFingerprints).count == suffixFingerprints.count
+
+        if canRebuildSuffixIncrementally {
+            let suffixTargets = ChatMessageScrollTargets.make(
+                for: suffixMessages,
+                fingerprints: suffixFingerprints,
+                baseOrder: suffixStart
+            )
+            fingerprints.replaceSubrange(suffixStart..., with: suffixFingerprints)
+            targets.replaceSubrange(suffixStart..., with: suffixTargets)
+            renderingRevision &+= 1
+            return .semanticsChanged
+        }
+
+        // Full rebuild fallback: mutation could affect duplicate-count
+        // semantics anywhere in the transcript.
+        let updatedFingerprints = commonPrefix == 0
+            ? suffixFingerprints
+            : ChatMessageScrollTargets.fingerprints(for: messages)
+        TranscriptPerf.lastFingerprintedMessageCount = messages.count
+        TranscriptPerf.lastFingerprintedByteCount = Self.fingerprintedBytes(of: messages)
         fingerprints = updatedFingerprints
         targets = ChatMessageScrollTargets.make(
             for: messages,
@@ -200,6 +149,10 @@ struct ChatMessageScrollTargetCache: Equatable {
         )
         renderingRevision &+= 1
         return .semanticsChanged
+    }
+
+    private static func fingerprintedBytes(of messages: [ChatMessage]) -> Int {
+        messages.reduce(0) { $0 + $1.content.utf8.count + ($1.code?.utf8.count ?? 0) }
     }
 }
 
@@ -215,18 +168,47 @@ struct ChatRenderedScrollContent: Equatable {
     let scope: ChatRenderedScrollScope
 }
 
+/// Global-space frame of one rendered stable message row, scoped to the
+/// rendered scroll scope that produced it. Only rows SwiftUI actually laid
+/// out report frames; this is how the viewport controller learns which
+/// stable row intersects the viewport without .scrollPosition. `order` is
+/// the row's position in the transcript target list, so consumers can pick
+/// the semantic first visible row from the rendered subset alone — no scan
+/// of the full transcript.
+struct ChatRenderedRowFrame: Equatable {
+    let id: String        // ChatMessageScrollTarget.id == message.id
+    let minY: CGFloat
+    let maxY: CGFloat
+    let order: Int
+    let scope: ChatRenderedScrollScope
+}
+
+/// Frame + transcript order carried per rendered row inside the
+/// preference payload dictionaries.
+struct ChatRenderedRowGeometry: Equatable {
+    let frame: CGRect
+    let order: Int
+}
+
 /// A preference payload emitted only by targets SwiftUI has instantiated.
 /// The cache deliberately cannot populate this value: lazy offscreen rows
 /// become ready only when their own geometry participates in the layout pass.
 struct ChatRenderedScrollTargets: Equatable {
     private(set) var rowsByScope: [ChatRenderedScrollScope: Set<String>] = [:]
     private(set) var bottomsByScope: [ChatRenderedScrollScope: Set<String>] = [:]
+    private(set) var framesByScope: [ChatRenderedScrollScope: [String: ChatRenderedRowGeometry]] = [:]
 
     static func row(
         semanticID: String,
-        scope: ChatRenderedScrollScope
+        scope: ChatRenderedScrollScope,
+        frame: CGRect? = nil,
+        order: Int = 0
     ) -> ChatRenderedScrollTargets {
-        ChatRenderedScrollTargets(rowsByScope: [scope: [semanticID]])
+        var targets = ChatRenderedScrollTargets(rowsByScope: [scope: [semanticID]])
+        if let frame {
+            targets.framesByScope = [scope: [semanticID: ChatRenderedRowGeometry(frame: frame, order: order)]]
+        }
+        return targets
     }
 
     static func bottom(
@@ -247,6 +229,9 @@ struct ChatRenderedScrollTargets: Equatable {
         for (scope, bottoms) in nextValue.bottomsByScope {
             value.bottomsByScope[scope, default: []].formUnion(bottoms)
         }
+        for (scope, frames) in nextValue.framesByScope {
+            value.framesByScope[scope, default: [:]].merge(frames) { _, new in new }
+        }
         // Prune: keep only scopes from the latest preference value plus
         // a small overlap window. Each message update creates a new scope
         // (different revision numbers), so without pruning the dictionaries
@@ -262,130 +247,24 @@ struct ChatRenderedScrollTargets: Equatable {
         bottomsByScope[scope]?.contains(anchorID) == true
     }
 
+    /// Global frames + transcript order of rendered stable rows for a scope
+    /// (rows that reported geometry this pass; offscreen lazy rows are absent).
+    func rowFrames(in scope: ChatRenderedScrollScope) -> [String: ChatRenderedRowGeometry] {
+        framesByScope[scope] ?? [:]
+    }
+
     /// Remove scopes that are no longer in the latest preference value.
     /// This prevents unbounded accumulation across message updates without
     /// relying on ordering — we simply keep only scopes present in the
     /// current frame.
     mutating func retainLatestScopes(from latest: ChatRenderedScrollTargets) {
-        let activeScopes = Set(latest.rowsByScope.keys).union(latest.bottomsByScope.keys)
+        let activeScopes = Set(latest.rowsByScope.keys)
+            .union(latest.bottomsByScope.keys)
+            .union(latest.framesByScope.keys)
         guard !activeScopes.isEmpty else { return }
         rowsByScope = rowsByScope.filter { activeScopes.contains($0.key) }
         bottomsByScope = bottomsByScope.filter { activeScopes.contains($0.key) }
-    }
-}
-
-enum ChatResumeRenderRestorationAction: Equatable {
-    case wait
-    case scroll(ChatResumeViewportDestination)
-    case complete
-    case abandon
-    case cancelled
-}
-
-/// A deterministic policy for the view-owned part of restoration. SwiftUI
-/// supplies actual layout observations; the policy never treats a derived
-/// message cache as proof that ScrollViewReader has installed its targets.
-struct ChatResumeRenderRestorationState {
-    let generation: UInt64
-    let sessionKey: ChatScrollSessionKey
-    private(set) var destination: ChatResumeViewportDestination
-    private let maximumChecks: Int
-    private let retryInterval: Int
-    private var checkCount = 0
-    private var lastScrollCheck: Int?
-    private var isCancelled = false
-
-    init(
-        generation: UInt64,
-        sessionKey: ChatScrollSessionKey,
-        destination: ChatResumeViewportDestination,
-        maximumChecks: Int = 80,
-        retryInterval: Int = 4
-    ) {
-        self.generation = generation
-        self.sessionKey = sessionKey
-        self.destination = destination
-        self.maximumChecks = max(maximumChecks, 1)
-        self.retryInterval = max(retryInterval, 1)
-    }
-
-    mutating func updateDestination(_ destination: ChatResumeViewportDestination) {
-        guard self.destination != destination else { return }
-        self.destination = destination
-        lastScrollCheck = nil
-    }
-
-    mutating func cancel() {
-        isCancelled = true
-    }
-
-    mutating func nextAction(
-        renderedContent: ChatRenderedScrollContent?,
-        installedTargets: ChatRenderedScrollTargets,
-        cacheRevision: UInt64,
-        transcriptRevision: UInt64,
-        topVisibleID: String?,
-        isNearBottom: Bool
-    ) -> ChatResumeRenderRestorationAction {
-        guard !isCancelled else { return .cancelled }
-        checkCount += 1
-
-        guard let renderedContent,
-              renderedContent.scope.restorationGeneration == generation,
-              renderedContent.scope.sessionKey == sessionKey,
-              renderedContent.scope.cacheRevision == cacheRevision,
-              renderedContent.scope.transcriptRevision == transcriptRevision else {
-            return checkCount > maximumChecks ? .abandon : .wait
-        }
-
-        if lastScrollCheck != nil,
-           targetIsInstalled(in: installedTargets, scope: renderedContent.scope),
-           destinationIsConfirmed(
-            topVisibleID: topVisibleID,
-            isNearBottom: isNearBottom
-        ) {
-            return .complete
-        }
-
-        guard checkCount <= maximumChecks else { return .abandon }
-
-        if lastScrollCheck.map({ checkCount - $0 >= retryInterval }) ?? true {
-            lastScrollCheck = checkCount
-            return .scroll(destination)
-        }
-
-        return .wait
-    }
-
-    private func targetIsInstalled(
-        in installedTargets: ChatRenderedScrollTargets,
-        scope: ChatRenderedScrollScope
-    ) -> Bool {
-        switch destination {
-        case .latest:
-            return installedTargets.contains(
-                bottom: bottomAnchorID(for: scope.sessionKey),
-                in: scope
-            )
-        case .anchor(let anchor):
-            return installedTargets.contains(row: anchor, in: scope)
-        }
-    }
-
-    private func bottomAnchorID(for sessionKey: ChatScrollSessionKey) -> String {
-        "chat-latest-\(sessionKey.profile)-\(sessionKey.sessionID)"
-    }
-
-    private func destinationIsConfirmed(
-        topVisibleID: String?,
-        isNearBottom: Bool
-    ) -> Bool {
-        switch destination {
-        case .latest:
-            return isNearBottom
-        case .anchor(let anchor):
-            return topVisibleID == anchor
-        }
+        framesByScope = framesByScope.filter { activeScopes.contains($0.key) }
     }
 }
 
@@ -398,15 +277,17 @@ enum ChatMessageScrollTargets {
         messages.map(fingerprint)
     }
 
-    fileprivate static func make(
+    static func make(
         for messages: [ChatMessage],
-        fingerprints: [String]
+        fingerprints: [String],
+        baseOrder: Int = 0
     ) -> [ChatMessageScrollTarget] {
         let duplicateCounts = fingerprints.reduce(into: [String: Int]()) { counts, fingerprint in
             counts[fingerprint, default: 0] += 1
         }
         var occurrences: [String: Int] = [:]
-        return zip(messages, fingerprints).map { message, fingerprint in
+        return zip(messages, fingerprints).enumerated().map { offset, pair in
+            let (message, fingerprint) = pair
             let occurrence = occurrences[fingerprint, default: 0]
             occurrences[fingerprint] = occurrence + 1
             return ChatMessageScrollTarget(
@@ -415,7 +296,8 @@ enum ChatMessageScrollTargets {
                 restorationMetadata: ChatScrollAnchorMetadata(
                     fingerprint: fingerprint,
                     duplicateCount: duplicateCounts[fingerprint, default: 0]
-                )
+                ),
+                order: baseOrder + offset
             )
         }
     }
@@ -429,11 +311,18 @@ enum ChatMessageScrollTargets {
 
         fingerprint.append(message.tool?.name)
 
-        fingerprint.append(message.clarify?.question)
-        fingerprint.append(message.clarify?.choices.count)
-        message.clarify?.choices.forEach { choice in
-            fingerprint.append(choice.label)
-            fingerprint.append(choice.value)
+        // Row identity only: statuses and answers mutate while the user works
+        // through a batch and must not re-anchor the scroll position.
+        fingerprint.append(message.clarify?.requestId)
+        fingerprint.append(message.clarify?.questions.count)
+        message.clarify?.questions.forEach { question in
+            fingerprint.append(question.id)
+            fingerprint.append(question.question)
+            fingerprint.append(question.choices.count)
+            question.choices.forEach { choice in
+                fingerprint.append(choice.label)
+                fingerprint.append(choice.value)
+            }
         }
 
         fingerprint.append(message.approval?.command)
@@ -460,7 +349,10 @@ enum ChatMessageScrollTargets {
     }
 }
 
-private enum ChatScrollIdentityNormalization {
+/// Canonical identity normalization shared by every session-keyed store:
+/// profiles trim and case-fold, session ids trim. Internal so the resume
+/// store, identity index, and AppState speak the same normalized language.
+enum ChatScrollIdentityNormalization {
     static func profile(_ profile: String?) -> String? {
         guard let value = profile?.trimmingCharacters(in: .whitespacesAndNewlines),
               !value.isEmpty else { return nil }
@@ -641,6 +533,7 @@ enum ChatScrollSessionIdentityResolver {
         catalog: [ChatScrollSessionCatalogIdentity],
         requestedSessionID: String? = nil,
         resolvedSessionID: String? = nil,
+        resolvedDurableSessionID: String? = nil,
         previousIdentity current: ChatScrollSessionIdentity,
         isReconciling: Bool,
         advanceSettledRevision: Bool = false
@@ -686,6 +579,12 @@ enum ChatScrollSessionIdentityResolver {
         let canonicalSessionID: String?
         if let matchedSession {
             canonicalSessionID = matchedSession.canonicalSessionID
+        } else if let resolvedDurable = ChatScrollIdentityNormalization.sessionID(resolvedDurableSessionID) {
+            // An admitted resume explicitly established the conversation's
+            // durable identity (a runtime-only conversation whose stored key
+            // was revealed). The catalog had no row to resolve through, so
+            // the positive claim wins over the raw runtime ids.
+            canonicalSessionID = resolvedDurable
         } else if continuesPreviousIdentity {
             canonicalSessionID = previous.canonicalSessionID
         } else if !reconciliationIDs.isEmpty {
@@ -699,6 +598,9 @@ enum ChatScrollSessionIdentityResolver {
         var equivalentSessionIDs = candidates
         if let matchedSession {
             equivalentSessionIDs.formUnion(matchedSession.identifiers)
+        }
+        if let resolvedDurable = ChatScrollIdentityNormalization.sessionID(resolvedDurableSessionID) {
+            equivalentSessionIDs.insert(resolvedDurable)
         }
         if continuesPreviousIdentity {
             equivalentSessionIDs.formUnion(previous.equivalentSessionIDs)

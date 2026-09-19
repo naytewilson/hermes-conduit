@@ -10,6 +10,7 @@
 import SwiftUI
 
 struct GatewayDiagnosticsSheet: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
 
     var body: some View {
@@ -47,10 +48,10 @@ struct GatewayDiagnosticsSheet: View {
     private var summary: some View {
         let diagnostics = appState.gatewayDiagnostics
         let running = diagnostics?.gatewayRunning ?? appState.isConnected
-        return ConduitSettingsSection(title: running ? "Connected" : "Disconnected", symbol: "radio", tint: running ? .green : .red) {
-            SettingsMetricRow(label: "Gateway", value: diagnostics?.gatewayState ?? (running ? "Online" : "Unavailable"))
-            if let version = diagnostics?.version { SettingsMetricRow(label: "Version", value: version) }
-            if let pid = diagnostics?.pid { SettingsMetricRow(label: "Process", value: "PID \(pid)") }
+        return ConduitSettingsSection(title: running ? AppLocalization.string("Connected") : AppLocalization.string("Disconnected"), symbol: "radio", tint: running ? .green : .red) {
+            SettingsMetricRow(label: AppLocalization.string("Gateway"), value: diagnostics?.gatewayState ?? (running ? AppLocalization.string("Online") : AppLocalization.string("Unavailable")))
+            if let version = diagnostics?.version { SettingsMetricRow(label: AppLocalization.string("Version"), value: version) }
+            if let pid = diagnostics?.pid { SettingsMetricRow(label: AppLocalization.string("Process"), value: AppLocalization.string("PID \(String(pid))")) }
             if let error = diagnostics?.error {
                 Text(error).font(.footnote).foregroundStyle(.red)
             }
@@ -68,7 +69,7 @@ struct GatewayDiagnosticsSheet: View {
 
     private var connectors: some View {
         let configuredConnectors = (appState.gatewayDiagnostics?.connectors ?? []).filter { $0.configured != false }
-        return ConduitSettingsSection(title: "Connectors", symbol: "point.3.connected.trianglepath.dotted", tint: .conduitAura) {
+        return ConduitSettingsSection(title: AppLocalization.string("Connectors"), symbol: "point.3.connected.trianglepath.dotted", tint: .conduitAura) {
             if configuredConnectors.isEmpty {
                 Text("No configured connectors were reported.").font(.footnote).foregroundStyle(.secondary)
             } else {
@@ -88,7 +89,7 @@ struct GatewayDiagnosticsSheet: View {
     }
 
     private var logs: some View {
-        ConduitSettingsSection(title: "Recent gateway logs", symbol: "text.alignleft", tint: .conduitAccent) {
+        ConduitSettingsSection(title: AppLocalization.string("Recent gateway logs"), symbol: "text.alignleft", tint: .conduitAccent) {
             let lines = appState.gatewayDiagnostics?.logs ?? []
             if lines.isEmpty {
                 Text("No gateway log lines were returned.").font(.footnote).foregroundStyle(.secondary)
@@ -113,6 +114,7 @@ struct GatewayDiagnosticsSheet: View {
 }
 
 struct WorkspaceBrowserSheet: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
     @State private var previewOpen = false
 
@@ -176,7 +178,7 @@ struct WorkspaceBrowserSheet: View {
 
     private var workspaceTitle: String {
         let name = URL(fileURLWithPath: appState.workspaceRoot).lastPathComponent
-        return name.isEmpty ? "Workspace" : name
+        return name.isEmpty ? AppLocalization.string("Workspace") : name
     }
 
     private func flatten(_ entries: [WorkspaceEntry], depth: Int) -> [(entry: WorkspaceEntry, depth: Int)] {
@@ -191,6 +193,7 @@ struct WorkspaceBrowserSheet: View {
 }
 
 private struct WorkspaceFilePreviewSheet: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
     @State private var downloadURL: URL?
 
@@ -209,7 +212,7 @@ private struct WorkspaceFilePreviewSheet: View {
                             if preview.binary {
                                 ContentUnavailableView("Binary file", systemImage: "doc.fill", description: Text("Use Save to Files to download this file."))
                             } else {
-                                Text(preview.text.isEmpty ? "This file is empty." : preview.text)
+                                Text(preview.text.isEmpty ? AppLocalization.string("This file is empty.") : preview.text)
                                     .font(.caption.monospaced())
                                     .textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -228,7 +231,7 @@ private struct WorkspaceFilePreviewSheet: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     if let downloadURL {
-                        ShareLink(item: downloadURL, preview: SharePreview(appState.workspaceSelectedFile?.name ?? "Workspace file")) {
+                        ShareLink(item: downloadURL, preview: SharePreview(appState.workspaceSelectedFile?.name ?? AppLocalization.string("Workspace file"))) {
                             Label("Save to Files", systemImage: "square.and.arrow.up")
                         }
                     } else {
@@ -241,9 +244,9 @@ private struct WorkspaceFilePreviewSheet: View {
     }
 
     private func fileMetadata(_ preview: WorkspaceFilePreview) -> some View {
-        ConduitSettingsSection(title: "File", symbol: "doc", tint: .conduitAccent) {
-            SettingsMetricRow(label: "Type", value: preview.language)
-            SettingsMetricRow(label: "Size", value: ByteCountFormatter.string(fromByteCount: Int64(preview.byteSize), countStyle: .file))
+        ConduitSettingsSection(title: AppLocalization.string("File"), symbol: "doc", tint: .conduitAccent) {
+            SettingsMetricRow(label: AppLocalization.string("Type"), value: preview.language)
+            SettingsMetricRow(label: AppLocalization.string("Size"), value: ByteCountFormatter.string(fromByteCount: Int64(preview.byteSize), countStyle: .file))
             if preview.truncated { Text("Preview is truncated; save the file for its full contents.").font(.footnote).foregroundStyle(.secondary) }
         }
     }
@@ -255,6 +258,7 @@ private struct WorkspaceFilePreviewSheet: View {
 }
 
 struct DelegateAgentsSheet: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
 
     var body: some View {
@@ -263,7 +267,7 @@ struct DelegateAgentsSheet: View {
                 ConduitBackdrop()
                 ScrollView {
                     VStack(spacing: 12) {
-                        ConduitSettingsSection(title: "Delegate agents", symbol: "person.2", tint: .conduitAccent) {
+                        ConduitSettingsSection(title: AppLocalization.string("Delegate agents"), symbol: "person.2", tint: .conduitAccent) {
                             Text(activeSummary).font(.footnote).foregroundStyle(.secondary)
                         }
                         if appState.delegateAgents.isEmpty {
@@ -286,11 +290,12 @@ struct DelegateAgentsSheet: View {
 
     private var activeSummary: String {
         let active = appState.delegateAgents.filter(\.status.isActive).count
-        return active == 0 ? "Latest delegation activity" : "\(active) working now"
+        return active == 0 ? AppLocalization.string("Latest delegation activity") : AppLocalization.string("\(String(active)) working now")
     }
 }
 
 private struct DelegateAgentCard: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let agent: DelegateAgentActivity
     @State private var expanded = true
 
@@ -311,7 +316,7 @@ private struct DelegateAgentCard: View {
             .tint(.primary)
             if expanded {
                 if agent.stream.isEmpty {
-                    Text(agent.summary ?? (agent.status.isActive ? "Waiting for activity…" : "No stream output returned."))
+                    Text(agent.summary ?? (agent.status.isActive ? AppLocalization.string("Waiting for activity…") : AppLocalization.string("No stream output returned.")))
                         .font(.footnote).foregroundStyle(.secondary)
                 } else {
                     ForEach(agent.stream.suffix(10)) { line in

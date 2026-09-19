@@ -19,4 +19,13 @@ final class VoiceAudioSessionConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.outputSampleRate, 16_000)
         XCTAssertEqual(configuration.outputChannelCount, 1)
     }
+
+    func testStandalonePlaybackUsesOutputOnlyMediaCoexistencePolicy() {
+        let configuration = VoiceAudioSessionConfiguration.standalonePlayback
+
+        XCTAssertEqual(configuration.category.rawValue, AVAudioSession.Category.playback.rawValue)
+        XCTAssertFalse(configuration.options.contains(.allowBluetoothHFP))
+        XCTAssertTrue(configuration.options.contains(.mixWithOthers))
+        XCTAssertTrue(configuration.options.contains(.duckOthers))
+    }
 }

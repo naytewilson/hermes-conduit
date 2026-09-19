@@ -33,13 +33,39 @@ struct MarkdownText: View {
     /// snapshot that would be dead the moment the next delta arrives.
     var isStreaming: Bool = false
 
+    /// The selected chat text size (issue #85): a first-class rendering
+    /// input, injected at the chat root. Streaming and settled content read
+    /// the same value, so the whole stream stays at one size. The
+    /// `.default` environment default keeps non-chat subtrees untouched.
+    @Environment(\.chatTextSize) private var chatTextSize
+
     var body: some View {
+        // Path fork is centralized here: ordinary messages keep the exact
+        // fast cached path below; pathological ones (see
+        // MarkdownLargeDocumentPolicy) get the bounded presentation so no
+        // stage of parse/format/layout scales with the whole source.
+        if MarkdownLargeDocumentPolicy.isLargeDocument(source) {
+            LargeMarkdownDocumentView(
+                source: source,
+                foregroundStyle: foregroundStyle,
+                usesAccentSurface: usesAccentSurface,
+                gatewayMediaDataURL: gatewayMediaDataURL
+            )
+        } else {
+            normalBody
+        }
+    }
+
+    @ViewBuilder
+    private var normalBody: some View {
+        let _ = isStreaming ? () : TranscriptPerf.note(.settledMarkdownBody, context: source)
         let rendering = MarkdownRenderCache.rendering(
             source: source,
             recognizesGatewayMedia: gatewayMediaDataURL != nil,
             foregroundStyle: foregroundStyle,
             usesAccentSurface: usesAccentSurface,
-            isStreaming: isStreaming
+            isStreaming: isStreaming,
+            chatTextSize: chatTextSize
         )
         let selectionSegments = rendering.selectableText == nil
             ? MarkdownSelectionSegmentPlan.descriptors(for: rendering.blocks)
@@ -53,12 +79,32 @@ struct MarkdownText: View {
                         to: baseText,
                         baseColor: usesAccentSurface ? .white : UIColor(foregroundStyle)
                     ),
-                    font: .preferredFont(forTextStyle: .body),
+                    font: ChatTypography.font(for: .body, chatSize: chatTextSize),
                     textColor: usesAccentSurface ? .white : UIColor(foregroundStyle),
                     lineSpacing: 4,
                     linkColor: usesAccentSurface ? .white : .link
                 )
                 .frame(maxWidth: .infinity, alignment: .leading)
+            } else if rendering.needsRichBounding {
+                // Byte-ordinary but structurally pathological rich content:
+                // identical block rendering behind a bounded mount budget
+                // (see MarkdownRichContent.swift). Plain flow messages can
+                // never reach here — they take the selectableText branch —
+                // and ordinary rich messages stay under the budget. The
+                // decision and the per-block unit vector come from the
+                // cached rendering, so re-evaluations never re-walk the
+                // blocks.
+                RichBudgetedMarkdownBody(
+                    blocks: rendering.blocks,
+                    source: source,
+                    richUnitsByBlock: rendering.richUnitsByBlock,
+                    foregroundStyle: foregroundStyle,
+                    usesAccentSurface: usesAccentSurface,
+                    gatewayMediaDataURL: gatewayMediaDataURL,
+                    selectionCoordinator: selectionCoordinator,
+                    selectionSegments: selectionSegments,
+                    newestCharacterOpacities: newestCharacterOpacities
+                )
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(Array(rendering.blocks.enumerated()), id: \.offset) { index, block in
@@ -85,6 +131,11 @@ struct MarkdownText: View {
                 .modifier(MarkdownSelectionHost(coordinator: selectionCoordinator))
             }
         }
+        // Reference definitions ride the environment so every InlineMarkdown
+        // below — however deeply nested in tables, quotes, or callouts — sees
+        // the same message-level context without threading it through each
+        // container view. Scoped to this MarkdownText subtree only.
+        .environment(\.markdownReferences, rendering.references)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
@@ -168,13 +219,33 @@ private final class MarkdownSelectionHighlightView: UIView {
 
 /// One render's parsed blocks plus the prebuilt selectable string (nil when
 /// the blocks need the full block-view path). A class so NSCache can hold it.
-private final class MarkdownRendering {
+///
+/// Structural rich-content metadata (the per-block rich-unit vector) is
+/// computed ONCE here, with the parse, and cached with the rendering — the
+/// exact pathological Markdown this bounding exists for used to re-walk
+/// every table's cells on each SwiftUI body re-evaluation just to
+/// rediscover the same budget (see MarkdownRichContentPolicy).
+final class MarkdownRendering {
     let blocks: [MarkdownBlock]
+    /// The message's link reference definitions; block views need them to
+    /// resolve reference-style links when re-parsing each fragment.
+    let references: MarkdownReferenceContext
     let selectableText: NSAttributedString?
+    /// Per-block rich-layout units (MarkdownRichContentPolicy.richUnits),
+    /// aligned with blocks by index.
+    let richUnitsByBlock: [Int]
 
-    init(blocks: [MarkdownBlock], selectableText: NSAttributedString?) {
+    /// Whether this message's aggregate rich complexity exceeds the
+    /// progressive-mount budget.
+    var needsRichBounding: Bool {
+        MarkdownRichContentPolicy.needsBounding(unitsByBlock: richUnitsByBlock)
+    }
+
+    init(blocks: [MarkdownBlock], references: MarkdownReferenceContext, selectableText: NSAttributedString?) {
         self.blocks = blocks
+        self.references = references
         self.selectableText = selectableText
+        self.richUnitsByBlock = MarkdownRichContentPolicy.richUnitsByBlock(blocks)
     }
 }
 
@@ -185,7 +256,7 @@ private final class MarkdownRendering {
 /// style so settled messages render from cache and only genuinely new content
 /// pays for parsing. Streaming-tail fades stay per-frame but are applied to a
 /// copy of the cached base rather than triggering a rebuild.
-private enum MarkdownRenderCache {
+enum MarkdownRenderCache {
     private static let cache: NSCache<NSString, MarkdownRendering> = {
         let cache = NSCache<NSString, MarkdownRendering>()
         cache.countLimit = 256
@@ -199,7 +270,8 @@ private enum MarkdownRenderCache {
         recognizesGatewayMedia: Bool,
         foregroundStyle: Color,
         usesAccentSurface: Bool,
-        isStreaming: Bool
+        isStreaming: Bool,
+        chatTextSize: ChatTextSize
     ) -> MarkdownRendering {
         // `foregroundStyle` is deliberately absent from the key: only two
         // values are ever passed (.primary / .white), each uniquely tied to
@@ -213,26 +285,33 @@ private enum MarkdownRenderCache {
             "MarkdownRenderCache keys on usesAccentSurface, not foregroundStyle; a new style needs an explicit key token."
         )
 
-        // Fonts resolve against the current Dynamic Type size, so a size change
-        // must miss the cache rather than serve stale metrics. Reading
-        // preferredContentSizeCategory touches UIApplication.shared, hence the
-        // @MainActor isolation on this function.
+        // Fonts resolve against the current Dynamic Type size AND the
+        // selected chat text size (issue #85), so either change must miss the
+        // cache rather than serve stale metrics. The chat-size identity is
+        // the persisted enum position, so re-tuning the scale factors later
+        // needs no cache migration. Reading preferredContentSizeCategory
+        // touches UIApplication.shared, hence the @MainActor isolation on
+        // this function.
         let key = [
             recognizesGatewayMedia ? "1" : "0",
             usesAccentSurface ? "1" : "0",
             UIApplication.shared.preferredContentSizeCategory.rawValue,
+            chatTextSize.cacheIdentity,
             source
         ].joined(separator: "|") as NSString
 
         if let cached = cache.object(forKey: key) { return cached }
-        let blocks = MarkdownParser.parse(source, recognizesGatewayMedia: recognizesGatewayMedia)
+        let document = MarkdownParser.parseDocument(source, recognizesGatewayMedia: recognizesGatewayMedia)
         let rendering = MarkdownRendering(
-            blocks: blocks,
+            blocks: document.blocks,
+            references: document.references,
             selectableText: MarkdownSelectionFormatter.attributedText(
-                for: blocks,
+                for: document.blocks,
+                references: document.references,
                 foregroundStyle: foregroundStyle,
                 usesAccentSurface: usesAccentSurface,
-                newestCharacterOpacities: []
+                newestCharacterOpacities: [],
+                chatTextSize: chatTextSize
             )
         )
         // While streaming, `source` changes every frame, so a cached entry is
@@ -251,7 +330,37 @@ private enum MarkdownRenderCache {
     }
 }
 
-enum MarkdownBlock {
+/// The message-wide link reference definitions (`[id]: url`) collected while
+/// parsing a chat message. Each block fragment is re-parsed together with
+/// these definitions so Foundation's Markdown parser — not this app — resolves
+/// reference-style links, labels, and titles.
+struct MarkdownReferenceContext: Equatable {
+    /// The original definition lines, newline-joined. Retained verbatim so
+    /// Foundation interprets destination/title semantics (case-insensitive
+    /// labels, collapsed/shortcut forms, escapes) instead of this app doing it.
+    let definitionsMarkdown: String
+
+    static let empty = MarkdownReferenceContext(definitionsMarkdown: "")
+
+    var containsDefinitions: Bool { !definitionsMarkdown.isEmpty }
+
+    /// Fragment + definitions parse as one document: the definition block is
+    /// block-level syntax that produces nothing visible, so fragments without
+    /// references render exactly as they would alone.
+    func markdownForParsing(_ fragment: String) -> String {
+        guard containsDefinitions else { return fragment }
+        return fragment + "\n\n" + definitionsMarkdown
+    }
+}
+
+/// A parsed chat message: its visible blocks plus the reference definitions
+/// that were removed from the visible body before block parsing.
+struct MarkdownParsedDocument {
+    let blocks: [MarkdownBlock]
+    let references: MarkdownReferenceContext
+}
+
+enum MarkdownBlock: Equatable {
     case heading(level: Int, text: String)
     case paragraph(String)
     case quote([MarkdownQuoteLine])
@@ -266,7 +375,7 @@ enum MarkdownBlock {
     case divider
 }
 
-struct MarkdownQuoteLine {
+struct MarkdownQuoteLine: Equatable {
     let depth: Int
     let text: String
 }
@@ -274,13 +383,18 @@ struct MarkdownQuoteLine {
 enum MarkdownSelectionFormatter {
     static func attributedText(
         for blocks: [MarkdownBlock],
+        references: MarkdownReferenceContext = .empty,
         foregroundStyle: Color,
         usesAccentSurface: Bool,
-        newestCharacterOpacities: [Double]
+        newestCharacterOpacities: [Double],
+        chatTextSize: ChatTextSize = .default
     ) -> NSAttributedString? {
         guard !blocks.isEmpty, blocks.allSatisfy(\.isSelectableFlowBlock) else { return nil }
 
-        let bodyFont = UIFont.preferredFont(forTextStyle: .body)
+        // All fonts resolve through ChatTypography (issue #85): the selected
+        // chat size scales ON TOP of the current Dynamic Type size, and
+        // `.default` reproduces the historical fonts exactly.
+        let bodyFont = ChatTypography.font(for: .body, chatSize: chatTextSize)
         let textColor = usesAccentSurface ? UIColor.white : UIColor(foregroundStyle)
         let linkColor = usesAccentSurface ? UIColor.white : UIColor.link
         let result = NSMutableAttributedString()
@@ -288,11 +402,13 @@ enum MarkdownSelectionFormatter {
         for (index, block) in blocks.enumerated() {
             guard let segment = segment(
                 for: block,
+                references: references,
                 bodyFont: bodyFont,
                 textColor: textColor,
                 linkColor: linkColor,
                 usesAccentSurface: usesAccentSurface,
-                foregroundStyle: foregroundStyle
+                foregroundStyle: foregroundStyle,
+                chatTextSize: chatTextSize
             ) else {
                 return nil
             }
@@ -315,42 +431,49 @@ enum MarkdownSelectionFormatter {
 
     private static func segment(
         for block: MarkdownBlock,
+        references: MarkdownReferenceContext,
         bodyFont: UIFont,
         textColor: UIColor,
         linkColor: UIColor,
         usesAccentSurface: Bool,
-        foregroundStyle: Color
+        foregroundStyle: Color,
+        chatTextSize: ChatTextSize
     ) -> NSAttributedString? {
         switch block {
         case .heading(let level, let text):
             return inline(
                 text,
-                font: headingFont(level),
+                references: references,
+                font: headingFont(level, chatTextSize: chatTextSize),
                 textColor: textColor,
                 linkColor: linkColor
             )
 
         case .paragraph(let text):
-            return inline(text, font: bodyFont, textColor: textColor, linkColor: linkColor)
+            return inline(text, references: references, font: bodyFont, textColor: textColor, linkColor: linkColor)
 
         case .unorderedList(let items):
             return list(
                 items,
                 ordered: false,
+                references: references,
                 bodyFont: bodyFont,
                 textColor: textColor,
                 linkColor: linkColor,
-                markerColor: usesAccentSurface ? .white : UIColor(Color.conduitAccent)
+                markerColor: usesAccentSurface ? .white : UIColor(Color.conduitAccent),
+                chatTextSize: chatTextSize
             )
 
         case .orderedList(let items):
             return list(
                 items,
                 ordered: true,
+                references: references,
                 bodyFont: bodyFont,
                 textColor: textColor,
                 linkColor: linkColor,
-                markerColor: usesAccentSurface ? .white : UIColor(Color.conduitAccent)
+                markerColor: usesAccentSurface ? .white : UIColor(Color.conduitAccent),
+                chatTextSize: chatTextSize
             )
 
         case .quote(let lines):
@@ -358,7 +481,7 @@ enum MarkdownSelectionFormatter {
             let quoteColor = usesAccentSurface
                 ? UIColor.white.withAlphaComponent(0.90)
                 : UIColor(foregroundStyle).withAlphaComponent(0.90)
-            let quoteFont = bodyFont.withTraits(.traitItalic)
+            let quoteFont = ChatTypography.font(for: .quote, chatSize: chatTextSize)
 
             for (index, line) in lines.enumerated() {
                 if index > 0 {
@@ -372,7 +495,7 @@ enum MarkdownSelectionFormatter {
                         .foregroundColor: quoteColor
                     ]
                 ))
-                result.append(inline(line.text, font: quoteFont, textColor: quoteColor, linkColor: linkColor))
+                result.append(inline(line.text, references: references, font: quoteFont, textColor: quoteColor, linkColor: linkColor))
             }
             return result
 
@@ -384,10 +507,12 @@ enum MarkdownSelectionFormatter {
     private static func list(
         _ items: [String],
         ordered: Bool,
+        references: MarkdownReferenceContext,
         bodyFont: UIFont,
         textColor: UIColor,
         linkColor: UIColor,
-        markerColor: UIColor
+        markerColor: UIColor,
+        chatTextSize: ChatTextSize
     ) -> NSAttributedString {
         let result = NSMutableAttributedString()
         let markerFont = bodyFont.withTraits(.traitBold)
@@ -413,6 +538,7 @@ enum MarkdownSelectionFormatter {
             ))
             result.append(inline(
                 task?.text ?? item,
+                references: references,
                 font: bodyFont,
                 textColor: textColor,
                 linkColor: linkColor
@@ -423,19 +549,20 @@ enum MarkdownSelectionFormatter {
 
     private static func inline(
         _ source: String,
+        references: MarkdownReferenceContext,
         font: UIFont,
         textColor: UIColor,
         linkColor: UIColor
     ) -> NSAttributedString {
         let attributed = (try? AttributedString(
-            markdown: source,
+            markdown: references.markdownForParsing(source),
             options: .init(interpretedSyntax: .full)
         )) ?? AttributedString(source)
         return SelectableTextView.bridge(attributed, defaultFont: font, defaultColor: textColor, linkColor: linkColor)
     }
 
-    private static func headingFont(_ level: Int) -> UIFont {
-        MarkdownHeading.font(for: level)
+    private static func headingFont(_ level: Int, chatTextSize: ChatTextSize) -> UIFont {
+        MarkdownHeading.font(for: level, chatTextSize: chatTextSize)
     }
 
     /// Applies the streaming-tail fade to a copy, leaving the shared cached
@@ -470,7 +597,7 @@ enum MarkdownSelectionFormatter {
     }
 }
 
-private extension MarkdownBlock {
+extension MarkdownBlock {
     var isSelectableFlowBlock: Bool {
         switch self {
         case .heading, .paragraph, .quote, .unorderedList, .orderedList:
@@ -484,11 +611,13 @@ private extension MarkdownBlock {
 enum MarkdownTableAlignment {
     case leading, center, trailing
 
-    var swiftUI: Alignment {
+    /// Carried into the cell text's paragraph style so alignment governs
+    /// every wrapped line, not just the position of a full-width wrapper.
+    var nsText: NSTextAlignment {
         switch self {
-        case .leading: .leading
+        case .leading: .natural
         case .center: .center
-        case .trailing: .trailing
+        case .trailing: .right
         }
     }
 }
@@ -496,17 +625,20 @@ enum MarkdownTableAlignment {
 /// Shared heading font logic used by both MarkdownSelectionFormatter
 /// and MarkdownBlockView to prevent divergence.
 enum MarkdownHeading {
+    /// Heading font at the selected chat text size. The style mapping and
+    /// bold trait live in ChatTypography so the SwiftUI block renderer and
+    /// the attributed-string formatter can never diverge.
+    static func font(for level: Int, chatTextSize: ChatTextSize) -> UIFont {
+        ChatTypography.font(for: .heading(level: level), chatSize: chatTextSize)
+    }
+
+    /// Historical entry point: today's typography at the default chat size.
     static func font(for level: Int) -> UIFont {
-        switch level {
-        case 1: UIFont.preferredFont(forTextStyle: .title2).withTraits(.traitBold)
-        case 2: UIFont.preferredFont(forTextStyle: .title3).withTraits(.traitBold)
-        case 3: UIFont.preferredFont(forTextStyle: .headline).withTraits(.traitBold)
-        default: UIFont.preferredFont(forTextStyle: .subheadline).withTraits(.traitBold)
-        }
+        font(for: level, chatTextSize: .default)
     }
 }
 
-private struct MarkdownBlockView: View {
+struct MarkdownBlockView: View {
     let block: MarkdownBlock
     let blockIndex: Int
     let foregroundStyle: Color
@@ -515,6 +647,7 @@ private struct MarkdownBlockView: View {
     let selectionCoordinator: MarkdownSelectionCoordinator?
     let selectionSegments: [MarkdownSelectionSegmentDescriptor]
     let newestCharacterOpacities: [Double]
+    @Environment(\.chatTextSize) private var chatTextSize
 
     var body: some View {
         switch block {
@@ -574,22 +707,51 @@ private struct MarkdownBlockView: View {
             )
 
         case .table(let headers, let alignments, let rows):
-            MarkdownTable(
-                headers: headers,
-                alignments: alignments,
-                rows: rows,
-                foregroundStyle: foregroundStyle,
-                usesAccentSurface: usesAccentSurface,
-                selectionCoordinator: selectionCoordinator,
-                blockIndex: blockIndex,
-                selectionSegments: selectionSegments
-            )
+            // Structural complexity — not whole-message bytes — decides the
+            // presentation: a 45-row table in a 40 KB message mounts the
+            // same thousand TextKit cell views as one in a 400 KB message.
+            // Both paths share MarkdownTableRowView, so appearance and
+            // selection behavior match either way.
+            if MarkdownRichContentPolicy.isComplexTable(headers: headers, rows: rows) {
+                LargeMarkdownTable(
+                    headers: headers,
+                    alignments: alignments,
+                    rows: rows,
+                    foregroundStyle: foregroundStyle,
+                    usesAccentSurface: usesAccentSurface,
+                    selectionCoordinator: selectionCoordinator,
+                    blockIndex: blockIndex,
+                    selectionSegments: selectionSegments
+                )
+            } else {
+                MarkdownTable(
+                    headers: headers,
+                    alignments: alignments,
+                    rows: rows,
+                    foregroundStyle: foregroundStyle,
+                    usesAccentSurface: usesAccentSurface,
+                    selectionCoordinator: selectionCoordinator,
+                    blockIndex: blockIndex,
+                    selectionSegments: selectionSegments
+                )
+            }
 
         case .image(let url, let alt):
             RemoteMarkdownImage(url: url, alt: alt, gatewayMediaDataURL: gatewayMediaDataURL)
 
         case .math(let source):
-            MathBlock(source: source)
+            // The #88 oversized-math guard applies to the block itself,
+            // wherever it renders — never only inside large-document mode.
+            if MarkdownBlockView.mathNeedsGuard(source) {
+                GuardedSourceCard(
+                    title: "LaTeX",
+                    icon: "function",
+                    source: source,
+                    guardBytes: MarkdownLargeDocumentPolicy.mathGuardBytes
+                )
+            } else {
+                MathBlock(source: source)
+            }
 
         case .callout(let kind, let text):
             MarkdownCallout(
@@ -613,9 +775,26 @@ private struct MarkdownBlockView: View {
             )
 
         case .code(let language, let source):
-            if MarkdownLanguage.normalized(language) == "mermaid" {
+            switch MarkdownBlockView.codePresentation(language: language, source: source) {
+            case .guardedMermaid:
+                // The #88 Mermaid guard, applied per block: a diagram past
+                // the guard size renders as a copyable bounded card no
+                // matter how small the enclosing message is.
+                GuardedSourceCard(
+                    title: "Mermaid",
+                    icon: "point.3.connected.trianglepath.dotted",
+                    source: source,
+                    guardBytes: MarkdownLargeDocumentPolicy.mermaidGuardBytes
+                )
+            case .mermaid:
                 MermaidBlock(source: source)
-            } else {
+            case .slicedCode:
+                LargeCodeBlockView(
+                    source: source,
+                    language: language,
+                    usesAccentSurface: usesAccentSurface
+                )
+            case .code:
                 ChatCodeBlock(
                     source: source,
                     language: language,
@@ -634,7 +813,7 @@ private struct MarkdownBlockView: View {
     }
 
     private func headingFont(_ level: Int) -> UIFont {
-        MarkdownHeading.font(for: level)
+        MarkdownHeading.font(for: level, chatTextSize: chatTextSize)
     }
 
     private var blockDescriptor: MarkdownSelectionSegmentDescriptor? {
@@ -652,22 +831,76 @@ private struct MarkdownBlockView: View {
     private func selectionSegment(id: String) -> MarkdownSelectionSegmentDescriptor? {
         selectionSegments.first { $0.id == id }
     }
+
+    // MARK: Block-local routing (pure, unit-testable)
+
+    /// The bounded presentations a code fence can take. The guards are
+    /// properties of the BLOCK — they apply identically in the ordinary
+    /// path and in large-document mode, which is what makes Mermaid and
+    /// oversized-code safety independent of the whole-message threshold.
+    enum CodePresentation: Equatable {
+        /// Mermaid source beyond the #88 guard: bounded copyable card,
+        /// render action dropped.
+        case guardedMermaid
+        /// Ordinary Mermaid diagram: render-card + on-demand preview.
+        case mermaid
+        /// Code at/above the #88 large-code threshold: bounded preview,
+        /// then line/byte slices with off-main highlighting.
+        case slicedCode
+        /// Ordinary code block.
+        case code
+    }
+
+    static func codePresentation(language: String, source: String) -> CodePresentation {
+        let normalized = MarkdownLanguage.normalized(language)
+        if normalized == "mermaid" {
+            return source.utf8.count > MarkdownLargeDocumentPolicy.mermaidGuardBytes
+                ? .guardedMermaid
+                : .mermaid
+        }
+        return MarkdownLargeDocumentPolicy.isLargeCodeBlock(source) ? .slicedCode : .code
+    }
+
+    /// Oversized math sources drop the render action (#88 guard), applied
+    /// per block rather than per document.
+    static func mathNeedsGuard(_ source: String) -> Bool {
+        source.utf8.count > MarkdownLargeDocumentPolicy.mathGuardBytes
+    }
 }
 
-private struct InlineMarkdown: View {
-    let source: String
-    let foregroundStyle: Color
-    let usesAccentSurface: Bool
-    var font: UIFont = .preferredFont(forTextStyle: .body)
-    var lineSpacing: CGFloat = 0
-    var maximumNumberOfLines: Int = 0
-    var selectionCoordinator: MarkdownSelectionCoordinator?
-    var selectionSegment: MarkdownSelectionSegmentDescriptor?
-    var trailingCharacterOpacities: [Double] = []
+/// Message-scoped link reference definitions for the block-view hierarchy.
+/// `MarkdownText` injects its parsed context; every `InlineMarkdown` in the
+/// subtree reads it. The default keeps `InlineMarkdown` renderable in
+/// isolation (no references), which matches pre-reference behavior.
+struct MarkdownReferencesKey: EnvironmentKey {
+    static let defaultValue = MarkdownReferenceContext.empty
+}
 
-    private var attributed: AttributedString {
+extension EnvironmentValues {
+    var markdownReferences: MarkdownReferenceContext {
+        get { self[MarkdownReferencesKey.self] }
+        set { self[MarkdownReferencesKey.self] = newValue }
+    }
+}
+
+/// The single inline-attributed-string construction shared by
+/// `InlineMarkdown` rendering and `MarkdownTableLayout` width measurement,
+/// so a table column is always measured at exactly the content its cells
+/// render — reference-style links resolve to their labels in both paths,
+/// and any future inline-syntax change updates measurement with it.
+enum InlineMarkdownContent {
+    static func attributed(
+        source: String,
+        references: MarkdownReferenceContext,
+        foregroundStyle: Color = .primary,
+        trailingCharacterOpacities: [Double] = []
+    ) -> AttributedString {
+        // Re-append the message's definitions so Foundation resolves
+        // reference-style links for this fragment too. The definition block
+        // is invisible under `.full`; if parsing fails, fall back to the bare
+        // fragment so definitions never surface as text.
         var attributed = (try? AttributedString(
-            markdown: source,
+            markdown: references.markdownForParsing(source),
             options: .init(interpretedSyntax: .full)
         )) ?? AttributedString(source)
 
@@ -680,15 +913,48 @@ private struct InlineMarkdown: View {
         }
         return attributed
     }
+}
+
+private struct InlineMarkdown: View {
+    let source: String
+    let foregroundStyle: Color
+    let usesAccentSurface: Bool
+    /// Explicit role font (headings, table cells); nil resolves the body
+    /// role through ChatTypography at the selected chat text size.
+    var font: UIFont?
+    var lineSpacing: CGFloat = 0
+    var maximumNumberOfLines: Int = 0
+    var textAlignment: NSTextAlignment = .natural
+    var selfSizingWidthRange: ClosedRange<CGFloat>? = nil
+    var selectionCoordinator: MarkdownSelectionCoordinator?
+    var selectionSegment: MarkdownSelectionSegmentDescriptor?
+    var trailingCharacterOpacities: [Double] = []
+    @Environment(\.markdownReferences) private var references
+    @Environment(\.chatTextSize) private var chatTextSize
+
+    private var effectiveFont: UIFont {
+        font ?? ChatTypography.font(for: .body, chatSize: chatTextSize)
+    }
+
+    private var attributed: AttributedString {
+        InlineMarkdownContent.attributed(
+            source: source,
+            references: references,
+            foregroundStyle: foregroundStyle,
+            trailingCharacterOpacities: trailingCharacterOpacities
+        )
+    }
 
     var body: some View {
         SelectableTextView(
             attributedText: attributed,
-            font: font,
+            font: effectiveFont,
             textColor: usesAccentSurface ? .white : UIColor(foregroundStyle),
             lineSpacing: lineSpacing,
             maximumNumberOfLines: maximumNumberOfLines,
             linkColor: usesAccentSurface ? .white : .link,
+            textAlignment: textAlignment,
+            selfSizingWidthRange: selfSizingWidthRange,
             selectionCoordinator: selectionCoordinator,
             selectionSegment: selectionSegment
         )
@@ -704,6 +970,21 @@ private struct MarkdownList: View {
     let selectionCoordinator: MarkdownSelectionCoordinator?
     let selectionSegments: [MarkdownSelectionSegmentDescriptor]
     var trailingCharacterOpacities: [Double] = []
+    @Environment(\.chatTextSize) private var chatTextSize
+    @Environment(\.sizeCategory) private var sizeCategory
+
+    /// Marker glyphs resolve Dynamic Type through the environment category
+    /// (rather than a size frozen at body-evaluation time), so a system
+    /// text-size change re-resolves them wherever the list re-evaluates.
+    private var markerFont: UIFont {
+        ChatTypography.font(
+            for: .body,
+            chatSize: chatTextSize,
+            compatibleWith: UITraitCollection(
+                preferredContentSizeCategory: UIContentSizeCategory(sizeCategory)
+            )
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -712,15 +993,16 @@ private struct MarkdownList: View {
                 HStack(alignment: .firstTextBaseline, spacing: 9) {
                     if let task {
                         Image(systemName: task.complete ? "checkmark.square.fill" : "square")
+                            .font(.system(size: markerFont.pointSize))
                             .foregroundStyle(task.complete
                                              ? (usesAccentSurface ? Color.white : Color.conduitAccent)
                                              : (usesAccentSurface ? Color.white.opacity(0.82) : Color.secondary))
-                            .frame(width: 16, alignment: .trailing)
+                            .frame(width: ChatTypography.dimension(16, chatSize: chatTextSize), alignment: .trailing)
                     } else {
                         Text(ordered ? "\(index + 1)." : "•")
-                            .font(.body.weight(.semibold))
+                            .font(.system(size: markerFont.pointSize, weight: .semibold))
                             .foregroundStyle(usesAccentSurface ? Color.white.opacity(0.92) : Color.conduitAccent)
-                            .frame(width: ordered ? 24 : 12, alignment: .trailing)
+                            .frame(width: ChatTypography.dimension(ordered ? 24 : 12, chatSize: chatTextSize), alignment: .trailing)
                     }
                     InlineMarkdown(
                         source: task?.text ?? item,
@@ -746,6 +1028,7 @@ private struct MarkdownQuote: View {
     let selectionCoordinator: MarkdownSelectionCoordinator?
     let selectionSegments: [MarkdownSelectionSegmentDescriptor]
     var trailingCharacterOpacities: [Double] = []
+    @Environment(\.chatTextSize) private var chatTextSize
 
     private var callout: (kind: String, text: String)? {
         guard let first = lines.first, let marker = MarkdownParser.calloutMarker(first.text) else { return nil }
@@ -779,7 +1062,7 @@ private struct MarkdownQuote: View {
                             source: line.text,
                             foregroundStyle: foregroundStyle.opacity(0.90),
                             usesAccentSurface: usesAccentSurface,
-                            font: UIFont.preferredFont(forTextStyle: .body).withTraits(.traitItalic),
+                            font: ChatTypography.font(for: .quote, chatSize: chatTextSize),
                             lineSpacing: 3,
                             selectionCoordinator: selectionCoordinator,
                             selectionSegment: selectionSegments.indices.contains(index) ? selectionSegments[index] : nil,
@@ -883,7 +1166,169 @@ private struct MarkdownColumns: View {
     }
 }
 
-private struct MarkdownTable: View {
+/// Table-wide column layout: one width per column shared by the header and
+/// every row, so vertical dividers align across rows. Each column's width
+/// is the largest ideal (unwrapped) text width among its cells — header
+/// included — capped at `maxColumnContentWidth`. When the capped columns
+/// fit the chat width the table fits too (narrow columns stay narrow, wide
+/// ones keep their earned space); when they overflow, columns above the
+/// shrink floor give up width proportionally to their excess and wrap, and
+/// a table that still overflows at the floor keeps horizontal scrolling.
+enum MarkdownTableLayout {
+    /// Widest a column's text may be before it wraps.
+    static let maxColumnContentWidth: CGFloat = 220
+    /// Narrowest a column shrinks to when the table must compress; columns
+    /// whose ideal is already below this keep their ideal width.
+    static let shrinkFloorContentWidth: CGFloat = 64
+    static let cellHorizontalPadding: CGFloat = 10
+    static let dividerWidth: CGFloat = 1
+    static let borderAllowance: CGFloat = 2
+
+    private static let cache: NSCache<NSString, NSArray> = {
+        let cache = NSCache<NSString, NSArray>()
+        cache.countLimit = 64
+        cache.totalCostLimit = 4 * 1024 * 1024
+        return cache
+    }()
+
+    @MainActor
+    static func columnWidths(
+        headers: [String],
+        rows: [[String]],
+        availableWidth: CGFloat,
+        references: MarkdownReferenceContext = .empty,
+        chatTextSize: ChatTextSize = .default
+    ) -> [CGFloat] {
+        let columnCount = max(headers.count, rows.map(\.count).max() ?? 0)
+        guard columnCount > 0 else { return [] }
+
+        // Fonts resolve against the current Dynamic Type size AND the
+        // selected chat text size (issue #85), so the widths key on the
+        // content category just like MarkdownRenderCache, on the chat-size
+        // identity, on the viewport width that feeds the fit-or-shrink
+        // decision, and on the reference definitions (they change how cell
+        // source measures). A chat-size change must never serve stale
+        // measurements from the previous size.
+        let key = (
+            [
+                UIApplication.shared.preferredContentSizeCategory.rawValue,
+                chatTextSize.cacheIdentity,
+                String(format: "%.1f", availableWidth),
+                references.definitionsMarkdown
+            ]
+                + headers
+                + rows.flatMap { $0.isEmpty ? ["<empty-row>"] : $0 }
+        ).joined(separator: "\u{1F}") as NSString
+
+        if let cached = cache.object(forKey: key) as? [CGFloat] { return cached }
+
+        let headerFont = ChatTypography.font(for: .tableHeader, chatSize: chatTextSize)
+        let bodyFont = ChatTypography.font(for: .tableBody, chatSize: chatTextSize)
+
+        var ideals = [CGFloat](repeating: 0, count: columnCount)
+        for (index, header) in headers.enumerated() {
+            ideals[index] = max(ideals[index], idealWidth(of: header, font: headerFont, references: references))
+        }
+        for row in rows {
+            for (index, cell) in row.enumerated() where index < columnCount {
+                ideals[index] = max(ideals[index], idealWidth(of: cell, font: bodyFont, references: references))
+            }
+        }
+
+        let widths = resolveColumnContentWidths(ideals: ideals, availableWidth: availableWidth)
+        cache.setObject(widths as NSArray, forKey: key, cost: key.length)
+        return widths
+    }
+
+    /// Pure distribution step so the policy is directly unit-testable.
+    /// A non-positive available width means the viewport is not yet known
+    /// (first layout pass): fall back to the cap-and-scroll layout, which is
+    /// deterministic and re-resolves once the real width arrives.
+    static func resolveColumnContentWidths(ideals: [CGFloat], availableWidth: CGFloat) -> [CGFloat] {
+        guard !ideals.isEmpty else { return [] }
+        let capped = ideals.map { min($0, maxColumnContentWidth) }
+        guard availableWidth > 0 else { return halfPointRounded(capped) }
+
+        // Cell padding, dividers, and the table border consume viewport width
+        // exactly once, before any column sees it.
+        let overhead = CGFloat(capped.count) * cellHorizontalPadding * 2
+            + CGFloat(capped.count - 1) * dividerWidth
+            + borderAllowance
+        let available = max(0, availableWidth - overhead)
+
+        let total = capped.reduce(0, +)
+        if total <= available { return halfPointRounded(capped) }
+
+        let shrinkable = capped.reduce(0) { $0 + max($1 - shrinkFloorContentWidth, 0) }
+        let deficit = total - available
+        if deficit >= shrinkable {
+            // Everything compressible is at the floor; columns that were
+            // already narrower keep their ideal. The table scrolls.
+            return halfPointRounded(capped.map { $0 > shrinkFloorContentWidth ? shrinkFloorContentWidth : $0 })
+        }
+        // Shrink proportionally to the excess above the floor: wide columns
+        // contribute more, narrow ones may not shrink at all.
+        let factor = deficit / shrinkable
+        return halfPointRounded(capped.map { $0 - max($0 - shrinkFloorContentWidth, 0) * factor })
+    }
+
+    private static func halfPointRounded(_ widths: [CGFloat]) -> [CGFloat] {
+        widths.map { ($0 * 2).rounded() / 2 }
+    }
+
+    /// Measures the ideal (single-fragment) width of a cell from the exact
+    /// attributed content InlineMarkdown renders (`InlineMarkdownContent`
+    /// bridged with the cell font), so the shared column widths and the
+    /// rendered wrapping agree — including message-level reference links,
+    /// which measure as their resolved labels.
+    private static func idealWidth(of source: String, font: UIFont, references: MarkdownReferenceContext) -> CGFloat {
+        let bridged = NSMutableAttributedString(
+            attributedString: SelectableTextView.bridge(
+                InlineMarkdownContent.attributed(source: source, references: references),
+                defaultFont: font,
+                defaultColor: .label,
+                linkColor: .link
+            )
+        )
+        let fullRange = NSRange(location: 0, length: bridged.length)
+        if fullRange.length > 0 {
+            bridged.addAttribute(
+                .paragraphStyle,
+                value: NSMutableParagraphStyle(),
+                range: fullRange
+            )
+        }
+        let measured = bridged.boundingRect(
+            with: CGSize(width: 100_000, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            context: nil
+        )
+        return ceil(measured.width)
+    }
+}
+
+/// The zero-height width probe shared by BOTH table presentations: the
+/// chat's proposed width for the block, read once per layout width change.
+/// Extracted so the ordinary MarkdownTable and the paged
+/// LargeMarkdownTable resolve columns from the SAME container-width
+/// knowledge — crossing the structural complexity threshold must not
+/// change whether a previously fitting table fits.
+private struct MarkdownTableWidthProbe: View {
+    @Binding var width: CGFloat
+
+    var body: some View {
+        GeometryReader { proxy in
+            Color.clear
+                .onAppear { width = proxy.size.width }
+                .onChange(of: proxy.size.width) { _, newWidth in width = newWidth }
+        }
+        .frame(height: 0)
+    }
+}
+
+/// The ordinary (non-paged) table presentation. Internal (not private) so
+/// the chat-size wiring into column measurement is directly testable.
+struct MarkdownTable: View {
     let headers: [String]
     let alignments: [MarkdownTableAlignment]
     let rows: [[String]]
@@ -893,48 +1338,60 @@ private struct MarkdownTable: View {
     let blockIndex: Int
     let selectionSegments: [MarkdownSelectionSegmentDescriptor]
 
+    /// The chat's proposed width for this block, read by a zero-height
+    /// probe above the scroll view. Zero means "unknown yet" (first pass);
+    /// the layout then falls back to cap-and-scroll and re-resolves a frame
+    /// later, once the width is known.
+    @State private var availableWidth: CGFloat = 0
+    @Environment(\.markdownReferences) private var references
+    @Environment(\.chatTextSize) private var chatTextSize
+
+    private var columnWidths: [CGFloat] {
+        MarkdownTableLayout.columnWidths(
+            headers: headers,
+            rows: rows,
+            availableWidth: availableWidth,
+            references: references,
+            chatTextSize: chatTextSize
+        )
+    }
+
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 0) {
-                tableRow(headers, rowIndex: 0, isHeader: true)
-                ForEach(Array(rows.enumerated()), id: \.offset) { rowOffset, row in
-                    Divider().overlay(usesAccentSurface ? Color.white.opacity(0.22) : Color.secondary.opacity(0.18))
-                    tableRow(row, rowIndex: rowOffset + 1, isHeader: false)
+        VStack(spacing: 0) {
+            MarkdownTableWidthProbe(width: $availableWidth)
+
+            let widths = columnWidths
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    tableRow(headers, rowIndex: 0, isHeader: true, widths: widths)
+                    ForEach(Array(rows.enumerated()), id: \.offset) { rowOffset, row in
+                        Divider().overlay(usesAccentSurface ? Color.white.opacity(0.22) : Color.secondary.opacity(0.18))
+                        tableRow(row, rowIndex: rowOffset + 1, isHeader: false, widths: widths)
+                    }
                 }
-            }
-            .background(
-                usesAccentSurface ? Color.black.opacity(0.13) : Color.primary.opacity(0.035),
-                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-            )
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(usesAccentSurface ? Color.white.opacity(0.26) : Color.secondary.opacity(0.20), lineWidth: 1)
+                .background(
+                    usesAccentSurface ? Color.black.opacity(0.13) : Color.primary.opacity(0.035),
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(usesAccentSurface ? Color.white.opacity(0.26) : Color.secondary.opacity(0.20), lineWidth: 1)
+                }
             }
         }
     }
 
-    private func tableRow(_ cells: [String], rowIndex: Int, isHeader: Bool) -> some View {
-        HStack(spacing: 0) {
-            ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
-                InlineMarkdown(
-                    source: cell,
-                    foregroundStyle: foregroundStyle,
-                    usesAccentSurface: usesAccentSurface,
-                    font: isHeader
-                        ? UIFont.preferredFont(forTextStyle: .caption1).withTraits(.traitBold)
-                        : UIFont.preferredFont(forTextStyle: .footnote),
-                    maximumNumberOfLines: 4,
-                    selectionCoordinator: selectionCoordinator,
-                    selectionSegment: selectionSegment(row: rowIndex, column: index)
-                )
-                    .frame(minWidth: 112, maxWidth: 220, alignment: alignment(at: index).swiftUI)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 9)
-                if index < cells.count - 1 {
-                    Divider().overlay(usesAccentSurface ? Color.white.opacity(0.22) : Color.secondary.opacity(0.18))
-                }
-            }
-        }
+    private func tableRow(_ cells: [String], rowIndex: Int, isHeader: Bool, widths: [CGFloat]) -> some View {
+        MarkdownTableRowView(
+            cells: cells,
+            isHeader: isHeader,
+            widths: widths,
+            alignments: alignments,
+            foregroundStyle: foregroundStyle,
+            usesAccentSurface: usesAccentSurface,
+            selectionCoordinator: selectionCoordinator,
+            segmentFor: { selectionSegment(row: rowIndex, column: $0) }
+        )
     }
 
     private func alignment(at index: Int) -> MarkdownTableAlignment {
@@ -947,7 +1404,249 @@ private struct MarkdownTable: View {
     }
 }
 
+/// The table row rendering shared by `MarkdownTable` and the paged
+/// `LargeMarkdownTable` so dividers, fonts, alignment, selection, and the
+/// deterministic single-width sizing behave identically in both paths.
+struct MarkdownTableRowView: View {
+    let cells: [String]
+    let isHeader: Bool
+    let widths: [CGFloat]
+    let alignments: [MarkdownTableAlignment]
+    let foregroundStyle: Color
+    let usesAccentSurface: Bool
+    let selectionCoordinator: MarkdownSelectionCoordinator?
+    let segmentFor: (Int) -> MarkdownSelectionSegmentDescriptor?
+    @Environment(\.chatTextSize) private var chatTextSize
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
+                let width = widths.indices.contains(index)
+                    ? widths[index]
+                    : MarkdownTableLayout.shrinkFloorContentWidth
+                InlineMarkdown(
+                    source: cell,
+                    foregroundStyle: foregroundStyle,
+                    usesAccentSurface: usesAccentSurface,
+                    font: ChatTypography.font(
+                        for: isHeader ? .tableHeader : .tableBody,
+                        chatSize: chatTextSize
+                    ),
+                    textAlignment: alignments.indices.contains(index) ? alignments[index].nsText : .natural,
+                    // The exact shared column width — a single-value range keeps
+                    // the cell's measured/committed height deterministic from the
+                    // first layout pass, and .frame(width:) below pins the
+                    // displayed width so every row's dividers align.
+                    selfSizingWidthRange: width...width,
+                    selectionCoordinator: selectionCoordinator,
+                    selectionSegment: segmentFor(index)
+                )
+                    .frame(width: width)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 9)
+                if index < cells.count - 1 {
+                    Divider().overlay(usesAccentSurface ? Color.white.opacity(0.22) : Color.secondary.opacity(0.18))
+                }
+            }
+        }
+    }
+}
+
+/// Paged presentation for very large tables: column widths are computed
+/// once from a bounded sample of leading rows (measuring every cell of a
+/// 1 MB table would itself be unbounded work), and rows mount in explicit
+/// batches — never all at once. Cell selection ids keep the ordinary
+/// `block-N-table-rX-cY` shape, so coordinator selection behaves like any
+/// other table.
+struct LargeMarkdownTable: View {
+    let headers: [String]
+    let alignments: [MarkdownTableAlignment]
+    let rows: [[String]]
+    let foregroundStyle: Color
+    let usesAccentSurface: Bool
+    let selectionCoordinator: MarkdownSelectionCoordinator?
+    let blockIndex: Int
+    let selectionSegments: [MarkdownSelectionSegmentDescriptor]
+
+    @State private var renderedRowCount: Int
+    /// The chat's proposed width for this block, read by the SAME zero-height
+    /// probe the ordinary MarkdownTable uses. Crossing the structural
+    /// complexity threshold (rows/cells/bytes) must not change whether a
+    /// previously fitting table fits: with the real container width the
+    /// shared layout engine's fit-or-shrink behavior applies identically in
+    /// both presentations. Zero means "unknown yet" (first pass); the
+    /// cap-and-scroll fallback re-resolves a frame later.
+    @State private var availableWidth: CGFloat = 0
+    @Environment(\.markdownReferences) private var references
+    @Environment(\.chatTextSize) private var chatTextSize
+
+    init(
+        headers: [String],
+        alignments: [MarkdownTableAlignment],
+        rows: [[String]],
+        foregroundStyle: Color,
+        usesAccentSurface: Bool,
+        selectionCoordinator: MarkdownSelectionCoordinator?,
+        blockIndex: Int,
+        selectionSegments: [MarkdownSelectionSegmentDescriptor]
+    ) {
+        self.headers = headers
+        self.alignments = alignments
+        self.rows = rows
+        self.foregroundStyle = foregroundStyle
+        self.usesAccentSurface = usesAccentSurface
+        self.selectionCoordinator = selectionCoordinator
+        self.blockIndex = blockIndex
+        self.selectionSegments = selectionSegments
+        // A table qualifies as large because of total estimated bytes — a
+        // few rows with enormous cells also qualify, so the mounted count
+        // must clamp to the actual row count from the start.
+        _renderedRowCount = State(initialValue: min(LargeMarkdownTable.initialRowBatch, rows.count))
+    }
+
+    /// Rows whose cells feed the shared width measurement. Widths computed
+    /// from a bounded prefix can differ from whole-table widths for wildly
+    /// varying columns — a documented pathological-only tradeoff that keeps
+    /// the expensive measurement bounded.
+    static let widthSampleRows = 100
+    static let initialRowBatch = 25
+    static let rowBatch = 100
+
+    private var columnWidths: [CGFloat] {
+        let ceiling = MarkdownLargeDocumentPolicy.tableCellBytes
+        return MarkdownTableLayout.columnWidths(
+            headers: headers.map { MarkdownLargeDocumentPolicy.boundedDisplayText($0, maxBytes: ceiling) },
+            rows: Array(rows.prefix(Self.widthSampleRows)).map {
+                $0.map { MarkdownLargeDocumentPolicy.boundedDisplayText($0, maxBytes: ceiling) }
+            },
+            availableWidth: availableWidth,
+            references: references,
+            chatTextSize: chatTextSize
+        )
+    }
+
+    /// Cell display text under the pathological-cell ceiling; keeps both
+    /// width measurement and text layout bounded per cell.
+    private func boundedCell(_ text: String) -> String {
+        MarkdownLargeDocumentPolicy.boundedDisplayText(text, maxBytes: MarkdownLargeDocumentPolicy.tableCellBytes)
+    }
+
+    private func segmentDescriptor(row: Int, column: Int) -> MarkdownSelectionSegmentDescriptor? {
+        let id = "block-\(blockIndex)-table-r\(row)-c\(column)"
+        return selectionSegments.first { $0.id == id }
+    }
+
+    var body: some View {
+        // One width computation per body evaluation — every mounted row and
+        // the header share the same resolved (bounded) widths.
+        let widths = columnWidths
+        return VStack(spacing: 0) {
+            MarkdownTableWidthProbe(width: $availableWidth)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    MarkdownTableRowView(
+                        cells: headers.map(boundedCell),
+                        isHeader: true,
+                        widths: widths,
+                        alignments: alignments,
+                        foregroundStyle: foregroundStyle,
+                        usesAccentSurface: usesAccentSurface,
+                        selectionCoordinator: selectionCoordinator,
+                        segmentFor: { segmentDescriptor(row: 0, column: $0) }
+                    )
+                    ForEach(0..<renderedRowCount, id: \.self) { rowOffset in
+                        Divider().overlay(usesAccentSurface ? Color.white.opacity(0.22) : Color.secondary.opacity(0.18))
+                        MarkdownTableRowView(
+                            cells: rows[rowOffset].map(boundedCell),
+                            isHeader: false,
+                            widths: widths,
+                            alignments: alignments,
+                            foregroundStyle: foregroundStyle,
+                            usesAccentSurface: usesAccentSurface,
+                            selectionCoordinator: selectionCoordinator,
+                            segmentFor: { segmentDescriptor(row: rowOffset + 1, column: $0) }
+                        )
+                    }
+                }
+                .background(
+                    usesAccentSurface ? Color.black.opacity(0.13) : Color.primary.opacity(0.035),
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(usesAccentSurface ? Color.white.opacity(0.26) : Color.secondary.opacity(0.20), lineWidth: 1)
+                }
+            }
+            if renderedRowCount < rows.count {
+                Button {
+                    renderedRowCount = min(renderedRowCount + Self.rowBatch, rows.count)
+                } label: {
+                    Label("Show \(min(Self.rowBatch, rows.count - renderedRowCount)) more rows (\(rows.count - renderedRowCount) of \(rows.count) left)", systemImage: "chevron.down")
+                        .font(.caption.weight(.semibold))
+                }
+                .tint(usesAccentSurface ? .white : .conduitAccent)
+                .padding(.vertical, 8)
+            }
+        }
+    }
+}
+
+/// Fallback card for oversized math/Mermaid sources: the dedicated
+/// renderers are not chunkable, so past the guard size the presentation is
+/// a bounded source preview plus Copy (the render action is dropped).
+struct GuardedSourceCard: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    let title: String
+    let icon: String
+    let source: String
+    let guardBytes: Int
+
+    @State private var copied = false
+    @Environment(\.chatTextSize) private var chatTextSize
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(title, systemImage: icon)
+                    .font(.caption2.monospaced().weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("Too large to render")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            SelectableTextView(
+                text: String(source.prefix(2_000)),
+                font: ChatTypography.font(for: .sourceCode, chatSize: chatTextSize),
+                textColor: .label,
+                maximumNumberOfLines: 5
+            )
+            Button {
+                UIPasteboard.general.string = source
+                Haptics.light()
+                copied = true
+                Task {
+                    try? await Task.sleep(for: .seconds(1.4))
+                    guard !Task.isCancelled else { return }
+                    copied = false
+                }
+            } label: {
+                Label(copied ? AppLocalization.string("Copied") : AppLocalization.string("Copy full source"), systemImage: copied ? "checkmark" : "doc.on.doc")
+                    .font(.caption.weight(.semibold))
+            }
+            .tint(.conduitAccent)
+        }
+        .padding(12)
+        .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 13, style: .continuous).strokeBorder(Color.secondary.opacity(0.20), lineWidth: 1)
+        }
+    }
+}
+
 private struct RemoteMarkdownImage: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let url: String
     let alt: String
     let gatewayMediaDataURL: ((String) async -> String?)?
@@ -971,7 +1670,7 @@ private struct RemoteMarkdownImage: View {
             case .failure:
                 WebFallbackImage(url: url, alt: alt)
             default:
-                HStack(spacing: 8) { ProgressView(); Text(alt.isEmpty ? "Loading image…" : alt).font(.footnote).foregroundStyle(.secondary) }
+                HStack(spacing: 8) { ProgressView(); Text(alt.isEmpty ? AppLocalization.string("Loading image…") : alt).font(.footnote).foregroundStyle(.secondary) }
                     .padding(12)
             }
                 }
@@ -1003,7 +1702,7 @@ private struct RemoteMarkdownImage: View {
                 .frame(maxHeight: 360)
                 .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
         } else if gatewayLoadFailed {
-            Label(alt.isEmpty ? "Image unavailable" : "\(alt) unavailable", systemImage: "photo.badge.exclamationmark")
+            Label(alt.isEmpty ? AppLocalization.string("Image unavailable") : AppLocalization.string("\(alt) unavailable"), systemImage: "photo.badge.exclamationmark")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .padding(12)
@@ -1016,7 +1715,7 @@ private struct RemoteMarkdownImage: View {
     private var loadingLabel: some View {
         HStack(spacing: 8) {
             ProgressView()
-            Text(alt.isEmpty ? "Loading image..." : alt)
+            Text(alt.isEmpty ? AppLocalization.string("Loading image...") : alt)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -1182,9 +1881,9 @@ enum WebFallbackImageDestination {
 enum WebFallbackImageLabel {
     static func title(alt: String, destinationAvailable: Bool) -> String {
         if destinationAvailable {
-            return alt.isEmpty ? "Open image" : "\(alt) — image unavailable; open source"
+            return alt.isEmpty ? AppLocalization.string("Open image") : AppLocalization.string("\(alt) — image unavailable; open source")
         }
-        return alt.isEmpty ? "Image unavailable" : "\(alt) unavailable"
+        return alt.isEmpty ? AppLocalization.string("Image unavailable") : AppLocalization.string("\(alt) unavailable")
     }
 }
 
@@ -1301,12 +2000,20 @@ private enum RemoteImageHTML {
 }
 
 struct ChatCodeBlock: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let source: String
     var language: String = ""
     var usesAccentSurface = false
     var selectionCoordinator: MarkdownSelectionCoordinator?
     var selectionSegment: MarkdownSelectionSegmentDescriptor?
     @State private var copied = false
+    @Environment(\.chatTextSize) private var chatTextSize
+
+    /// Code content scales with the chat text size (issue #85); the
+    /// language label and Copy button above stay interface chrome.
+    private var codeFont: UIFont {
+        ChatTypography.font(for: .blockCode, chatSize: chatTextSize)
+    }
 
     private var normalizedLanguage: String { MarkdownLanguage.normalized(language) }
 
@@ -1323,7 +2030,7 @@ struct ChatCodeBlock: View {
                     copied = true
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { copied = false }
                 } label: {
-                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc").font(.caption2.weight(.semibold))
+                    Label(copied ? AppLocalization.string("Copied") : AppLocalization.string("Copy"), systemImage: copied ? "checkmark" : "doc.on.doc").font(.caption2.weight(.semibold))
                 }
                 .tint(usesAccentSurface ? .white : .conduitAccent)
             }
@@ -1335,7 +2042,7 @@ struct ChatCodeBlock: View {
                     if usesAccentSurface {
                         SelectableTextView(
                             text: source,
-                            font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .footnote).pointSize, weight: .regular),
+                            font: codeFont,
                             textColor: UIColor.white.withAlphaComponent(0.96),
                             lineSpacing: 3,
                             wrapsLines: false,
@@ -1345,7 +2052,7 @@ struct ChatCodeBlock: View {
                     } else {
                         SelectableTextView(
                             attributedText: SyntaxHighlighter.highlight(source, language: normalizedLanguage),
-                            font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .footnote).pointSize, weight: .regular),
+                            font: codeFont,
                             textColor: .label,
                             lineSpacing: 3,
                             wrapsLines: false,
@@ -1369,12 +2076,13 @@ struct ChatCodeBlock: View {
 }
 
 private struct MermaidBlock: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let source: String
     @Environment(\.colorScheme) private var colorScheme
     @State private var preview: MarkupPreview?
 
     var body: some View {
-        RenderCard(title: "Mermaid", icon: "point.3.connected.trianglepath.dotted", source: source, actionTitle: "Render diagram", actionIcon: "play.fill") {
+        RenderCard(title: "Mermaid", icon: "point.3.connected.trianglepath.dotted", source: source, actionTitle: AppLocalization.string("Render diagram"), actionIcon: "play.fill") {
             preview = MarkupPreview(kind: .mermaid, source: source, light: colorScheme == .light)
         }
         .sheet(item: $preview) { MarkupPreviewSheet(preview: $0) }
@@ -1382,12 +2090,13 @@ private struct MermaidBlock: View {
 }
 
 private struct MathBlock: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let source: String
     @Environment(\.colorScheme) private var colorScheme
     @State private var preview: MarkupPreview?
 
     var body: some View {
-        RenderCard(title: "LaTeX", icon: "function", source: source, actionTitle: "Render formula", actionIcon: "function") {
+        RenderCard(title: "LaTeX", icon: "function", source: source, actionTitle: AppLocalization.string("Render formula"), actionIcon: "function") {
             preview = MarkupPreview(kind: .math, source: source, light: colorScheme == .light)
         }
         .sheet(item: $preview) { MarkupPreviewSheet(preview: $0) }
@@ -1401,6 +2110,7 @@ private struct RenderCard: View {
     let actionTitle: String
     let actionIcon: String
     let action: () -> Void
+    @Environment(\.chatTextSize) private var chatTextSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1417,7 +2127,7 @@ private struct RenderCard: View {
                 .tint(.conduitAccent)
             SelectableTextView(
                 text: source,
-                font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular),
+                font: ChatTypography.font(for: .sourceCode, chatSize: chatTextSize),
                 textColor: .label,
                 maximumNumberOfLines: 5
             )
@@ -1439,6 +2149,7 @@ private struct MarkupPreview: Identifiable {
 private struct MarkupPreviewSheet: View {
     let preview: MarkupPreview
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.chatTextSize) private var chatTextSize
 
     var body: some View {
         NavigationStack {
@@ -1449,7 +2160,7 @@ private struct MarkupPreviewSheet: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     SelectableTextView(
                         text: preview.source,
-                        font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular),
+                        font: ChatTypography.font(for: .sourceCode, chatSize: chatTextSize),
                         textColor: .label,
                         wrapsLines: false
                     )
@@ -1457,7 +2168,7 @@ private struct MarkupPreviewSheet: View {
                 }
                     .frame(maxHeight: 96)
             }
-            .navigationTitle(preview.kind == .mermaid ? "Diagram" : "Formula")
+            .navigationTitle(preview.kind == .mermaid ? AppLocalization.string("Diagram") : AppLocalization.string("Formula"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
         }
@@ -1542,8 +2253,125 @@ enum MarkupHTML {
 }
 
 enum MarkdownParser {
+    #if DEBUG
+    /// Test instrumentation: sizes (utf8 bytes) of every source handed to
+    /// `parseDocument`. Lets regression tests assert that pathological
+    /// streaming/rendering paths never re-parse the whole document per frame
+    /// — a bound on work, not a fragile wall-clock threshold. Lock-guarded
+    /// because `parseDocument` runs on the MainActor (rendering) and inside
+    /// off-main preparation passes concurrently.
+    private static let parseSizeLock = NSLock()
+    private nonisolated(unsafe) static var parseSizes: [Int] = []
+
+    nonisolated(unsafe) static var parseSourceSizes: [Int] {
+        get {
+            parseSizeLock.lock()
+            defer { parseSizeLock.unlock() }
+            return parseSizes
+        }
+        set {
+            parseSizeLock.lock()
+            defer { parseSizeLock.unlock() }
+            parseSizes = newValue
+        }
+    }
+
+    nonisolated(unsafe) private static func recordParseSize(_ bytes: Int) {
+        parseSizeLock.lock()
+        defer { parseSizeLock.unlock() }
+        parseSizes.append(bytes)
+    }
+    #endif
+
+    /// Compatibility wrapper for callers that only need the visible blocks.
+    /// Reference definitions are already stripped from them; call
+    /// `parseDocument` when the render context needs those definitions.
     static func parse(_ source: String, recognizesGatewayMedia: Bool = false) -> [MarkdownBlock] {
+        parseDocument(source, recognizesGatewayMedia: recognizesGatewayMedia).blocks
+    }
+
+    /// Splits a message into its visible blocks and its link reference
+    /// definitions. Definitions (`[id]: url`) are block-level Markdown that a
+    /// fragment-by-fragment renderer never sees — without this pass they end
+    /// up as visible paragraph text and every `[text][id]` use stays literal.
+    /// Definition lines are removed here (leaving a blank line behind so
+    /// neighboring paragraphs don't merge) and re-fed to Foundation with each
+    /// fragment at render time; see `MarkdownReferenceContext`.
+    static func parseDocument(_ source: String, recognizesGatewayMedia: Bool = false) -> MarkdownParsedDocument {
+        #if DEBUG
+        recordParseSize(source.utf8.count)
+        #endif
         let lines = source.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        var visibleLines: [String] = []
+        var definitions: [String] = []
+        var openFence: String?
+        var mathClose: String?
+
+        var index = 0
+        while index < lines.count {
+            let line = lines[index]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            // Fenced code and math blocks are raw content — the same regions
+            // the block walker below consumes wholesale — so a
+            // definition-looking line inside them must stay put. One known
+            // divergence: a fence opener inside a blockquote ("> ```") reads
+            // as a quote line to the walker but opens a fence here, so a
+            // definition-looking line in that region is collected while the
+            // walker renders the region as prose. Quote-nested fences are not
+            // a construct this renderer supports; accepted as an edge case.
+            if let close = mathClose {
+                visibleLines.append(line)
+                if trimmed == close { mathClose = nil }
+                index += 1
+                continue
+            }
+            if let fence = openFence {
+                visibleLines.append(line)
+                if trimmed.hasPrefix(fence) { openFence = nil }
+                index += 1
+                continue
+            }
+            if let fence = fenceStart(trimmed) {
+                openFence = fence
+                visibleLines.append(line)
+                index += 1
+                continue
+            }
+            if let close = mathBlockOpening(trimmed) {
+                mathClose = close
+                visibleLines.append(line)
+                index += 1
+                continue
+            }
+            if isDefinitionIndent(line), let definition = referenceDefinition(trimmed),
+               let span = consumedDefinitionSpan(definition, following: lines, at: index) {
+                definitions.append(span.markdown)
+                for _ in 0..<span.lineCount { visibleLines.append("") }
+                index += span.lineCount
+                continue
+            }
+            visibleLines.append(line)
+            index += 1
+        }
+
+        let visibleSource = visibleLines.joined(separator: "\n")
+        let blocks = parseBlocks(visibleLines, recognizesGatewayMedia: recognizesGatewayMedia)
+        // Defensive safety net carried over from the original parse(): if the
+        // walker ever produces nothing for non-whitespace input, surface the
+        // stripped body rather than rendering an empty message. Definitions
+        // were already removed from visibleSource, so they cannot resurface
+        // here even in that fallback.
+        let finalBlocks = blocks.isEmpty && !visibleSource.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? [.paragraph(visibleSource)]
+            : blocks
+        return MarkdownParsedDocument(
+            blocks: finalBlocks,
+            references: MarkdownReferenceContext(definitionsMarkdown: definitions.joined(separator: "\n"))
+        )
+    }
+
+    private static func parseBlocks(_ lines: [String], recognizesGatewayMedia: Bool) -> [MarkdownBlock] {
         var blocks: [MarkdownBlock] = []
         var index = 0
 
@@ -1634,7 +2462,7 @@ enum MarkdownParser {
             }
             blocks.append(.paragraph(paragraph.joined(separator: "\n")))
         }
-        return blocks.isEmpty && !source.isEmpty ? [.paragraph(source)] : blocks
+        return blocks
     }
 
     static func taskItem(_ value: String) -> (complete: Bool, text: String)? {
@@ -1650,6 +2478,73 @@ enum MarkdownParser {
     }
 
     private static func fenceStart(_ value: String) -> String? { value.hasPrefix("```") ? "```" : (value.hasPrefix("~~~") ? "~~~" : nil) }
+
+    /// CommonMark allows a definition at most three spaces of indentation;
+    /// anything deeper is indented-code content that Foundation keeps as
+    /// visible paragraph text, so it must not be collected here.
+    private static func isDefinitionIndent(_ line: String) -> Bool {
+        var spaces = 0
+        for character in line {
+            if character == " " { spaces += 1 }
+            else if character == "\t" { return false }
+            else { break }
+        }
+        return spaces <= 3
+    }
+
+    /// Recognizes the supported single-line subset of CommonMark link
+    /// reference definitions: `[label]: destination` with an optional
+    /// `"…"`, `'…'`, or `(…)` title and an optional `<…>` destination.
+    /// Labels containing brackets and footnote-style `[^…]` markers are out
+    /// of scope and return nil (they stay visible text). Definitions with
+    /// title continuation lines are deliberately unsupported; this renderer
+    /// documents and tests the single-line forms only.
+    private static func referenceDefinition(_ value: String) -> String? {
+        guard let range = value.range(
+            of: #"^\[([^\[\]\^][^\[\]]*)\]:[ \t]+(<[^>]+>|[^\s<][^\s]*)(?:[ \t]+("[^"]*"|'[^']*'|\([^)]*\)))?[ \t]*$"#,
+            options: .regularExpression
+        ) else { return nil }
+        return String(value[range])
+    }
+
+    /// Foundation is the authority on valid definitions; the regex above is
+    /// only a pre-filter. A regex match Foundation renders as text — e.g. a
+    /// destination with an unbalanced `)` — must stay visible in place:
+    /// stripping it here would delete it from its position and then
+    /// duplicate it after every block when the collected definitions are
+    /// re-appended to each fragment. A definition's title may also continue
+    /// on the following line; fold a title-shaped next line in only when
+    /// Foundation consumes the pair invisibly, so it cannot surface as a
+    /// stray paragraph. The shape check keeps block openers (fences, math,
+    /// directives) out of the fold even when a bare opener would parse empty.
+    private static func consumedDefinitionSpan(
+        _ definition: String,
+        following lines: [String],
+        at index: Int
+    ) -> (markdown: String, lineCount: Int)? {
+        func isConsumedInvisibly(_ markdown: String) -> Bool {
+            (try? AttributedString(
+                markdown: markdown,
+                options: .init(interpretedSyntax: .full)
+            ))?.characters.isEmpty == true
+        }
+
+        let next = index + 1 < lines.count
+            ? lines[index + 1].trimmingCharacters(in: .whitespaces)
+            : ""
+        if isTitleContinuation(next), isConsumedInvisibly(definition + "\n" + next) {
+            return (definition + "\n" + next, 2)
+        }
+        return isConsumedInvisibly(definition) ? (definition, 1) : nil
+    }
+
+    private static func isTitleContinuation(_ value: String) -> Bool {
+        guard value.count >= 2, let first = value.first, let last = value.last else { return false }
+        switch (first, last) {
+        case ("\"", "\""), ("'", "'"), ("(", ")"): return true
+        default: return false
+        }
+    }
     private static func mathBlockOpening(_ value: String) -> String? { value == "$$" ? "$$" : (value == "\\[" ? "\\]" : nil) }
     private static func singleLineMath(_ value: String) -> String? {
         guard value.hasPrefix("$$"), value.hasSuffix("$$"), value.count > 4 else { return nil }
@@ -1738,7 +2633,7 @@ private final class HighlightedCode {
     init(_ value: AttributedString) { self.value = value }
 }
 
-private enum SyntaxHighlighter {
+enum SyntaxHighlighter {
     /// Settled code blocks across the transcript re-render at streaming frame
     /// rate; tokenizing is linear but allocation-heavy, so memoize by content.
     ///
@@ -1757,6 +2652,10 @@ private enum SyntaxHighlighter {
         return cache
     }()
 
+    /// NOTE: deliberately NOT keyed on the chat text size (issue #85): the
+    /// tokenizer bakes colors only — fonts are applied when the result is
+    /// bridged into an NSAttributedString with a caller-supplied default
+    /// font — so one highlighted value serves every typography.
     static func highlight(_ source: String, language: String) -> AttributedString {
         let key = "\(language)|\(source)" as NSString
         if let cached = cache.object(forKey: key) { return cached.value }

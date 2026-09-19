@@ -15,14 +15,18 @@ final class SessionPresentationCache {
     static let shared = SessionPresentationCache()
     static let maxUnconfirmedPendingDecisionAge: TimeInterval = 24 * 60 * 60
 
-    /// Returns whether a clarification or approval presentation still needs a
-    /// user decision. Keep this rule shared by resume pruning and cache saves.
+    /// Returns whether a clarification presentation still needs a user
+    /// decision. Keep this rule shared by resume pruning and cache saves. A
+    /// retryable `.error` question is still unanswered — it must survive as
+    /// an unresolved decision, never be pruned as completed.
     static func isPendingDecision(_ status: ClarifyActivity.Status) -> Bool {
-        status == .pending || status == .submitting
+        status == .pending || status == .submitting || status == .error
     }
 
     static func isPendingDecision(_ status: ApprovalActivity.Status) -> Bool {
-        status == .pending || status == .submitting
+        // An errored approval is still retryable (the card re-arms its
+        // controls), so it remains an unresolved decision for pruning.
+        status == .pending || status == .submitting || status == .error
     }
 
     /// Stable identity for a decision card, regardless of whether it is still
@@ -160,9 +164,46 @@ final class SessionPresentationCache {
         includePendingApprovals: Bool = false
     ) -> [ChatMessage] {
         let stored = load()
-        let cached = sessionIDs
-            .compactMap { stored[key(profile: profile, sessionID: $0)] }
-            .flatMap { session in
+        // Resolve every supplied alias, but let each LOGICAL cached snapshot
+        // enter the matching pool exactly once. save(...sessionIDs:) writes
+        // equivalent records under every alias, so a requested+resolved
+        // lookup used to flatten the same rows twice and the matcher could
+        // consume stale duplicates as though they were distinct historical
+        // messages (fingerprint and positional scoring especially). Aliases
+        // are resolved in supplied order; when several aliases hold the same
+        // logical snapshot — including one rewritten later with only fresh
+        // presentation stamps — the freshest write wins.
+        //
+        // Ordering contract (review-gate W1): DIVERGENT snapshots that
+        // outscore equally tie-break by earliest pool position, which is
+        // this call's argument order. The sole production caller passes
+        // [resolvedId, requestedId] so the live write leads; keep callers
+        // passing the most-current alias first.
+        var resolutionOrder: [String] = []
+        var snapshotByID: [String: CachedSession] = [:]
+        var seenCacheKeys = Set<String>()
+        for rawSessionID in sessionIDs {
+            let trimmed = rawSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard seenCacheKeys.insert(trimmed).inserted else { continue }
+            guard let session = stored[
+                key(profile: profile, sessionID: trimmed)
+            ] else { continue }
+            let identity = Self.logicalSnapshotIdentity(for: session.messages)
+            if let existing = snapshotByID[identity] {
+                let isFresher =
+                    session.updatedAt == existing.updatedAt
+                    ? session.messages.count > existing.messages.count
+                    : session.updatedAt > existing.updatedAt
+                if isFresher {
+                    snapshotByID[identity] = session
+                }
+            } else {
+                resolutionOrder.append(identity)
+                snapshotByID[identity] = session
+            }
+        }
+        let cached = resolutionOrder.compactMap { snapshotByID[$0] }
+            .flatMap { session -> [CachedMessage] in
                 let unconfirmedExpired = isUnconfirmedPendingDecisionExpired(
                     since: session.unconfirmedPendingDecisionAt
                 )
@@ -246,7 +287,7 @@ final class SessionPresentationCache {
                     merged.append(ChatMessage(
                         id: cachedMessage?.id ?? "clarify-\(clarify.requestId)",
                         role: .clarify,
-                        content: clarify.question,
+                        content: clarify.displayQuestion,
                         timestamp: cachedMessage?.timestamp ?? "",
                         clarify: clarify
                     ))
@@ -258,9 +299,26 @@ final class SessionPresentationCache {
             let pendingApprovals = cached.compactMap(\.approval).filter {
                 Self.isPendingDecision($0.status)
             }
-            for approval in pendingApprovals where !merged.contains(where: {
-                $0.approval?.sessionId == approval.sessionId
-            }) {
+            // Hermes approvals are a single gate per conversation. When the
+            // gateway transcript already announces a pending approval under
+            // ANY identity of this conversation (the supplied lookup set),
+            // a promoted push card for the same gate — keyed by the durable
+            // id after routing rewrite — would render as a duplicate.
+            let suppliedIDs = Set(sessionIDs.map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            })
+            let gatewayAnnouncesPendingGate = merged.contains { message in
+                guard let approval = message.approval else { return false }
+                return Self.isPendingDecision(approval.status)
+                    && suppliedIDs.contains(
+                        approval.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+                    )
+            }
+            for approval in pendingApprovals {
+                if gatewayAnnouncesPendingGate { break }
+                guard !merged.contains(where: {
+                    $0.approval?.sessionId == approval.sessionId
+                }) else { continue }
                 let cachedMessage = cached.last { $0.approval?.sessionId == approval.sessionId }
                 merged.append(ChatMessage(
                     id: cachedMessage?.id ?? "approval-\(approval.sessionId)",
@@ -525,6 +583,211 @@ final class SessionPresentationCache {
         persist(store)
     }
 
+    /// Removes the cached records for the given sessions inside `profile`,
+    /// for exactly the keys passed (callers must pass every alias — see
+    /// `revokeDeletedConversationIdentity`). The delete path calls this so a
+    /// deleted conversation cannot resurrect its presentation (including any
+    /// pending decision cards) from a stale alias.
+    func removeSessions(profile: String, sessionIDs: [String]) {
+        let prefix = normalized(profile) + "|"
+        let ids = Set(sessionIDs.compactMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        })
+        guard !ids.isEmpty else { return }
+        var store = load()
+        var changed = false
+        for sessionID in ids {
+            let cacheKey = prefix + sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if store.removeValue(forKey: cacheKey) != nil {
+                changed = true
+            }
+        }
+        guard changed else { return }
+        persist(store)
+    }
+
+    /// Durable-owned persistence: once this conversation's durable identity
+    /// is positively established, the durable key is its ONLY persistent
+    /// presentation key. Moves the conversation's cached presentation from
+    /// its runtime-alias keys into the durable key, then REMOVES every alias
+    /// key. Retiring the mutable runtime keys is the point: a runtime id the
+    /// gateway later re-attributes to a different conversation must not
+    /// carry this conversation's timestamps, attachments, tool metadata, or
+    /// pending decision cards with it.
+    ///
+    /// Merge semantics when the durable record already exists: the durable
+    /// record stays AUTHORITATIVE for transcript presentation — an alias
+    /// snapshot never overwrites its timestamps, tool metadata, or rows.
+    /// Only NEW pending decision content (approval/clarify/batch by stable
+    /// decision key, deduped) is promoted from alias records — the fresh
+    /// notification-delivered card must survive, the stale alias transcript
+    /// must not leak. On establishment (no durable record yet) the FRESHEST
+    /// alias record migrates whole so runtime-only history is not lost.
+    ///
+    /// Approval cards whose embedded `sessionId` names a retired runtime
+    /// alias are rewritten to the durable id, so answering a restored card
+    /// dispatches to the durable session even after later rotations.
+    /// Clarify request ids are relay-minted (`conduit-push-…`), not session
+    /// ids, and are never rewritten.
+    func consolidateUnderDurableKey(
+        profile: String,
+        durableSessionID: String,
+        runtimeAliases: [String]
+    ) {
+        let durableKey = key(profile: profile, sessionID: durableSessionID)
+        let aliasKeys = Set(
+            runtimeAliases.map { key(profile: profile, sessionID: $0) }
+        ).subtracting([durableKey])
+        guard !aliasKeys.isEmpty else { return }
+        var store = load()
+        if store[durableKey] == nil {
+            let freshest = aliasKeys
+                .compactMap { store[$0] }
+                .max { lhs, rhs in
+                    lhs.updatedAt == rhs.updatedAt
+                        ? lhs.messages.count < rhs.messages.count
+                        : lhs.updatedAt < rhs.updatedAt
+                }
+            if var freshest {
+                rewriteRoutingIdentities(in: &freshest, durableSessionID: durableSessionID, runtimeAliases: runtimeAliases)
+                store[durableKey] = freshest
+            }
+        } else {
+            promotePendingDecisionsFromAliases(
+                into: &store,
+                durableKey: durableKey,
+                aliasKeys: aliasKeys,
+                durableSessionID: durableSessionID,
+                runtimeAliases: runtimeAliases
+            )
+        }
+        var changed = store[durableKey] != nil
+        for aliasKey in aliasKeys where store.removeValue(forKey: aliasKey) != nil {
+            changed = true
+        }
+        guard changed else { return }
+        if var durableSession = store[durableKey] {
+            rewriteRoutingIdentities(
+                in: &durableSession,
+                durableSessionID: durableSessionID,
+                runtimeAliases: runtimeAliases
+            )
+            store[durableKey] = durableSession
+        }
+        persist(store)
+    }
+
+    /// Promotes NEW pending decision presentation from alias records into an
+    /// existing durable record. The durable transcript rows, timestamps, and
+    /// tool metadata are never touched: only pending decisions the durable
+    /// record does not already hold (deduped by stable decision key, after
+    /// routing-identity rewrite) are appended, and the bounded
+    /// unconfirmed-expiry marker is adopted when the durable record has none.
+    private func promotePendingDecisionsFromAliases(
+        into store: inout [String: CachedSession],
+        durableKey: String,
+        aliasKeys: Set<String>,
+        durableSessionID: String,
+        runtimeAliases: [String]
+    ) {
+        guard var durableSession = store[durableKey] else { return }
+        let aliases = Set(runtimeAliases.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        })
+        var knownKeys = Set(durableSession.messages.compactMap(decisionKey(for:)))
+        var promoted = false
+        // The freshest unconfirmed marker among aliases that actually
+        // contributed a card. Markers from cardless aliases are ignored:
+        // adopting one could expire the just-promoted card immediately.
+        var freshestContributedMarker: Date?
+        for aliasKey in aliasKeys {
+            guard let aliasEntry = store[aliasKey] else { continue }
+            var aliasContributed = false
+            for message in aliasEntry.messages {
+                guard pendingDecisionKey(for: message) != nil else { continue }
+                var candidate = message
+                // Rewrite BEFORE dedup so a runtime-keyed card cannot
+                // duplicate a decision the durable record already holds
+                // under the durable id.
+                if let approval = candidate.approval,
+                   aliases.contains(approval.sessionId) {
+                    candidate.approval?.sessionId = durableSessionID
+                }
+                let key = decisionKey(for: candidate)
+                guard let key else { continue }
+                if let existingIndex = durableSession.messages.firstIndex(where: {
+                    decisionKey(for: $0) == key
+                }) {
+                    // Same decision already persisted. The durable row stays
+                    // authoritative unless its unconfirmed marker has
+                    // expired — a dead durable card is replaced by the fresh
+                    // alias copy rather than duplicated or silently dropped.
+                    if isUnconfirmedPendingDecisionExpired(
+                        since: durableSession.unconfirmedPendingDecisionAt
+                    ) {
+                        durableSession.messages[existingIndex] = candidate
+                        aliasContributed = true
+                    }
+                    continue
+                }
+                durableSession.messages.append(candidate)
+                knownKeys.insert(key)
+                promoted = true
+                aliasContributed = true
+            }
+            // Replacement (the duplicate branch above) counts as promotion:
+            // without it a fresh alias copy of an expired durable card would
+            // be discarded and the marker refresh skipped.
+            if aliasContributed { promoted = true }
+            guard aliasContributed,
+                  let aliasMarker = aliasEntry.unconfirmedPendingDecisionAt else { continue }
+            if freshestContributedMarker == nil || aliasMarker > freshestContributedMarker! {
+                freshestContributedMarker = aliasMarker
+            }
+        }
+        guard promoted else { return }
+        // Expiry semantics: only touch the marker when cards were promoted.
+        // Adopt the freshest contributing marker when the durable record has
+        // none, and REFRESH an expired durable marker — a stale marker would
+        // make merge strip the freshly promoted card on the next read,
+        // silently losing it after successful promotion. A live durable
+        // marker is left alone: legitimately-expired durable cards without
+        // fresh arrivals stay expired.
+        if let freshestContributedMarker,
+           durableSession.unconfirmedPendingDecisionAt == nil
+            || isUnconfirmedPendingDecisionExpired(since: durableSession.unconfirmedPendingDecisionAt) {
+            durableSession.unconfirmedPendingDecisionAt = freshestContributedMarker
+        }
+        durableSession.updatedAt = now()
+        store[durableKey] = durableSession
+    }
+
+    /// Points migrated approval cards at the durable session id when they
+    /// were keyed by one of the retired runtime aliases. Clarify request ids
+    /// live in a different namespace and are intentionally untouched.
+    private func rewriteRoutingIdentities(
+        in session: inout CachedSession,
+        durableSessionID: String,
+        runtimeAliases: [String]
+    ) {
+        let aliases = Set(runtimeAliases.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        })
+        var mutated = false
+        for index in session.messages.indices {
+            var message = session.messages[index]
+            if let approval = message.approval,
+               aliases.contains(approval.sessionId) {
+                message.approval?.sessionId = durableSessionID
+                session.messages[index] = message
+                mutated = true
+            }
+        }
+        if mutated {
+            session.updatedAt = now()
+        }
+    }
+
     private func load() -> [String: CachedSession] {
         guard let data = defaults.data(forKey: storageKey),
               let decoded = try? JSONDecoder().decode([String: CachedSession].self, from: data) else {
@@ -560,36 +823,49 @@ final class SessionPresentationCache {
         remaining: Set<Int>,
         preferredPosition: Int
     ) -> Int? {
-        let ranked = remaining.compactMap { index -> (index: Int, score: Int)? in
+        var bestIndex: Int?
+        var bestScore = Int.min
+        // Scan candidates in ascending pool order and keep the FIRST highest
+        // score. Equal-scoring rows (repeated content, repeated tool calls)
+        // must resolve deterministically to the earliest row; iterating the
+        // `remaining` set unordered made enrichment order arbitrary.
+        for index in remaining.sorted() {
             let candidate = cached[index]
-            guard candidate.role == message.role else { return nil }
+            guard candidate.role == message.role else { continue }
+            var score = Int.min
 
-            if candidate.id == message.id { return (index, 1_000) }
-
-            if let tool = message.tool {
-                guard candidate.toolName == normalized(tool.name) else { return nil }
-                var score = 50
+            if candidate.id == message.id {
+                // Absolute maximum; no later candidate can outrank it.
+                return index
+            } else if let tool = message.tool {
+                guard candidate.toolName == normalized(tool.name) else { continue }
+                score = 50
                 if let input = tool.input, candidate.toolInputSignature == Self.fingerprint(input) { score += 30 }
                 if let output = tool.output, candidate.toolOutputSignature == Self.fingerprint(output) { score += 30 }
                 if (tool.input ?? "").isEmpty, candidate.toolPreview?.isEmpty == false { score += 5 }
-                return (index, score)
+            } else if candidate.signature == Self.fingerprint(message.content) {
+                score = 100
+            } else {
+                // Hermes can re-render a completed response before placing it in
+                // history. The text may therefore differ even though it is the
+                // same chronological row. This is only a fallback for missing
+                // presentation metadata within the same bounded session cache.
+                let distance = abs(index - preferredPosition)
+                guard distance <= 3,
+                      !candidate.timestamp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    continue
+                }
+                score = 20 - distance
             }
 
-            if candidate.signature == Self.fingerprint(message.content) { return (index, 100) }
-
-            // Hermes can re-render a completed response before placing it in
-            // history. The text may therefore differ even though it is the
-            // same chronological row. This is only a fallback for missing
-            // presentation metadata within the same bounded session cache.
-            let distance = abs(index - preferredPosition)
-            guard distance <= 3,
-                  !candidate.timestamp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return nil
+            // Strict > : the first highest-scoring candidate in ascending
+            // index order wins the tie, never arbitrary Set iteration order.
+            if score > bestScore {
+                bestScore = score
+                bestIndex = index
             }
-            return (index, 20 - distance)
         }
-
-        return ranked.max { $0.score < $1.score }?.index
+        return bestIndex
     }
 
     /// Never replace a cached timestamp/preview with a newer history record
@@ -649,5 +925,36 @@ final class SessionPresentationCache {
             hash &*= 1_099_511_628_211
         }
         return String(hash, radix: 16)
+    }
+
+    /// Stable logical identity of one cached snapshot: the (role, id,
+    /// content-signature) sequence of its rows. Deliberately EXCLUDES
+    /// volatile presentation stamps (timestamps, tool previews) so a
+    /// re-stamped rewrite of the same transcript through another alias is
+    /// recognized as the same snapshot and deduplicated to its freshest
+    /// write — while snapshots whose rows genuinely differ keep separate
+    /// identities and all stay available to the matcher. Identity is
+    /// value-derived; two records collapse only when their entire row
+    /// sequences agree structurally.
+    private static func logicalSnapshotIdentity(
+        for messages: [CachedMessage]
+    ) -> String {
+        // Review-gate W2: encode the row matrix as JSON before fingerprinting
+        // so no separator/field content can ever alias two structurally
+        // different sequences onto one identity.
+        let rowIdentity = messages.map { message -> [String] in
+            [
+                String(describing: message.role),
+                message.id,
+                message.signature,
+                message.toolName ?? ""
+            ]
+        }
+        guard let data = try? JSONEncoder().encode(rowIdentity) else {
+            // Encoding cannot fail for [ [String] ]; failing open can only
+            // ever ADD a candidate, never silently drop a real one.
+            return UUID().uuidString
+        }
+        return fingerprint(String(decoding: data, as: UTF8.self))
     }
 }

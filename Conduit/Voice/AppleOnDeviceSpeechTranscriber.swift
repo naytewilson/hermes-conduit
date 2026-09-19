@@ -36,13 +36,13 @@ final class AppleOnDeviceSpeechTranscriber: DeviceSpeechTranscriptionService {
         cancel()
         let locale = Locale.current
         guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.supportsOnDeviceRecognition else {
-            throw VoiceAudioError.unavailable("On-device Apple speech recognition is unavailable for \(locale.identifier).")
+            throw VoiceAudioError.unavailable(AppLocalization.string("On-device Apple speech recognition is unavailable for \(locale.identifier)."))
         }
         guard await requestPermission() else {
-            throw VoiceAudioError.unavailable("Speech Recognition permission is required for on-device transcription.")
+            throw VoiceAudioError.unavailable(AppLocalization.string("Speech Recognition permission is required for on-device transcription."))
         }
         guard recognizer.isAvailable else {
-            throw VoiceAudioError.unavailable("Apple speech recognition is temporarily unavailable.")
+            throw VoiceAudioError.unavailable(AppLocalization.string("Apple speech recognition is temporarily unavailable."))
         }
 
         let url = FileManager.default.temporaryDirectory
@@ -51,7 +51,7 @@ final class AppleOnDeviceSpeechTranscriber: DeviceSpeechTranscriptionService {
         do {
             try audio.wavData.write(to: url, options: .atomic)
         } catch {
-            throw VoiceAudioError.unavailable("Conduit could not prepare captured audio for transcription.")
+            throw VoiceAudioError.unavailable(AppLocalization.string("Conduit could not prepare captured audio for transcription."))
         }
         temporaryAudioURL = url
 

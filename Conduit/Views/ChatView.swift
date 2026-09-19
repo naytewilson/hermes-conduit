@@ -12,23 +12,34 @@ import ImageIO
 struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @State private var bottomMarkerMaxY: CGFloat?
-    @State private var scrollViewportMaxY: CGFloat?
-    @State private var followsLatest = true
-    @State private var topVisibleChatID: String?
-    @State private var chatMessageScrollTargetCache = ChatMessageScrollTargetCache()
-    @State private var renderedScrollSessionKey: ChatScrollSessionKey?
+    @State private var scrollViewportFrame: CGRect?
     @State private var renderedScrollContent: ChatRenderedScrollContent?
     @State private var renderedScrollTargets = ChatRenderedScrollTargets()
-    @State private var renderedTranscriptRevision: UInt64 = 0
-    @State private var renderedViewportTransitionGeneration: UInt64 = 0
     @State private var viewportSnapshotProviderID = UUID()
-    @State private var scrollOwnerState = ChatScrollOwnerState()
+    @State private var viewport = ChatViewportController()
+    /// The animated bottom command whose delayed retry is still armed. A
+    /// coalesced follow correction must not execute while this is set: the
+    /// animation is mid-flight toward the bottom, the measured drift is
+    /// transient, and a second scrollTo against the same anchor mid-
+    /// animation churns the lazy realization (observed as settled-row
+    /// re-materialization in the hosted transcript fixture). The retry
+    /// itself guarantees the animated command lands.
+    @State private var armedAnimatedBottomRetry: ChatViewportCommand?
+    /// Lifecycle-aware backfill task: cancelled when the view disappears so
+    /// a late response cannot mutate viewport state after teardown. (The
+    /// session/profile staleness of the response itself is AppState's
+    /// concern — this is view-lifetime only.)
+    @State private var backfillViewportTask: Task<Void, Never>?
     @GestureState private var isDraggingChat = false
-    @State private var chatDragLifecycle = ChatDragLifecycleState()
-    @State private var chatDragCompletionToken: ChatDragCompletionToken?
-    @State private var notificationHandoffPending = false
-    @State private var notificationHandoffSessionKey: ChatScrollSessionKey?
-    @State private var notificationHandoffHasMeasuredLayout = false
+
+    private var renderedScrollSessionKey: ChatScrollSessionKey? { viewport.renderedSessionKey }
+
+    private var scrollViewportMaxY: CGFloat? { scrollViewportFrame?.maxY }
+
+    private var scrollViewportMinY: CGFloat? { scrollViewportFrame?.minY }
+
+    /// Single source of follow-latest truth: the controller's mode.
+    private var followsLatest: Bool { viewport.isFollowingLatest }
 
     private var activeScrollSessionKey: ChatScrollSessionKey? {
         if let canonical = appState.activeChatScrollSessionIdentity.canonicalSessionKey {
@@ -59,6 +70,10 @@ struct ChatView: View {
         )
     }
 
+    private var chatMessageScrollTargets: [ChatMessageScrollTarget] {
+        viewport.targets
+    }
+
     private var bottomAnchor: String {
         let scope = activeOrFallbackScrollSessionKey
         return "chat-latest-\(scope.profile)-\(scope.sessionID)"
@@ -73,380 +88,126 @@ struct ChatView: View {
         appState.chatResumeRestorationRequest != nil
     }
 
-    private var renderedScrollScope: ChatRenderedScrollScope? {
-        renderedScrollSessionKey.map {
-            ChatRenderedScrollScope(
-                sessionKey: $0,
-                cacheRevision: chatMessageScrollTargetCache.renderingRevision,
-                restorationGeneration: appState.chatResumeRestorationRequest?.generation,
-                transcriptRevision: renderedTranscriptRevision,
-                viewportTransitionGeneration: renderedViewportTransitionGeneration
-            )
+    /// Whether "Load earlier messages" is offered right now. AppState owns
+    /// the complete truth — window state, transcript content, and
+    /// active-conversation ownership — the exact predicate
+    /// `loadEarlierMessages` enforces, so the control can never render for
+    /// a window the action would silently reject.
+    private var transcriptBackfillAvailable: Bool {
+        appState.canLoadEarlierMessagesForActiveConversation
+    }
+
+    private var transcriptBackfillIsLoading: Bool {
+        appState.persistedTranscriptWindow?.isLoadingEarlier == true
+    }
+
+    /// Transcript-top affordance for bounded history: fetches the next older
+    /// page and prepends it. The currently visible row is captured as the
+    /// viewport anchor before the fetch so the prepend lands without moving
+    /// the user's position. Label-exposed for accessibility — never
+    /// icon-only — and the loading state is announced by the combined
+    /// progress row.
+    private var transcriptTopBackfillControl: some View {
+        Group {
+            if transcriptBackfillIsLoading {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading earlier messages")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+            } else {
+                Button {
+                    // A second tap while the first backfill is in flight
+                    // must not overwrite the armed anchor (the single-flight
+                    // guard in AppState would then discard nothing and the
+                    // discharge below would kill the first request's anchor).
+                    guard !transcriptBackfillIsLoading else { return }
+                    ChatViewportTrace.shared.log("event loadEarlier")
+                    let armedKey = renderedScrollSessionKey ?? activeScrollSessionKey
+                    viewport.olderPageBackfillRequested(
+                        anchorMessageID: viewport.stableTopMessageID,
+                        sessionKey: armedKey
+                    )
+                    backfillViewportTask?.cancel()
+                    backfillViewportTask = Task { @MainActor in
+                        let didPrepend = await appState.loadEarlierMessages()
+                        guard !Task.isCancelled else { return }
+                        if !didPrepend {
+                            // Nothing landed (short page, transient failure,
+                            // all-duplicate page): discharge the anchor so it
+                            // can never re-pin on a later unrelated change.
+                            // Scoped to the session this tap armed — a stale
+                            // task must not clobber a newer conversation's
+                            // anchor.
+                            viewport.prependAnchorDischarged(matching: armedKey)
+                        }
+                    }
+                } label: {
+                    Label("Load earlier messages", systemImage: "clock.arrow.circlepath")
+                        .font(.footnote.weight(.semibold))
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.plain)
+                .conduitGlassControl(cornerRadius: 16, tint: .conduitAccent.opacity(0.12))
+                .accessibilityLabel("Load earlier messages")
+                .accessibilityHint("Fetches the next older page of this conversation")
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+            }
         }
     }
 
+    /// Latest global frames + transcript order of rendered stable rows for
+    /// the current scope. Only message rows report frames (streaming/typing/
+    /// markers never do), so ephemeral identifiers cannot enter stable-top
+    /// observation.
+    private var renderedRowFrames: [String: ChatRenderedRowGeometry] {
+        guard let scope = renderedScrollScope else { return [:] }
+        return renderedScrollTargets.rowFrames(in: scope)
+    }
+
+    private var renderedScrollScope: ChatRenderedScrollScope? {
+        viewport.renderedScrollScope
+    }
+
+    /// The chat-only text-size preference (issue #85). Local, device-only
+    /// @AppStorage like ComposerReturnKey — never synced to Hermes or the
+    /// profile. Injected once here so every transcript Markdown path
+    /// (settled, streaming, large-document, tables, code) resolves the same
+    /// typography, while non-chat subtrees keep the `.default` environment
+    /// value and today's appearance.
+    @AppStorage(ChatTypography.preferenceKey) private var chatTextSizeRaw = ChatTypography.defaultSize.rawValue
+
+    private var chatTextSize: ChatTextSize {
+        ChatTypography.resolve(rawValue: chatTextSizeRaw)
+    }
+
     var body: some View {
+        let _ = TranscriptPerf.note(.chatViewBody)
         VStack(spacing: 0) {
             // Message list
             ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 18) {
-                        Color.clear
-                            .frame(height: 1)
-                            .id(topAnchor)
-
-                        if appState.messages.isEmpty {
-                            EmptyChatState().padding(.top, 60)
-                        }
-
-                        ForEach(chatMessageScrollTargetCache.targets) { target in
-                            MessageBubble(message: target.message)
-                                .id(target.id)
-                                .background {
-                                    GeometryReader { _ in
-                                        Color.clear.preference(
-                                            key: ChatRenderedScrollTargetsPreferenceKey.self,
-                                            value: renderedScrollScope.map {
-                                                ChatRenderedScrollTargets.row(
-                                                    semanticID: target.id,
-                                                    scope: $0
-                                                )
-                                            } ?? ChatRenderedScrollTargets()
-                                        )
-                                    }
-                                }
-                        }
-
-                        if !appState.streamingText.isEmpty {
-                            StreamingBubble(
-                                text: appState.streamingText,
-                                active: appState.isBusy
-                            )
-                            .id("streaming")
-                        }
-
-                        if appState.isBusy && appState.streamingText.isEmpty {
-                            TypingIndicator().id("typing")
-                        }
-
-                        // Keep the scroll target in the lazy layout itself.
-                        // A notification can replace the entire transcript at
-                        // once; a sibling target can otherwise be measured
-                        // against stale content while LazyVStack catches up.
-                        Color.clear
-                            .frame(height: 1)
-                            .padding(.bottom, 126)
-                            .id(bottomAnchor)
-                            .background {
-                                GeometryReader { _ in
-                                    Color.clear.preference(
-                                        key: ChatRenderedScrollTargetsPreferenceKey.self,
-                                        value: renderedScrollScope.map {
-                                            ChatRenderedScrollTargets.bottom(
-                                                anchorID: bottomAnchor,
-                                                scope: $0
-                                            )
-                                        } ?? ChatRenderedScrollTargets()
-                                    )
-                                }
-                            }
-                    }
-                    .scrollTargetLayout()
-                    .padding(.horizontal, 18)
-                    .padding(.top, 18)
-                    .background {
-                        // Measure the lazy stack itself, not its final child.
-                        // SwiftUI can unload that child after the user scrolls
-                        // away, leaving the old "at bottom" value stuck and
-                        // suppressing the scroll-to-latest button.
-                        GeometryReader { geometry in
-                            Color.clear
-                                .preference(
-                                    key: ChatBottomMarkerPreferenceKey.self,
-                                    value: geometry.frame(in: .global).maxY
-                                )
-                                .preference(
-                                    key: ChatRenderedScrollContentPreferenceKey.self,
-                                    value: renderedScrollScope.map(ChatRenderedScrollContent.init(scope:))
-                                )
-                        }
-                    }
-                }
-                .scrollDismissesKeyboard(.interactively)
-                .scrollPosition(id: $topVisibleChatID, anchor: .top)
-                .onTapGesture {
-                    UIApplication.shared.sendAction(
-                        #selector(UIResponder.resignFirstResponder),
-                        to: nil,
-                        from: nil,
-                        for: nil
-                    )
-                }
-                .background {
-                    GeometryReader { geometry in
-                        Color.clear.preference(
-                            key: ChatViewportBottomPreferenceKey.self,
-                            value: geometry.frame(in: .global).maxY
+                sessionObservers(
+                    proxy: proxy,
+                    content: transcriptObservers(
+                        proxy: proxy,
+                        content: lifecycleObservers(
+                            proxy: proxy,
+                            content: chatScrollView(proxy: proxy)
                         )
-                    }
-                }
-                .onAppear {
-                    renderedScrollSessionKey = activeScrollSessionKey
-                    chatMessageScrollTargetCache.update(for: appState.messages)
-                    renderedTranscriptRevision = appState.chatTranscriptRevision
-                    renderedViewportTransitionGeneration = appState.chatViewportTransitionGeneration
-                    let followsLatestState = $followsLatest
-                    let topVisibleChatIDState = $topVisibleChatID
-                    let targetCacheState = $chatMessageScrollTargetCache
-                    let renderedSessionKeyState = $renderedScrollSessionKey
-                    appState.installChatViewportSnapshotProvider(
-                        id: viewportSnapshotProviderID,
-                        capture: {
-                            guard let sessionKey = renderedSessionKeyState.wrappedValue else {
-                                return nil
-                            }
-                            let followsLatest = followsLatestState.wrappedValue
-                            guard let snapshot = ChatTitleScrollViewportSnapshot.make(
-                                followsLatest: followsLatest,
-                                topVisibleID: topVisibleChatIDState.wrappedValue,
-                                topAnchorID: ChatTitleScrollAnchor.id(for: sessionKey),
-                                targets: targetCacheState.wrappedValue.targets
-                            ) else {
-                                return nil
-                            }
-                            return ChatRenderedViewportSnapshot(
-                                sessionKey: sessionKey,
-                                snapshot: snapshot
-                            )
-                        }
                     )
-                }
-                .onDisappear {
-                    abandonChatDrag()
-                    appState.removeChatViewportSnapshotProvider(id: viewportSnapshotProviderID)
-                }
-                .task(id: appState.chatResumeRestorationRequest?.generation) {
-                    guard let request = appState.chatResumeRestorationRequest else { return }
-                    invalidateChatDrag()
-                    await applyChatResumeRestoration(request, using: proxy)
-                }
-                .task(id: chatDragCompletionToken) {
-                    guard let completed = chatDragCompletionToken else { return }
-                    await completeChatDrag(completed)
-                }
-                .onPreferenceChange(ChatBottomMarkerPreferenceKey.self) { value in
-                    updateBottomMarker(value)
-                    recordNotificationHandoffLayout()
-                    finishNotificationHandoffIfReady(using: proxy)
-                }
-                .onPreferenceChange(ChatViewportBottomPreferenceKey.self) { value in
-                    updateViewportBottom(value)
-                    recordNotificationHandoffLayout()
-                    finishNotificationHandoffIfReady(using: proxy)
-                }
-                .onPreferenceChange(ChatRenderedScrollContentPreferenceKey.self) { value in
-                    renderedScrollContent = value
-                    guard let value else { return }
-                    appState.chatViewportLayoutDidSettle(
-                        sessionKey: value.scope.sessionKey,
-                        transitionGeneration: value.scope.viewportTransitionGeneration,
-                        transcriptRevision: value.scope.transcriptRevision,
-                        renderRevision: value.scope.cacheRevision,
-                        receivedScopedPreference: true
-                    )
-                }
-                .onPreferenceChange(ChatRenderedScrollTargetsPreferenceKey.self) { value in
-                    renderedScrollTargets = value
-                }
-                .onChange(of: isDraggingChat) { wasDragging, isDragging in
-                    guard wasDragging, !isDragging else { return }
-                    chatDragCompletionToken = chatDragLifecycle.finish()
-                }
-                .onChange(of: appState.messages) { _, newMessages in
-                    let cacheUpdate = chatMessageScrollTargetCache.update(for: newMessages)
-                    renderedTranscriptRevision = appState.chatTranscriptRevision
-                    renderedViewportTransitionGeneration = appState.chatViewportTransitionGeneration
-                    guard !appState.isOpeningNotificationSession else {
-                        notificationHandoffPending = true
-                        return
-                    }
-                    guard ChatMessageScrollUpdatePolicy.shouldReassertLatest(
-                        after: cacheUpdate,
-                        followsLatest: followsLatest,
-                        hasPendingRestoration: hasPendingRestoration,
-                        hasNotificationHandoff: notificationHandoffPending
-                    ) else { return }
-                    DispatchQueue.main.async {
-                        guard ChatMessageScrollUpdatePolicy.shouldReassertLatest(
-                            after: cacheUpdate,
-                            followsLatest: followsLatest,
-                            hasPendingRestoration: appState.chatResumeRestorationRequest != nil,
-                            hasNotificationHandoff: appState.isOpeningNotificationSession
-                                || notificationHandoffPending
-                        ) else { return }
-                        scrollToLatest(using: proxy)
-                    }
-                }
-                .onChange(of: appState.chatTranscriptRevision) { _, revision in
-                    if chatMessageScrollTargetCache.targets.map(\.message) != appState.messages {
-                        chatMessageScrollTargetCache.update(for: appState.messages)
-                    }
-                    renderedTranscriptRevision = revision
-                    renderedViewportTransitionGeneration = appState.chatViewportTransitionGeneration
-                }
-                .onChange(of: topVisibleChatID) { _, _ in
-                    // Persist the browsing position while the old transcript
-                    // is still rendered. A session switch clears messages in
-                    // the same main-actor turn, so waiting until the switch
-                    // callback would leave us with no anchor to save.
-                    saveChatScrollPosition(for: renderedScrollSessionKey)
-                }
-                .onChange(of: followsLatest) { _, _ in
-                    saveChatScrollPosition(for: renderedScrollSessionKey)
-                }
-                .onChange(of: appState.chatScrollRequest) { _, _ in
-                    invalidateChatDrag()
-                    cancelAutomaticRestoration()
-                    followsLatest = true
-                    scrollToLatest(using: proxy)
-                }
-                .onChange(of: appState.chatScrollToTopRequest) { _, request in
-                    invalidateChatDrag()
-                    cancelAutomaticRestoration()
-                    followsLatest = false
-                    scrollToTop(using: proxy, request: request)
-                }
-                .onChange(of: appState.activeSessionId) { oldSessionID, newSessionID in
-                    guard !appState.isOpeningNotificationSession else {
-                        invalidateChatDrag()
-                        scrollOwnerState.invalidateForSessionTransition()
-                        cancelAutomaticRestoration()
-                        notificationHandoffPending = true
-                        notificationHandoffSessionKey = activeScrollSessionKey
-                        notificationHandoffHasMeasuredLayout = false
-                        renderedScrollSessionKey = activeScrollSessionKey
-                        if followsLatest {
-                            renderedViewportTransitionGeneration = appState.chatViewportTransitionGeneration
-                        }
-                        return
-                    }
-                    let identity = appState.activeChatScrollSessionIdentity
-                    let oldKey = renderedScrollSessionKey ?? identity.key(for: oldSessionID)
-                    let newKey = activeScrollSessionKey
-                    if let request = appState.chatResumeRestorationRequest,
-                       !identity.areEquivalent(request.sessionKey, newKey) {
-                        cancelAutomaticRestoration()
-                    }
-                    let keysAreEquivalent = identity.areEquivalent(oldKey, newKey)
-                    if !keysAreEquivalent {
-                        invalidateChatDrag()
-                        scrollOwnerState.invalidateForSessionTransition()
-                    }
-                    renderedScrollSessionKey = newKey
-                    if followsLatest {
-                        renderedViewportTransitionGeneration = appState.chatViewportTransitionGeneration
-                    }
-                    guard !keysAreEquivalent else { return }
-                    topVisibleChatID = nil
-                    let shouldFollowLatest = ChatFollowLatestRelatchPolicy
-                        .shouldFollowLatestAfterTransition(isDragging: isDraggingChat)
-                    followsLatest = shouldFollowLatest
-                    if shouldFollowLatest {
-                        scrollToLatest(using: proxy)
-                    }
-                }
-                .onChange(of: appState.activeProfile) { _, _ in
-                    invalidateChatDrag()
-                    scrollOwnerState.invalidateForSessionTransition()
-                    let oldKey = renderedScrollSessionKey
-                    let newKey = activeScrollSessionKey
-                    if let request = appState.chatResumeRestorationRequest,
-                       request.sessionKey != newKey {
-                        cancelAutomaticRestoration()
-                    }
-                    topVisibleChatID = nil
-                    chatMessageScrollTargetCache = ChatMessageScrollTargetCache()
-                    chatMessageScrollTargetCache.update(for: appState.messages)
-                    renderedTranscriptRevision = appState.chatTranscriptRevision
-                    renderedScrollSessionKey = newKey
-                    if followsLatest {
-                        renderedViewportTransitionGeneration = appState.chatViewportTransitionGeneration
-                    }
-                    guard !appState.isOpeningNotificationSession else {
-                        notificationHandoffPending = true
-                        notificationHandoffSessionKey = newKey
-                        notificationHandoffHasMeasuredLayout = false
-                        followsLatest = false
-                        return
-                    }
-                    guard oldKey != newKey else { return }
-                    let shouldFollowLatest = ChatFollowLatestRelatchPolicy
-                        .shouldFollowLatestAfterTransition(isDragging: isDraggingChat)
-                    followsLatest = shouldFollowLatest
-                    if shouldFollowLatest {
-                        scrollToLatest(using: proxy)
-                    }
-                }
-                .onChange(of: appState.activeChatScrollSessionIdentity) { _, _ in
-                    guard !appState.isOpeningNotificationSession else { return }
-                    if let activeScrollSessionKey,
-                       appState.activeChatScrollSessionIdentity.areEquivalent(
-                           renderedScrollSessionKey,
-                           activeScrollSessionKey
-                    ) {
-                        renderedScrollSessionKey = activeScrollSessionKey
-                    }
-                }
-                .onChange(of: appState.isOpeningNotificationSession) { _, isOpening in
-                    if isOpening {
-                        invalidateChatDrag()
-                        scrollOwnerState.invalidateForSessionTransition()
-                        cancelAutomaticRestoration()
-                        notificationHandoffPending = true
-                        notificationHandoffSessionKey = nil
-                        notificationHandoffHasMeasuredLayout = false
-                        followsLatest = false
-                    } else {
-                        if notificationHandoffPending, notificationHandoffSessionKey == nil {
-                            notificationHandoffSessionKey = activeScrollSessionKey
-                            notificationHandoffHasMeasuredLayout = bottomMarkerMaxY != nil && scrollViewportMaxY != nil
-                        }
-                        finishNotificationHandoffIfReady(using: proxy)
-                    }
-                }
-                .onChange(of: appState.streamingText) { _, _ in
-                    if followsLatest && !hasPendingRestoration {
-                        proxy.scrollTo(bottomAnchor, anchor: .bottom)
-                    }
-                }
-                .onChange(of: appState.isBusy) { _, isBusy in
-                    if !isBusy, followsLatest, !hasPendingRestoration {
-                        scrollToLatest(using: proxy)
-                    }
-                }
-                .simultaneousGesture(chatDragGesture)
-                .overlay(alignment: .bottomTrailing) {
-                    if !followsLatest && !isNearBottom {
-                        Button {
-                            cancelAutomaticRestoration()
-                            followsLatest = true
-                            scrollToLatest(using: proxy)
-                        } label: {
-                            Image(systemName: "arrow.down")
-                                .font(.system(size: 15, weight: .bold))
-                                .frame(width: 44, height: 44)
-                        }
-                        .conduitGlassControl(cornerRadius: 22, tint: .conduitAccent.opacity(0.14))
-                        .accessibilityLabel("Scroll to latest message")
-                        .padding(.trailing, 18)
-                        .padding(.bottom, 14)
-                    }
-                }
+                )
             }
 
             // Composer + control bar
             ComposerBar()
         }
+        .environment(\.chatTextSize, chatTextSize)
         .background(Color.clear)
         .overlay(alignment: .top) {
             if appState.isOpeningNotificationSession {
@@ -469,9 +230,364 @@ struct ChatView: View {
         }
     }
 
+    // MARK: - Scroll construction (layered so the type-checker can cope)
+
+    private func chatScrollView(proxy: ScrollViewProxy) -> some View {
+        ScrollView {
+            LazyVStack(spacing: 18) {
+                Color.clear
+                    .frame(height: 1)
+                    .id(topAnchor)
+
+                if transcriptBackfillAvailable {
+                    transcriptTopBackfillControl
+                }
+
+                if appState.messages.isEmpty {
+                    EmptyChatState().padding(.top, 60)
+                }
+
+                // Iterate the targets collection directly: wrapping it in
+                // Array(enumerated()) copied the entire transcript into a
+                // fresh tuple array on EVERY body evaluation — O(message
+                // count) allocation churn at streaming/reasoning cadence in
+                // deep sessions. Row identity (target.id) and the transcript
+                // order needed by row geometry (target.order, maintained by
+                // the scroll-target cache) are unchanged.
+                ForEach(chatMessageScrollTargets) { target in
+                    MessageBubble(message: target.message, gatewayResolver: appState.gatewayMediaResolver)
+                        .id(target.id)
+                        .background {
+                            GeometryReader { geometry in
+                                Color.clear.preference(
+                                    key: ChatRenderedScrollTargetsPreferenceKey.self,
+                                    value: renderedScrollScope.map {
+                                        ChatRenderedScrollTargets.row(
+                                            semanticID: target.id,
+                                            scope: $0,
+                                            frame: geometry.frame(in: .global),
+                                            order: target.order
+                                        )
+                                    } ?? ChatRenderedScrollTargets()
+                                )
+                            }
+                        }
+                }
+
+                // Live reasoning renders from the projection, not the settled
+                // transcript: per-publish reasoning changes re-render only
+                // this card, never the ForEach data or the scroll-target
+                // cache. Chronology matches the pre-projection transcript —
+                // thinking streams at the tail, before the assistant answer.
+                if let segment = appState.liveReasoningSegment {
+                    ThinkingCard(
+                        message: ChatMessage(
+                            id: segment.id,
+                            role: .reasoning,
+                            content: segment.content,
+                            timestamp: segment.timestamp,
+                            author: appState.activeProfile
+                        )
+                    )
+                    .id(segment.id)
+                }
+
+                if !appState.streamingText.isEmpty {
+                    StreamingBubble(
+                        text: appState.streamingText,
+                        active: appState.isBusy
+                    )
+                    .id("streaming")
+                }
+
+                if appState.isBusy && appState.streamingText.isEmpty {
+                    TypingIndicator().id("typing")
+                }
+
+                // Keep the scroll target in the lazy layout itself.
+                // A notification can replace the entire transcript at
+                // once; a sibling target can otherwise be measured
+                // against stale content while LazyVStack catches up.
+                Color.clear
+                    .frame(height: 1)
+                    .padding(.bottom, 126)
+                    .id(bottomAnchor)
+                    .background {
+                        GeometryReader { _ in
+                            Color.clear.preference(
+                                key: ChatRenderedScrollTargetsPreferenceKey.self,
+                                value: renderedScrollScope.map {
+                                    ChatRenderedScrollTargets.bottom(
+                                        anchorID: bottomAnchor,
+                                        scope: $0
+                                    )
+                                } ?? ChatRenderedScrollTargets()
+                            )
+                        }
+                    }
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 18)
+            .background {
+                // Measure the lazy stack itself, not its final child.
+                // SwiftUI can unload that child after the user scrolls
+                // away, leaving the old "at bottom" value stuck and
+                // suppressing the scroll-to-latest button.
+                GeometryReader { geometry in
+                    Color.clear
+                        .preference(
+                            key: ChatBottomMarkerPreferenceKey.self,
+                            value: geometry.frame(in: .global).maxY
+                        )
+                        .preference(
+                            key: ChatRenderedScrollContentPreferenceKey.self,
+                            value: renderedScrollScope.map(ChatRenderedScrollContent.init(scope:))
+                        )
+                }
+            }
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .onTapGesture {
+            UIApplication.shared.sendAction(
+                #selector(UIResponder.resignFirstResponder),
+                to: nil,
+                from: nil,
+                for: nil
+            )
+        }
+        .background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: ChatViewportFramePreferenceKey.self,
+                    value: geometry.frame(in: .global)
+                )
+            }
+        }
+        .simultaneousGesture(chatDragGesture(proxy: proxy))
+        .overlay(alignment: .bottomTrailing) {
+            if !followsLatest && !isNearBottom {
+                Button {
+                    ChatViewportTrace.shared.log("event explicitLatest (button)")
+                    performViewportEffects(
+                        viewport.explicitLatestRequested(),
+                        using: proxy
+                    )
+                } label: {
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: 15, weight: .bold))
+                        .frame(width: 44, height: 44)
+                }
+                .conduitGlassControl(cornerRadius: 22, tint: .conduitAccent.opacity(0.14))
+                .accessibilityLabel("Scroll to latest message")
+                .padding(.trailing, 18)
+                .padding(.bottom, 14)
+            }
+        }
+    }
+
+    private func lifecycleObservers(proxy: ScrollViewProxy, content: some View) -> some View {
+        content
+            .onAppear {
+                performViewportEffects(
+                    viewport.renderedSessionChanged(
+                        to: activeScrollSessionKey,
+                        identity: appState.activeChatScrollSessionIdentity,
+                        viaNotification: false,
+                        viewportTransitionGeneration: appState.chatViewportTransitionGeneration
+                    ),
+                    using: proxy
+                )
+                performViewportEffects(
+                    viewport.transcriptChanged(
+                        messages: appState.messages,
+                        transcriptRevision: appState.chatTranscriptRevision,
+                        viewportTransitionGeneration: appState.chatViewportTransitionGeneration,
+                        isInitialSync: true
+                    ),
+                    using: proxy
+                )
+                appState.installChatViewportSnapshotProvider(
+                    id: viewportSnapshotProviderID,
+                    capture: {
+                        // @State reads through the captured view struct see
+                        // current values (State storage is a reference box).
+                        self.viewport.renderedViewportSnapshot()
+                    }
+                )
+            }
+            .onDisappear {
+                performViewportEffects(viewport.viewDisappeared(), using: proxy)
+                backfillViewportTask?.cancel()
+                appState.removeChatViewportSnapshotProvider(id: viewportSnapshotProviderID)
+            }
+            .task(id: appState.chatResumeRestorationRequest?.generation) {
+                guard let request = appState.chatResumeRestorationRequest else { return }
+                await runViewportRestoration(request, using: proxy)
+            }
+            .onPreferenceChange(ChatBottomMarkerPreferenceKey.self) { value in
+                bottomMarkerMaxY = value
+                // Facts first: the handoff readiness decision reads the
+                // controller's geometry copy, so it must see this tick.
+                performViewportEffects(
+                    viewport.layoutMetricsChanged(facts: currentLayoutFacts()),
+                    using: proxy
+                )
+                recordNotificationHandoffLayout()
+                finishNotificationHandoffIfReady(using: proxy)
+            }
+            .onPreferenceChange(ChatViewportFramePreferenceKey.self) { value in
+                scrollViewportFrame = value
+                performViewportEffects(
+                    viewport.layoutMetricsChanged(facts: currentLayoutFacts()),
+                    using: proxy
+                )
+                recordNotificationHandoffLayout()
+                finishNotificationHandoffIfReady(using: proxy)
+            }
+            .onPreferenceChange(ChatRenderedScrollContentPreferenceKey.self) { value in
+                renderedScrollContent = value
+                guard let value else { return }
+                appState.chatViewportLayoutDidSettle(
+                    sessionKey: value.scope.sessionKey,
+                    transitionGeneration: value.scope.viewportTransitionGeneration,
+                    transcriptRevision: value.scope.transcriptRevision,
+                    renderRevision: value.scope.cacheRevision,
+                    receivedScopedPreference: true
+                )
+            }
+            .onPreferenceChange(ChatRenderedScrollTargetsPreferenceKey.self) { value in
+                renderedScrollTargets = value
+                performViewportEffects(
+                    viewport.layoutMetricsChanged(facts: currentLayoutFacts()),
+                    using: proxy
+                )
+            }
+            .onChange(of: isDraggingChat) { wasDragging, isDragging in
+                guard wasDragging, !isDragging else { return }
+                performViewportEffects(viewport.userDragGestureEnded(), using: proxy)
+            }
+            .onChange(of: viewport.pendingFollowCorrection) { _, pending in
+                // The coalesced follow-correction executor: the controller
+                // scheduled (state changed) from a geometry preference
+                // callback; SwiftUI delivers this observer on the update
+                // turn that change created — after the layout pass, riding
+                // its transaction, at most once per pending token.
+                guard let pending else { return }
+                executePendingFollowCorrection(pending, using: proxy)
+            }
+    }
+
+    private func transcriptObservers(proxy: ScrollViewProxy, content: some View) -> some View {
+        content
+            .onChange(of: appState.messages) { _, _ in
+                performViewportEffects(
+                    viewport.transcriptChanged(
+                        messages: appState.messages,
+                        transcriptRevision: appState.chatTranscriptRevision,
+                        viewportTransitionGeneration: appState.chatViewportTransitionGeneration,
+                        activeSessionKey: activeScrollSessionKey,
+                        isOpeningNotificationSession: appState.isOpeningNotificationSession
+                    ),
+                    using: proxy
+                )
+            }
+            .onChange(of: appState.chatResumeRestorationRequest) { oldRequest, newRequest in
+                guard oldRequest != nil, newRequest == nil else { return }
+                // The published request disappeared on the AppState side
+                // (completed/abandoned/cancelled elsewhere).
+                performViewportEffects(
+                    viewport.restorationSystemCancelled(),
+                    using: proxy
+                )
+            }
+            .onChange(of: followsLatest) { _, _ in
+                saveChatScrollPosition(for: renderedScrollSessionKey)
+            }
+    }
+
+    private func sessionObservers(proxy: ScrollViewProxy, content: some View) -> some View {
+        content
+            .onChange(of: appState.chatScrollRequest) { _, _ in
+                ChatViewportTrace.shared.log("event explicitLatest (send pulse)")
+                performViewportEffects(viewport.explicitLatestRequested(), using: proxy)
+            }
+            .onChange(of: appState.chatScrollToTopRequest) { _, request in
+                ChatViewportTrace.shared.log("event explicitTop request=\(request)")
+                performViewportEffects(
+                    viewport.explicitTopRequested(request: request),
+                    using: proxy
+                )
+            }
+            .onChange(of: appState.activeSessionId) { _, _ in
+                ChatViewportTrace.shared.log(
+                    "event sessionChanged viaNotification=\(appState.isOpeningNotificationSession)"
+                )
+                performViewportEffects(
+                    viewport.renderedSessionChanged(
+                        to: activeScrollSessionKey,
+                        identity: appState.activeChatScrollSessionIdentity,
+                        viaNotification: appState.isOpeningNotificationSession,
+                        viewportTransitionGeneration: appState.chatViewportTransitionGeneration
+                    ),
+                    using: proxy
+                )
+            }
+            .onChange(of: appState.activeProfile) { _, _ in
+                ChatViewportTrace.shared.log(
+                    "event profileChanged viaNotification=\(appState.isOpeningNotificationSession)"
+                )
+                // Mirror-only transcript sync: the session-change event below
+                // owns the single follow scroll for a real switch, so a
+                // profile change cannot emit a duplicate latest command.
+                performViewportEffects(
+                    viewport.transcriptChanged(
+                        messages: appState.messages,
+                        transcriptRevision: appState.chatTranscriptRevision,
+                        viewportTransitionGeneration: appState.chatViewportTransitionGeneration,
+                        isInitialSync: true,
+                        activeSessionKey: activeScrollSessionKey,
+                        isOpeningNotificationSession: appState.isOpeningNotificationSession
+                    ),
+                    using: proxy
+                )
+                performViewportEffects(
+                    viewport.renderedSessionChanged(
+                        to: activeScrollSessionKey,
+                        identity: appState.activeChatScrollSessionIdentity,
+                        viaNotification: appState.isOpeningNotificationSession,
+                        viewportTransitionGeneration: appState.chatViewportTransitionGeneration
+                    ),
+                    using: proxy
+                )
+            }
+            .onChange(of: appState.activeChatScrollSessionIdentity) { _, _ in
+                performViewportEffects(
+                    viewport.activeIdentityRefreshed(
+                        identity: appState.activeChatScrollSessionIdentity,
+                        key: activeScrollSessionKey
+                    ),
+                    using: proxy
+                )
+            }
+            .onChange(of: appState.isOpeningNotificationSession) { _, isOpening in
+                if isOpening {
+                    ChatViewportTrace.shared.log("event notificationHandoffBegan")
+                    performViewportEffects(
+                        viewport.notificationHandoffBegan(destination: nil),
+                        using: proxy
+                    )
+                } else {
+                    performViewportEffects(
+                        viewport.notificationHandoffDestinationReady(activeKey: activeScrollSessionKey),
+                        using: proxy
+                    )
+                }
+            }
+    }
+
     private func saveChatScrollPosition(for preferredKey: ChatScrollSessionKey? = nil) {
         let currentKey = preferredKey ?? renderedScrollSessionKey ?? activeScrollSessionKey
-        guard let sessionKey = ChatFollowLatestRelatchPolicy.persistenceSessionKey(
+        guard let sessionKey = ChatViewportPersistenceSupport.persistenceSessionKey(
             currentKey: currentKey,
             identity: appState.activeChatScrollSessionIdentity
         ) else { return }
@@ -480,356 +596,273 @@ struct ChatView: View {
     }
 
     private func currentChatViewportSnapshot() -> ChatScrollSnapshot? {
-        ChatTitleScrollViewportSnapshot.make(
-            followsLatest: followsLatest,
-            topVisibleID: topVisibleChatID,
-            topAnchorID: renderedTopAnchor,
-            targets: chatMessageScrollTargetCache.targets
-        )
+        viewport.renderedViewportSnapshot()?.snapshot
     }
 
     private func cancelAutomaticRestoration() {
         appState.cancelChatResumeRestoration()
     }
 
-    private var chatDragGesture: some Gesture {
+    private func chatDragGesture(proxy: ScrollViewProxy) -> some Gesture {
         DragGesture(minimumDistance: 3)
             .updating($isDraggingChat) { _, isDragging, _ in
                 isDragging = true
             }
             .onChanged { _ in
-                beginChatDragIfNeeded()
+                beginChatDragIfNeeded(using: proxy)
             }
     }
 
-    private func beginChatDragIfNeeded() {
-        // Only a deliberate user drag opts out of stream following. Capturing
-        // here preserves the session and transition that owned the gesture.
-        guard chatDragLifecycle.begin(
-            sessionKey: renderedScrollSessionKey ?? activeScrollSessionKey,
-            viewportTransitionGeneration: appState.chatViewportTransitionGeneration
-        ) else { return }
-        scrollOwnerState.invalidateForUserDrag()
-        chatDragCompletionToken = nil
-        cancelAutomaticRestoration()
-        followsLatest = false
-    }
-
-    @MainActor
-    private func completeChatDrag(_ completed: ChatDragCompletionToken) async {
-        await ChatFollowLatestRelatchPolicy.completeDragAfterNextTurn(
-            isCurrent: {
-                ChatFollowLatestRelatchPolicy.isCompletionCurrent(
-                    completed: completed,
-                    current: currentChatDragCompletionToken,
-                    identity: appState.activeChatScrollSessionIdentity,
-                    isDragging: isDraggingChat,
-                    hasPendingRestoration: hasPendingRestoration,
-                    hasNotificationHandoff: appState.isOpeningNotificationSession
-                        || notificationHandoffPending
-                )
-            },
-            relatch: { relatchFollowsLatestIfSettled() },
-            persist: {
-                saveChatScrollPosition(for: currentChatDragCompletionToken.sessionKey)
-                appState.flushChatResumeViewport()
-            }
-        )
-        guard !Task.isCancelled,
-              chatDragCompletionToken == completed else { return }
-        chatDragCompletionToken = nil
-    }
-
-    private var currentChatDragCompletionToken: ChatDragCompletionToken {
-        chatDragLifecycle.currentToken(
-            sessionKey: renderedScrollSessionKey ?? activeScrollSessionKey,
-            viewportTransitionGeneration: appState.chatViewportTransitionGeneration
+    private func beginChatDragIfNeeded(using proxy: ScrollViewProxy) {
+        // Only a deliberate user drag opts out of stream following; the
+        // controller captures the session and transition that owned the
+        // gesture and owns the completion lineage.
+        performViewportEffects(
+            viewport.userDragBegan(
+                sessionKey: renderedScrollSessionKey ?? activeScrollSessionKey,
+                viewportTransitionGeneration: appState.chatViewportTransitionGeneration
+            ),
+            using: proxy
         )
     }
 
-    private func invalidateChatDrag() {
-        chatDragLifecycle.invalidate(hasActiveGesture: isDraggingChat)
-        chatDragCompletionToken = nil
+    private func invalidateChatDrag(using proxy: ScrollViewProxy) {
+        performViewportEffects(
+            viewport.invalidateDrag(hasActiveGesture: isDraggingChat),
+            using: proxy
+        )
     }
 
-    private func abandonChatDrag() {
-        chatDragLifecycle.abandon()
-        chatDragCompletionToken = nil
+    private func abandonChatDrag(using proxy: ScrollViewProxy) {
+        performViewportEffects(viewport.abandonDrag(), using: proxy)
     }
 
+    /// Controller-driven restoration: the .task restarts whenever the
+    /// published request generation changes; each tick feeds the controller
+    /// current observations and executes its effects. Cancellation comes
+    /// from task identity (generation change / view teardown) or the
+    /// system-cancel onChange; identity drift cancels via the session-change
+    /// event. All retries are bounded inside the controller.
     @MainActor
-    private func applyChatResumeRestoration(
+    private func runViewportRestoration(
         _ request: ChatResumeRestorationRequest,
         using proxy: ScrollViewProxy
     ) async {
-        guard restorationRequestIsCurrent(request) else {
-            // If the generation is still current but identity drifted,
-            // abandon so pendingRestoration doesn't get stuck forever.
-            if appState.chatResumeRestorationRequest?.generation == request.generation {
-                appState.abandonChatResumeRestoration(generation: request.generation)
-            }
-            return
-        }
-        if chatMessageScrollTargetCache.targets.map(\.message) != appState.messages {
-            chatMessageScrollTargetCache.update(for: appState.messages)
-            renderedTranscriptRevision = appState.chatTranscriptRevision
-        }
-
-        var destination = restorationDestination(
-            for: request,
-            targets: chatMessageScrollTargetCache.targets
-        )
-        followsLatest = destination == .latest
-        var restoration = ChatResumeRenderRestorationState(
-            generation: request.generation,
-            sessionKey: request.sessionKey,
-            destination: destination
-        )
-
-        while restorationRequestIsCurrent(request) {
-            if chatMessageScrollTargetCache.targets.map(\.message) != appState.messages {
-                chatMessageScrollTargetCache.update(for: appState.messages)
-                renderedTranscriptRevision = appState.chatTranscriptRevision
-            }
-            destination = restorationDestination(
-                for: request,
-                targets: chatMessageScrollTargetCache.targets
-            )
-            restoration.updateDestination(destination)
-
-            switch restoration.nextAction(
+        performViewportEffects(viewport.restorationRequested(request), using: proxy)
+        while !Task.isCancelled, viewport.restorationIsActive {
+            let effects = viewport.restorationTick(
+                messages: appState.messages,
+                transcriptRevision: appState.chatTranscriptRevision,
+                viewportTransitionGeneration: appState.chatViewportTransitionGeneration,
                 renderedContent: renderedScrollContent,
                 installedTargets: renderedScrollTargets,
-                cacheRevision: chatMessageScrollTargetCache.renderingRevision,
-                transcriptRevision: appState.chatTranscriptRevision,
-                topVisibleID: topVisibleChatID,
-                isNearBottom: bottomMarkerMaxY != nil
-                    && scrollViewportMaxY != nil
-                    && isNearBottom
-            ) {
-            case .wait:
-                break
-            case .scroll(let destination):
-                guard restorationRequestIsCurrent(request) else { return }
-                var transaction = Transaction()
-                transaction.animation = nil
-                withTransaction(transaction) {
-                    switch destination {
-                    case .latest:
-                        followsLatest = true
-                        proxy.scrollTo(bottomAnchor, anchor: .bottom)
-                    case .anchor(let anchor):
-                        followsLatest = false
-                        proxy.scrollTo(anchor, anchor: .top)
-                    }
-                }
-            case .complete:
-                guard restorationRequestIsCurrent(request) else { return }
-                appState.completeChatResumeRestoration(generation: request.generation)
-                if destination == .latest {
-                    saveChatScrollPosition(for: request.sessionKey)
-                }
-                return
-            case .abandon:
-                guard restorationRequestIsCurrent(request) else { return }
-                appState.abandonChatResumeRestoration(generation: request.generation)
-                return
-            case .cancelled:
-                return
-            }
-
+                topVisibleID: viewport.stableTopMessageID,
+                isNearBottom: viewport.isNearBottom
+            )
+            performViewportEffects(effects, using: proxy)
+            guard viewport.restorationIsActive else { return }
             do {
                 try await Task.sleep(for: .milliseconds(25))
             } catch {
-                restoration.cancel()
                 return
-            }
-        }
-
-        // Loop exited because restorationRequestIsCurrent returned false.
-        // If the generation is still current but identity drifted mid-loop,
-        // abandon so pendingRestoration doesn't get stuck forever.
-        if appState.chatResumeRestorationRequest?.generation == request.generation {
-            appState.abandonChatResumeRestoration(generation: request.generation)
-        }
-    }
-
-    private func restorationDestination(
-        for request: ChatResumeRestorationRequest,
-        targets: [ChatMessageScrollTarget]
-    ) -> ChatResumeViewportDestination {
-        switch request.destination {
-        case .latest:
-            return .latest
-        case .snapshot(let snapshot):
-            // The resolver returns semantic anchor IDs, but rows are now
-            // keyed by message.id (.id(target.id)). Resolve the semantic
-            // anchor to its source message.id so the entire restoration
-            // state machine operates in one identity space.
-            let resolved = ChatResumeViewportResolver.destination(
-                for: snapshot,
-                availableTargets: ChatScrollTargetAvailability(targets: targets)
-            )
-            switch resolved {
-            case .latest:
-                return .latest
-            case .anchor(let semanticAnchor):
-                let sourceAnchor = targets.first { $0.semanticID == semanticAnchor }?.id ?? semanticAnchor
-                return .anchor(sourceAnchor)
-            }
-        }
-    }
-
-    private func restorationRequestIsCurrent(
-        _ request: ChatResumeRestorationRequest
-    ) -> Bool {
-        guard !Task.isCancelled,
-              appState.chatResumeRestorationRequest?.generation == request.generation else {
-            return false
-        }
-        let identity = appState.activeChatScrollSessionIdentity
-        return identity.areEquivalent(request.sessionKey, activeScrollSessionKey)
-    }
-
-    private func scrollToLatest(using proxy: ScrollViewProxy) {
-        guard !hasPendingRestoration else { return }
-        let ownerToken = scrollOwnerState.claimLatest()
-        let anchorID = bottomAnchor
-        withAnimation(ConduitMotion.response) {
-            proxy.scrollTo(anchorID, anchor: .bottom)
-        }
-        // Retry after a short delay: proxy.scrollTo is a silent no-op if the
-        // bottom anchor row isn't materialized yet (LazyVStack on a long
-        // transcript). A single delayed retry covers the common case where
-        // messages arrive on the same main-actor turn.
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(150))
-            guard let retryAnchor = scrollOwnerState.latestRetryAnchor(
-                for: ownerToken,
-                currentAnchor: bottomAnchor,
-                followsLatest: followsLatest,
-                hasPendingRestoration: hasPendingRestoration,
-                isCancelled: Task.isCancelled
-            ) else { return }
-            withAnimation(ConduitMotion.response) {
-                proxy.scrollTo(retryAnchor, anchor: .bottom)
-            }
-        }
-    }
-
-    private func scrollToTop(using proxy: ScrollViewProxy, request: Int) {
-        let ownerToken = scrollOwnerState.claimTop(request: request)
-        let anchorID = topAnchor
-        var transaction = Transaction()
-        transaction.animation = nil
-        withTransaction(transaction) {
-            proxy.scrollTo(anchorID, anchor: .top)
-        }
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(150))
-            guard let retryAnchor = scrollOwnerState.topRetryAnchor(
-                for: ownerToken,
-                currentRequest: appState.chatScrollToTopRequest,
-                currentAnchor: topAnchor,
-                isCancelled: Task.isCancelled
-            ) else { return }
-            var transaction = Transaction()
-            transaction.animation = nil
-            withTransaction(transaction) {
-                proxy.scrollTo(retryAnchor, anchor: .top)
             }
         }
     }
 
     /// A notification handoff completes only after the destination transcript
-    /// has emitted its own geometry. This is a layout fact rather than a timer,
-    /// so a long lazy transcript cannot inherit the old conversation's offset.
+    /// has emitted its own geometry. This is a layout fact rather than a
+    /// timer, so a long lazy transcript cannot inherit the old conversation's
+    /// offset. The controller owns the handoff state; these helpers feed it
+    /// facts and ask for the completion decision.
     private func recordNotificationHandoffLayout() {
-        guard notificationHandoffPending,
+        guard viewport.notificationHandoffAwaitingLayout,
+              let handoffKey = viewport.notificationHandoff?.sessionKey,
               appState.activeChatScrollSessionIdentity.areEquivalent(
-                notificationHandoffSessionKey,
+                handoffKey,
                 activeScrollSessionKey
               ),
               bottomMarkerMaxY != nil,
               scrollViewportMaxY != nil else { return }
-        notificationHandoffHasMeasuredLayout = true
+        _ = viewport.notificationHandoffLayoutMeasured()
     }
 
     private func finishNotificationHandoffIfReady(using proxy: ScrollViewProxy) {
-        guard notificationHandoffPending,
-              !appState.isOpeningNotificationSession,
-              appState.activeChatScrollSessionIdentity.areEquivalent(
-                notificationHandoffSessionKey,
-                activeScrollSessionKey
-              ),
-              notificationHandoffHasMeasuredLayout else { return }
-        notificationHandoffPending = false
-        notificationHandoffSessionKey = nil
-        cancelAutomaticRestoration()
-        let shouldFollowLatest = ChatFollowLatestRelatchPolicy
-            .shouldFollowLatestAfterTransition(isDragging: isDraggingChat)
-        switch scrollOwnerState.handoffCompletionAction(
-            currentTopRequest: appState.chatScrollToTopRequest,
-            currentTopAnchor: topAnchor,
-            shouldFollowLatest: shouldFollowLatest
-        ) {
-        case .top:
-            followsLatest = false
-            // The handoff completes once the destination's bottom-marker
-            // geometry arrives, but the lazy top anchor may not be laid out
-            // yet. Use the retry-capable path so the viewport still lands at
-            // the top once the anchor materializes.
-            scrollToTop(using: proxy, request: appState.chatScrollToTopRequest)
-        case .latest:
-            followsLatest = true
-            _ = scrollOwnerState.claimLatest()
-            var transaction = Transaction()
-            transaction.animation = nil
-            withTransaction(transaction) {
-                proxy.scrollTo(bottomAnchor, anchor: .bottom)
+        guard !appState.isOpeningNotificationSession else { return }
+        performViewportEffects(
+            viewport.notificationHandoffDestinationReady(activeKey: activeScrollSessionKey),
+            using: proxy
+        )
+    }
+
+    // MARK: - Viewport controller wiring
+
+    private func currentLayoutFacts() -> ChatViewportLayoutFacts {
+        let scope = renderedScrollScope
+        let frames = renderedRowFrames.map { id, geometry in
+            ChatRenderedRowFrame(
+                id: id,
+                minY: geometry.frame.minY,
+                maxY: geometry.frame.maxY,
+                order: geometry.order,
+                scope: scope ?? ChatRenderedScrollScope(
+                    sessionKey: activeOrFallbackScrollSessionKey,
+                    cacheRevision: 0,
+                    restorationGeneration: nil,
+                    transcriptRevision: 0,
+                    viewportTransitionGeneration: 0
+                )
+            )
+        }
+        return ChatViewportLayoutFacts(
+            bottomMarkerMaxY: bottomMarkerMaxY,
+            viewportMinY: scrollViewportMinY,
+            viewportMaxY: scrollViewportMaxY,
+            rowFrames: frames,
+            renderedScope: scope,
+            timestamp: CFAbsoluteTimeGetCurrent()
+        )
+    }
+
+    /// The ONLY boundary that executes viewport effects. `runScroll` is the
+    /// only place in ChatView that calls ScrollViewProxy.scrollTo.
+    @MainActor
+    private func performViewportEffects(
+        _ effects: [ChatViewportEffect],
+        using proxy: ScrollViewProxy
+    ) {
+        for effect in effects {
+            performViewportEffect(effect, using: proxy)
+        }
+    }
+
+    @MainActor
+    private func performViewportEffect(
+        _ effect: ChatViewportEffect,
+        using proxy: ScrollViewProxy
+    ) {
+        switch effect {
+        case .scroll(let command):
+            executeViewportScrollCommand(command, using: proxy)
+        case .cancelAutomaticRestoration:
+            appState.cancelChatResumeRestoration()
+        case .persistViewportSnapshot(let key):
+            saveChatScrollPosition(for: key)
+        case .flushViewportPersistence:
+            appState.flushChatResumeViewport()
+        case .completeRestoration(let generation):
+            appState.completeChatResumeRestoration(generation: generation)
+        case .abandonRestoration(let generation):
+            appState.abandonChatResumeRestoration(generation: generation)
+        case .scheduleDragEvaluation(let token):
+            Task { @MainActor in
+                await ChatViewportPersistenceSupport.waitForNextMainActorTurn()
+                guard !Task.isCancelled else { return }
+                ChatViewportTrace.shared.log(
+                    "drag completion evaluate gen=\(token.dragGeneration)"
+                )
+                performViewportEffects(
+                    viewport.evaluateDragCompletion(
+                        token,
+                        viewportTransitionGeneration: appState.chatViewportTransitionGeneration
+                    ),
+                    using: proxy
+                )
             }
-        case .none:
-            followsLatest = false
+        case .scheduleFollowCorrection(let token):
+            ChatViewportTrace.shared.log(
+                "follow correction scheduled seq=\(token.sequence) gen=\(token.generation)"
+            )
+            // Executed by the pendingFollowCorrection observer below: the
+            // correction must ride the SwiftUI update turn that the
+            // scheduling state change already created — never its own
+            // MainActor task (a standalone task commits a separate layout
+            // transaction, which re-materializes lazy rows the transcript
+            // fixtures measure), and never synchronously inside the geometry
+            // preference callback that scheduled it (that
+            // scrollTo → layout → preference → scrollTo loop is the
+            // ScrollViewCommitMutation watchdog storm).
+            break
         }
     }
 
-    private func updateBottomMarker(_ value: CGFloat?) {
-        bottomMarkerMaxY = value
-        relatchFollowsLatestIfSettled()
-    }
-
-    private func updateViewportBottom(_ value: CGFloat?) {
-        scrollViewportMaxY = value
-        relatchFollowsLatestIfSettled()
-    }
-
-    /// Geometry callbacks fire on every content-growth and scroll tick, so
-    /// they must not re-latch while the user's finger is still down: the drag
-    /// sets `followsLatest = false`, but until the finger travels past the
-    /// near-bottom window each streamed delta would yank the scroll back to
-    /// the bottom, fighting the drag.
-    private func relatchFollowsLatestIfSettled() {
-        if scrollOwnerState.hasActiveTopOwner(
-            currentRequest: appState.chatScrollToTopRequest
-        ) {
-            // A title tap pins the viewport near the top so the user can read
-            // back up the thread without streamed deltas yanking them to the
-            // bottom. Once they return near the bottom, hand ownership back to
-            // "latest" so auto-follow of new messages resumes instead of staying
-            // suppressed for the rest of the session. (A finger drag already
-            // clears this owner via beginChatDragIfNeeded; this covers the
-            // non-drag paths, e.g. short conversations where top ≈ bottom.)
-            guard isNearBottom else { return }
-            scrollOwnerState.claimLatest()
+    /// Executes the coalesced bottom-follow correction on the update turn
+    /// that the controller's pending-correction state change created. This
+    /// is the ONLY place a follow correction scrolls. MainActor-isolated to
+    /// match the neighboring scroll-execution entry points: it mutates
+    /// viewport state, writes the trace ring, and drives ScrollViewProxy.
+    @MainActor
+    private func executePendingFollowCorrection(
+        _ token: ChatFollowCorrectionToken,
+        using proxy: ScrollViewProxy
+    ) {
+        if let armed = armedAnimatedBottomRetry {
+            // An animated bottom command is still in flight with its own
+            // retry armed; a correction now would fight the animation. Drop
+            // this cycle — genuinely new growth schedules a fresh one.
+            ChatViewportTrace.shared.log(
+                "follow correction skipped, animated retry armed gen=\(armed.generation)"
+            )
+            _ = viewport.followCorrectionDue(token)
+            return
         }
-        if ChatFollowLatestRelatchPolicy.shouldRelatch(
-            isNearBottom: isNearBottom,
-            hasPendingRestoration: hasPendingRestoration,
-            hasNotificationHandoff: appState.isOpeningNotificationSession
-                || notificationHandoffPending,
-            isDragging: isDraggingChat
-        ) {
-            followsLatest = true
+        ChatViewportTrace.shared.log(
+            "follow correction due gen=\(token.generation)"
+        )
+        performViewportEffects(
+            viewport.followCorrectionDue(token),
+            using: proxy
+        )
+    }
+
+    @MainActor
+    private func executeViewportScrollCommand(
+        _ command: ChatViewportCommand,
+        using proxy: ScrollViewProxy
+    ) {
+        // Immediate execution: the controller issued this command in the
+        // current turn, so it is current by construction. Only the delayed
+        // retry re-validates below.
+        runViewportScroll(command, using: proxy)
+        guard case .delayed(let milliseconds) = command.retry else { return }
+        if case .bottom = command.destination {
+            // Mark the flight window: the retry disarms below, and follow
+            // corrections defer to the animation meanwhile.
+            armedAnimatedBottomRetry = command
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(milliseconds))
+            if armedAnimatedBottomRetry == command {
+                armedAnimatedBottomRetry = nil
+            }
+            guard !Task.isCancelled, viewport.isCommandCurrent(command) else { return }
+            ChatViewportTrace.shared.log(
+                "scroll retry \(command.destination) gen=\(command.generation)"
+            )
+            runViewportScroll(command, using: proxy)
+        }
+    }
+
+    @MainActor
+    private func runViewportScroll(
+        _ command: ChatViewportCommand,
+        using proxy: ScrollViewProxy
+    ) {
+        ChatViewportTrace.shared.log(
+            "scroll \(command.destination) gen=\(command.generation) animated=\(command.animated)"
+        )
+        var transaction = Transaction()
+        transaction.animation = command.animated ? ConduitMotion.response : nil
+        withTransaction(transaction) {
+            switch command.destination {
+            case .bottom(let anchorID):
+                proxy.scrollTo(anchorID, anchor: .bottom)
+            case .top(let anchorID, _):
+                proxy.scrollTo(anchorID, anchor: .top)
+            case .message(let id):
+                proxy.scrollTo(id, anchor: .top)
+            case .prependAnchor(let id):
+                proxy.scrollTo(id, anchor: .top)
+            }
         }
     }
 }
@@ -837,105 +870,6 @@ struct ChatView: View {
 enum ChatTitleScrollAnchor {
     static func id(for sessionKey: ChatScrollSessionKey) -> String {
         "chat-top-\(sessionKey.profile)-\(sessionKey.sessionID)"
-    }
-}
-
-enum ChatScrollOwner: Equatable {
-    case latest
-    case explicitTop(request: Int)
-    case userDrag
-    case sessionTransition
-}
-
-struct ChatScrollOwnerToken: Equatable {
-    let generation: UInt64
-    let owner: ChatScrollOwner
-}
-
-enum ChatHandoffCompletionAction: Equatable {
-    case top(anchorID: String)
-    case latest
-    case none
-}
-
-struct ChatScrollOwnerState: Equatable {
-    private(set) var generation: UInt64 = 0
-    private(set) var owner: ChatScrollOwner = .latest
-
-    @discardableResult
-    mutating func claimLatest() -> ChatScrollOwnerToken {
-        advance(to: .latest)
-    }
-
-    @discardableResult
-    mutating func claimTop(request: Int) -> ChatScrollOwnerToken {
-        advance(to: .explicitTop(request: request))
-    }
-
-    mutating func invalidateForUserDrag() {
-        advance(to: .userDrag)
-    }
-
-    mutating func invalidateForSessionTransition() {
-        advance(to: .sessionTransition)
-    }
-
-    func hasActiveTopOwner(currentRequest: Int) -> Bool {
-        guard case .explicitTop(let request) = owner else { return false }
-        return request == currentRequest
-    }
-
-    func topRetryAnchor(
-        for token: ChatScrollOwnerToken,
-        currentRequest: Int,
-        currentAnchor: String,
-        isCancelled: Bool
-    ) -> String? {
-        guard !isCancelled,
-              token == currentToken,
-              hasActiveTopOwner(currentRequest: currentRequest) else {
-            return nil
-        }
-        return currentAnchor
-    }
-
-    func latestRetryAnchor(
-        for token: ChatScrollOwnerToken,
-        currentAnchor: String,
-        followsLatest: Bool,
-        hasPendingRestoration: Bool,
-        isCancelled: Bool
-    ) -> String? {
-        guard !isCancelled,
-              token == currentToken,
-              owner == .latest,
-              followsLatest,
-              !hasPendingRestoration else {
-            return nil
-        }
-        return currentAnchor
-    }
-
-    func handoffCompletionAction(
-        currentTopRequest: Int,
-        currentTopAnchor: String,
-        shouldFollowLatest: Bool
-    ) -> ChatHandoffCompletionAction {
-        if hasActiveTopOwner(currentRequest: currentTopRequest) {
-            return .top(anchorID: currentTopAnchor)
-        }
-        return shouldFollowLatest ? .latest : .none
-    }
-
-    private var currentToken: ChatScrollOwnerToken {
-        ChatScrollOwnerToken(generation: generation, owner: owner)
-    }
-
-    @discardableResult
-    private mutating func advance(to nextOwner: ChatScrollOwner) -> ChatScrollOwnerToken {
-        generation &+= 1
-        owner = nextOwner
-        return currentToken
     }
 }
 
@@ -986,9 +920,9 @@ private struct ChatBottomMarkerPreferenceKey: PreferenceKey {
     }
 }
 
-private struct ChatViewportBottomPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat? = nil
-    static func reduce(value: inout CGFloat?, nextValue: () -> CGFloat?) {
+private struct ChatViewportFramePreferenceKey: PreferenceKey {
+    static var defaultValue: CGRect? = nil
+    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
         value = nextValue() ?? value
     }
 }
@@ -1015,16 +949,27 @@ private struct ChatRenderedScrollTargetsPreferenceKey: PreferenceKey {
 }
 // MARK: - Message Bubble
 
+/// Routes a transcript row to its presentation. The expensive settled
+/// content of each row type lives behind an Equatable gate (see
+/// SettledAssistantMessageContent and friends) so a streaming publish —
+/// which re-creates every mounted row through this switch — cannot force
+/// settled Markdown presentation to re-evaluate.
 struct MessageBubble: View {
     let message: ChatMessage
+    let gatewayResolver: GatewayMediaDataURLResolver?
     @EnvironmentObject var appState: AppState
 
     var body: some View {
+        let _ = TranscriptPerf.note(.settledBubbleBody)
         switch message.role {
         case .user:
-            UserBubble(message: message)
+            UserBubble(message: message, gatewayResolver: gatewayResolver)
         case .assistant:
-            AssistantBubble(message: message)
+            AssistantBubble(
+                message: message,
+                readAloudController: appState.messageReadAloudController,
+                gatewayResolver: gatewayResolver
+            )
         case .reasoning:
             ThinkingCard(message: message)
         case .tool:
@@ -1048,19 +993,32 @@ struct MessageBubble: View {
                 SystemBubble(message: message)
             }
         case .partial:
-            AssistantBubble(message: message)
+            AssistantBubble(
+                message: message,
+                readAloudController: appState.messageReadAloudController,
+                gatewayResolver: gatewayResolver
+            )
         }
     }
 }
 
 struct UserBubble: View {
     let message: ChatMessage
+    let gatewayResolver: GatewayMediaDataURLResolver?
+    @Environment(\.sizeCategory) private var sizeCategory
+    @Environment(\.chatTextSize) private var chatTextSize
 
     var body: some View {
         HStack {
             Spacer(minLength: 40)
             VStack(alignment: .trailing, spacing: 4) {
-                UserMessageContent(message: message)
+                UserMessageContent(
+                    message: message,
+                    gatewayResolver: gatewayResolver,
+                    sizeCategory: sizeCategory,
+                    chatTextSize: chatTextSize
+                )
+                    .equatable()
 
                 MessageTimestampLabel(timestamp: message.timestamp)
                     .frame(maxWidth: .infinity, alignment: .trailing)
@@ -1069,8 +1027,27 @@ struct UserBubble: View {
     }
 }
 
-private struct UserMessageContent: View {
+/// Settled user-row content: Markdown plus attachment previews. Equatable
+/// over the message and the stable gateway resolver so streaming publishes
+/// cannot re-evaluate it (same contract as
+/// SettledAssistantMessageContent). Internal (not private) so the gate
+/// contract is directly testable.
+struct UserMessageContent: View, Equatable {
     let message: ChatMessage
+    let gatewayResolver: GatewayMediaDataURLResolver?
+    /// Explicit Dynamic Type input — see SettledAssistantMessageContent.
+    let sizeCategory: ContentSizeCategory
+    /// Explicit chat text-size input (issue #85): a preference change must
+    /// re-open the gate and re-render, while ordinary streaming publishes —
+    /// which leave both explicit inputs equal — keep the isolation.
+    let chatTextSize: ChatTextSize
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message == rhs.message
+            && lhs.gatewayResolver === rhs.gatewayResolver
+            && lhs.sizeCategory == rhs.sizeCategory
+            && lhs.chatTextSize == rhs.chatTextSize
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -1081,7 +1058,7 @@ private struct UserMessageContent: View {
             if let attachments = message.attachments {
                 ForEach(attachments) { attachment in
                     if attachment.kind == .image {
-                        UserImageAttachmentPreview(attachment: attachment)
+                        UserImageAttachmentPreview(attachment: attachment, gatewayResolver: gatewayResolver)
                     } else {
                         UserDocumentAttachmentChip(attachment: attachment)
                     }
@@ -1108,8 +1085,9 @@ private struct UserMessageContent: View {
 }
 
 private struct UserImageAttachmentPreview: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let attachment: Attachment
-    @EnvironmentObject private var appState: AppState
+    let gatewayResolver: GatewayMediaDataURLResolver?
     @State private var gatewayImage: UIImage?
     @State private var gatewayLoadFailed = false
     @State private var localPreview: UIImage?
@@ -1199,7 +1177,7 @@ private struct UserImageAttachmentPreview: View {
                 loadingPlaceholder
             } else {
                 Label(
-                    (gatewayLoadFailed || localPreviewFailed) ? "Image unavailable" : "Image attached",
+                    (gatewayLoadFailed || localPreviewFailed) ? AppLocalization.string("Image unavailable") : AppLocalization.string("Image attached"),
                     systemImage: (gatewayLoadFailed || localPreviewFailed) ? "photo.badge.exclamationmark" : "photo"
                 )
                 .font(.caption.weight(.medium))
@@ -1209,7 +1187,7 @@ private struct UserImageAttachmentPreview: View {
                 .background(Color.white.opacity(0.13), in: Capsule())
             }
         }
-        .task(id: "\(attachment.uri)|\(appState.activeProfile)") {
+        .task(id: "\(attachment.uri)|\(gatewayResolver?.profile ?? "")") {
             // Local file: cache hits are already shown by `body` on the first
             // frame via `cachedLocalImage`, so only misses reach here. Decode
             // off the MainActor so a large photo can't hitch scrolling.
@@ -1230,13 +1208,10 @@ private struct UserImageAttachmentPreview: View {
                 // returns above, so a local URI never reaches here — which also
                 // removes the old `localImage == nil` check that decoded local
                 // files on the MainActor before short-circuiting.
-            } else if isGatewayImage {
+            } else if isGatewayImage, let gatewayResolver {
                 gatewayImage = nil
                 gatewayLoadFailed = false
-                guard let dataURL = await appState.gatewayMediaDataURL(
-                    for: attachment.uri,
-                    profile: appState.activeProfile
-                ),
+                guard let dataURL = await gatewayResolver.dataURL(for: attachment.uri),
                 !Task.isCancelled,
                 let image = image(fromDataURL: dataURL) else {
                     guard !Task.isCancelled else { return }
@@ -1303,10 +1278,38 @@ private struct UserDocumentAttachmentChip: View {
     }
 }
 
-struct AssistantBubble: View {
+/// The settled half of an assistant row: identity header, Markdown body,
+/// and code block. Equatable over immutable message presentation inputs so
+/// a streaming publish re-creating this view is a no-op (`.equatable()`
+/// skips body evaluation when inputs compare equal). Dynamic Type changes
+/// still invalidate through the `\.sizeCategory` environment read.
+struct SettledAssistantMessageContent: View, Equatable {
     let message: ChatMessage
-    @EnvironmentObject var appState: AppState
-    @State private var copied = false
+    let displayName: String
+    let avatarURL: URL?
+    let gatewayResolver: GatewayMediaDataURLResolver?
+    /// Explicit Dynamic Type input (read by the shell): equality describes
+    /// every visual input, so a category change re-opens the gate and
+    /// re-renders with fresh fonts (the Markdown render cache keys on the
+    /// content size category). Other presentation traits the subtree
+    /// consumes are render-time adaptive — color scheme resolves through
+    /// UIKit trait collections, layout direction through TextKit — and do
+    /// not require body re-evaluation.
+    let sizeCategory: ContentSizeCategory
+    /// Explicit chat text-size input (issue #85): equality describes every
+    /// typography input, so a preference change re-opens the gate and
+    /// re-renders (the render cache keys on the chat-size identity), while
+    /// unrelated streaming publishes — equal inputs — stay gated.
+    let chatTextSize: ChatTextSize
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message == rhs.message
+            && lhs.displayName == rhs.displayName
+            && lhs.avatarURL == rhs.avatarURL
+            && lhs.gatewayResolver === rhs.gatewayResolver
+            && lhs.sizeCategory == rhs.sizeCategory
+            && lhs.chatTextSize == rhs.chatTextSize
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1314,11 +1317,11 @@ struct AssistantBubble: View {
             // the full reading column instead of inheriting the avatar indent.
             HStack(spacing: 8) {
                 ConduitAgentMark(
-                    avatarURL: appState.profileAvatarURL(for: appState.activeProfile),
-                    displayName: appState.profileDisplayName(appState.activeProfile)
+                    avatarURL: avatarURL,
+                    displayName: displayName
                 )
 
-                Text(appState.profileDisplayName(appState.activeProfile))
+                Text(displayName)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
 
@@ -1329,8 +1332,8 @@ struct AssistantBubble: View {
             if !message.content.isEmpty {
                 MarkdownText(
                     source: message.content,
-                    gatewayMediaDataURL: { path in
-                        await appState.gatewayMediaDataURL(for: path, profile: appState.activeProfile)
+                    gatewayMediaDataURL: gatewayResolver.map { resolver in
+                        { path in await resolver.dataURL(for: path) }
                     }
                 )
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1340,38 +1343,44 @@ struct AssistantBubble: View {
                 ChatCodeBlock(source: code)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-
-            HStack(spacing: 4) {
-                Spacer(minLength: 0)
-
-                Button {
-                    copyResponse()
-                } label: {
-                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(width: 34, height: 34)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(copied ? Color.conduitAccent : Color.secondary)
-                .accessibilityLabel(copied ? "Response copied" : "Copy response")
-
-                Button {
-                    Haptics.medium()
-                    Task { await appState.branchFromAssistantMessage(message.id) }
-                } label: {
-                    Image(systemName: "arrow.triangle.branch")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(width: 34, height: 34)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .disabled(appState.isBusy || appState.isBranchingChat)
-                .opacity(appState.isBusy || appState.isBranchingChat ? 0.45 : 1)
-                .accessibilityLabel("Branch from this response")
-            }
-            .padding(.top, 2)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The dynamic half of an assistant row: copy/branch controls that depend
+/// on busy state, kept small so their per-publish re-evaluation is cheap.
+struct AssistantMessageActions: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    let message: ChatMessage
+    @EnvironmentObject private var appState: AppState
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            copyResponse()
+        } label: {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                .font(.subheadline.weight(.semibold))
+                .frame(width: 34, height: 34)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(copied ? Color.conduitAccent : Color.secondary)
+        .accessibilityLabel(copied ? AppLocalization.string("Response copied") : AppLocalization.string("Copy response"))
+
+        Button {
+            Haptics.medium()
+            Task { await appState.branchFromAssistantMessage(message.id) }
+        } label: {
+            Image(systemName: "arrow.triangle.branch")
+                .font(.subheadline.weight(.semibold))
+                .frame(width: 34, height: 34)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .disabled(appState.isBusy || appState.isBranchingChat)
+        .opacity(appState.isBusy || appState.isBranchingChat ? 0.45 : 1)
+        .accessibilityLabel("Branch from this response")
     }
 
     private func copyResponse() {
@@ -1386,13 +1395,101 @@ struct AssistantBubble: View {
     }
 }
 
+/// The read-aloud control surface. This is deliberately the ONLY part of
+/// an assistant row that observes the shared read-aloud controller, so a
+/// playback state transition re-renders a 34pt button instead of every
+/// response's Markdown in the transcript.
+struct ReadAloudButton: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    let message: ChatMessage
+    @ObservedObject var controller: MessageReadAloudController
+    @EnvironmentObject private var appState: AppState
+
+    private var isActive: Bool {
+        controller.isActiveMessage(message.id)
+    }
+
+    private var unavailable: Bool {
+        appState.readAloudUnavailableReason != nil
+    }
+
+    var body: some View {
+        Button {
+            if isActive {
+                Haptics.medium()
+            } else {
+                Haptics.light()
+            }
+            appState.toggleReadAloud(message: message)
+        } label: {
+            Group {
+                if case .preparing(let id) = controller.state, id == message.id {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: isActive ? "stop.fill" : "speaker.wave.2")
+                }
+            }
+            .font(.subheadline.weight(.semibold))
+            .frame(width: 34, height: 34)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(isActive ? Color.conduitAccent : Color.secondary)
+        .disabled(unavailable && !isActive)
+        .opacity(unavailable && !isActive ? 0.45 : 1)
+        .accessibilityLabel(isActive ? AppLocalization.string("Stop reading response") : AppLocalization.string("Read response aloud"))
+    }
+}
+
+struct AssistantBubble: View {
+    let message: ChatMessage
+    /// Held as a plain reference (not @ObservedObject): forwarding a
+    /// controller instance must not subscribe this whole bubble to every
+    /// read-aloud state transition. Only ReadAloudButton observes it.
+    let readAloudController: MessageReadAloudController
+    let gatewayResolver: GatewayMediaDataURLResolver?
+    @EnvironmentObject var appState: AppState
+    @Environment(\.sizeCategory) private var sizeCategory
+    @Environment(\.chatTextSize) private var chatTextSize
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SettledAssistantMessageContent(
+                message: message,
+                displayName: appState.profileDisplayName(appState.activeProfile),
+                avatarURL: appState.profileAvatarURL(for: appState.activeProfile),
+                gatewayResolver: gatewayResolver,
+                sizeCategory: sizeCategory,
+                chatTextSize: chatTextSize
+            )
+            .equatable()
+
+            HStack(spacing: 4) {
+                Spacer(minLength: 0)
+                AssistantMessageActions(message: message)
+
+                if message.role == .assistant {
+                    ReadAloudButton(message: message, controller: readAloudController)
+                }
+            }
+            .padding(.top, 2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 // MARK: - System Message (slash command output)
 
 struct SystemBubble: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let message: ChatMessage
 
     private var isRuntimeNotice: Bool {
-        MessageNormalizer.systemNoticeText(fromText: message.rawContent ?? message.content) != nil
+        // Rows Hermes projected onto the timeline via `display_kind` are
+        // runtime notices by construction, even though their projected text
+        // (e.g. "Resumed interrupted turn") matches no legacy marker.
+        message.displayKind != nil
+            || MessageNormalizer.systemNoticeText(fromText: message.rawContent ?? message.content) != nil
     }
 
     var body: some View {
@@ -1404,7 +1501,7 @@ struct SystemBubble: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
-                    Text(isRuntimeNotice ? "System" : "Command")
+                    Text(isRuntimeNotice ? AppLocalization.string("System") : AppLocalization.string("Command"))
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.conduitAccent)
                         .textCase(.uppercase)
@@ -1432,7 +1529,13 @@ struct SystemBubble: View {
     }
 }
 
+/// Review activity summary. Intentionally OUTSIDE the chat text-size
+/// preference (issue #85): these status/activity cards — like tool cards —
+/// are not ordinary transcript Markdown and keep their fixed typography.
+/// (Of the system-message surfaces, only `SystemBubble`'s Markdown body
+/// follows `ChatTypography`.)
 private struct ReviewSummaryCard: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let activity: ReviewActivity
     let timestamp: String
     @EnvironmentObject private var appState: AppState
@@ -1476,7 +1579,7 @@ private struct ReviewSummaryCard: View {
             }
             .buttonStyle(.plain)
             .disabled(details.isEmpty)
-            .accessibilityLabel(details.isEmpty ? activity.summary : (expanded ? "Collapse review details" : "Expand review details"))
+            .accessibilityLabel(details.isEmpty ? activity.summary : (expanded ? AppLocalization.string("Collapse review details") : AppLocalization.string("Expand review details")))
 
             if expanded, !details.isEmpty {
                 VStack(alignment: .leading, spacing: 12) {
@@ -1512,6 +1615,9 @@ private struct ReviewSummaryCard: View {
     }
 }
 
+/// Model-change summary. Intentionally OUTSIDE the chat text-size
+/// preference (issue #85) — a status/activity card with fixed typography;
+/// see ReviewSummaryCard.
 private struct ModelChangeSummaryCard: View {
     let model: String
     let provider: String
@@ -1551,41 +1657,76 @@ private struct ModelChangeSummaryCard: View {
     }
 }
 
+/// Settled reasoning-row content, gated the same way as assistant/user
+/// content: identical presentation inputs skip body evaluation during
+/// unrelated AppState publishes. Internal (not private) so the gate
+/// contract is directly testable.
+struct SettledThinkingCardContent: View, Equatable {
+    let message: ChatMessage
+    let displayName: String
+    let avatarURL: URL?
+    /// Explicit Dynamic Type input — see SettledAssistantMessageContent.
+    let sizeCategory: ContentSizeCategory
+    /// Explicit chat text-size input — see SettledAssistantMessageContent.
+    let chatTextSize: ChatTextSize
+    @State private var expanded = false
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message == rhs.message
+            && lhs.displayName == rhs.displayName
+            && lhs.avatarURL == rhs.avatarURL
+            && lhs.sizeCategory == rhs.sizeCategory
+            && lhs.chatTextSize == rhs.chatTextSize
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            ConduitAgentMark(
+                avatarURL: avatarURL,
+                displayName: displayName
+            )
+
+            DisclosureGroup(isExpanded: $expanded) {
+                SelectableTextView(
+                    text: message.content,
+                    font: ChatTypography.font(for: .thinking, chatSize: chatTextSize),
+                    textColor: .secondaryLabel
+                )
+                    .padding(.top, 4)
+            } label: {
+                HStack(spacing: 6) {
+                    Label("Thinking", systemImage: "brain.head.profile")
+                    MessageTimestampLabel(timestamp: message.timestamp)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            }
+            .tint(.conduitAccent)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .conduitGlassSurface(cornerRadius: 16, tint: .conduitAccent.opacity(0.06))
+
+            Spacer(minLength: 28)
+        }
+    }
+}
+
 struct ThinkingCard: View {
     let message: ChatMessage
     @EnvironmentObject var appState: AppState
-    @State private var expanded = false
+    @Environment(\.sizeCategory) private var sizeCategory
+    @Environment(\.chatTextSize) private var chatTextSize
 
     var body: some View {
         if appState.displayPreferences.showReasoning, !message.content.isEmpty {
-            HStack(alignment: .top, spacing: 10) {
-                ConduitAgentMark(
-                    avatarURL: appState.profileAvatarURL(for: appState.activeProfile),
-                    displayName: appState.profileDisplayName(appState.activeProfile)
-                )
-
-                DisclosureGroup(isExpanded: $expanded) {
-                    SelectableTextView(
-                        text: message.content,
-                        font: .preferredFont(forTextStyle: .callout),
-                        textColor: .secondaryLabel
-                    )
-                        .padding(.top, 4)
-                } label: {
-                    HStack(spacing: 6) {
-                        Label("Thinking", systemImage: "brain.head.profile")
-                        MessageTimestampLabel(timestamp: message.timestamp)
-                    }
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                }
-                .tint(.conduitAccent)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .conduitGlassSurface(cornerRadius: 16, tint: .conduitAccent.opacity(0.06))
-
-                Spacer(minLength: 28)
-            }
+            SettledThinkingCardContent(
+                message: message,
+                displayName: appState.profileDisplayName(appState.activeProfile),
+                avatarURL: appState.profileAvatarURL(for: appState.activeProfile),
+                sizeCategory: sizeCategory,
+                chatTextSize: chatTextSize
+            )
+            .equatable()
         }
     }
 }
@@ -1643,13 +1784,23 @@ enum MessageTimestampFormatter {
 
 // MARK: - Tool Card
 
-struct ToolCard: View {
+/// Settled tool-row content, gated on the message and expansion default so
+/// streaming publishes skip its SelectableTextView measurement work.
+private struct SettledToolCardContent: View, Equatable {
     let message: ChatMessage
+    let expandToolsByDefault: Bool
+    /// Explicit Dynamic Type input — see SettledAssistantMessageContent.
+    let sizeCategory: ContentSizeCategory
     @State private var expanded = false
-    @EnvironmentObject var appState: AppState
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message == rhs.message
+            && lhs.expandToolsByDefault == rhs.expandToolsByDefault
+            && lhs.sizeCategory == rhs.sizeCategory
+    }
 
     var body: some View {
-        if appState.displayPreferences.showToolProgress, let tool = message.tool {
+        if let tool = message.tool {
             VStack(alignment: .leading, spacing: 0) {
                 Button {
                     withAnimation(ConduitMotion.response) {
@@ -1708,7 +1859,7 @@ struct ToolCard: View {
                                     .font(.caption2.bold())
                                     .foregroundStyle(.tertiary)
                                 SelectableTextView(
-                                    text: Self.truncateForDisplay(input, maxLines: 500),
+                                    text: ToolCard.truncateForDisplay(input, maxLines: 500),
                                     font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular),
                                     textColor: .secondaryLabel,
                                     maximumNumberOfLines: 0
@@ -1722,7 +1873,7 @@ struct ToolCard: View {
                                     .font(.caption2.bold())
                                     .foregroundStyle(.tertiary)
                                 SelectableTextView(
-                                    text: Self.truncateForDisplay(output, maxLines: 500),
+                                    text: ToolCard.truncateForDisplay(output, maxLines: 500),
                                     font: .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular),
                                     textColor: .secondaryLabel,
                                     maximumNumberOfLines: 0
@@ -1738,7 +1889,7 @@ struct ToolCard: View {
             }
             .conduitGlassSurface(cornerRadius: 18, tint: tool.status == .running ? .conduitAccent.opacity(0.10) : .clear)
             .onAppear {
-                if appState.displayPreferences.expandToolsByDefault {
+                if expandToolsByDefault {
                     expanded = true
                 }
             }
@@ -1752,6 +1903,24 @@ struct ToolCard: View {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return preview.isEmpty ? nil : preview
     }
+}
+
+struct ToolCard: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    let message: ChatMessage
+    @EnvironmentObject var appState: AppState
+    @Environment(\.sizeCategory) private var sizeCategory
+
+    var body: some View {
+        if appState.displayPreferences.showToolProgress, message.tool != nil {
+            SettledToolCardContent(
+                message: message,
+                expandToolsByDefault: appState.displayPreferences.expandToolsByDefault,
+                sizeCategory: sizeCategory
+            )
+            .equatable()
+        }
+    }
 
     /// Limits tool output rendered in the non-scrolling SelectableTextView to
     /// avoid a single massive layout pass when expanding large command logs or
@@ -1760,19 +1929,60 @@ struct ToolCard: View {
     static func truncateForDisplay(_ text: String, maxLines: Int) -> String {
         let lines = text.components(separatedBy: "\n")
         guard lines.count > maxLines else { return text }
-        return lines.prefix(maxLines).joined(separator: "\n") + "\n… (\(lines.count - maxLines) more lines)"
+        return lines.prefix(maxLines).joined(separator: "\n") + AppLocalization.string("\n… (\(lines.count - maxLines) more lines)")
     }
 }
 
 // MARK: - Clarify Card
 
+/// Where the visible question text lives on one clarification card. The
+/// header always renders the returned text exactly once; rows render their
+/// own titles only in a batch, so a single question is never title-less and
+/// a batch summary is never duplicated.
+enum ClarifyCardLayout {
+    /// One question: the header carries the question itself and the row
+    /// renders controls only — the exact legacy clarify card layout.
+    case singleQuestion
+    /// Several questions: the header summarizes once and every row carries
+    /// its own question title.
+    case batch
+
+    init(questionCount: Int) {
+        self = questionCount > 1 ? .batch : .singleQuestion
+    }
+
+    /// Text rendered in the card header beneath the status title.
+    func headerText(for activity: ClarifyActivity) -> String {
+        switch self {
+        case .singleQuestion:
+            return activity.questions.first?.question ?? ""
+        case .batch:
+            return AppLocalization.string("Hermes asked \(activity.questions.count) questions before it can continue")
+        }
+    }
+
+    /// Whether a question row draws its own title line.
+    var rowsShowTitles: Bool {
+        switch self {
+        case .singleQuestion: return false
+        case .batch: return true
+        }
+    }
+}
+
 struct ClarifyCard: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let message: ChatMessage
     @EnvironmentObject var appState: AppState
-    @State private var customAnswer = ""
+    // Per-question draft state, keyed by the gateway qid: typed custom text
+    // and in-progress multi-select selections. Multi-select intentionally
+    // buffers locally — an RPC fires only on that question's confirm.
+    @State private var customAnswers: [String: String] = [:]
+    @State private var multiSelections: [String: Set<String>] = [:]
 
     var body: some View {
         if let clarify = message.clarify {
+            let layout = ClarifyCardLayout(questionCount: clarify.questions.count)
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
                     Image(systemName: "questionmark.bubble")
@@ -1783,7 +1993,7 @@ struct ClarifyCard: View {
                             .tracking(0.5)
                             .foregroundStyle(statusColor(for: clarify.status))
                         SelectableTextView(
-                            text: clarify.question,
+                            text: layout.headerText(for: clarify),
                             font: .preferredFont(forTextStyle: .subheadline).withTraits(.traitBold),
                             textColor: .label
                         )
@@ -1792,8 +2002,9 @@ struct ClarifyCard: View {
                     Spacer(minLength: 8)
                     if clarify.status == .submitting {
                         ProgressView().controlSize(.small)
-                    } else if clarify.status == .answered, clarify.answer != nil {
-                        // Only this device's accepted answer earns the check;
+                    } else if clarify.status == .answered,
+                              clarify.questions.contains(where: { $0.answer != nil }) {
+                        // Only an answer this device holds earns the check;
                         // an answered-elsewhere settle renders no checkmark so
                         // the header agrees with the body copy.
                         Image(systemName: "checkmark.circle.fill")
@@ -1802,73 +2013,15 @@ struct ClarifyCard: View {
                     MessageTimestampLabel(timestamp: message.timestamp, tone: .supporting)
                 }
 
-                if clarify.status == .answered, let answer = clarify.answer {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("YOUR ANSWER")
-                            .font(.caption2.weight(.bold))
-                            .tracking(0.5)
-                            .foregroundStyle(.green)
-                        SelectableTextView(
-                            text: answer,
-                            font: .preferredFont(forTextStyle: .subheadline),
-                            textColor: .label
-                        )
-                    }
-                    .padding(12)
-                    .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                } else if clarify.status == .answered {
-                    // Answered elsewhere (relay 409): settled, but this device's
-                    // rejected text must not display as what Hermes received —
-                    // and the disabled controls should not linger either.
-                    Text("Answered on another device")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(clarify.choices) { choice in
-                        Button {
-                            send(choice.value, for: clarify)
-                        } label: {
-                            HStack {
-                                Text(choice.label)
-                                    .font(.body)
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.caption)
-                            }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .conduitGlassControl(cornerRadius: 14, tint: .conduitAccent.opacity(0.12))
-                            .foregroundStyle(.primary)
-                        }
-                        .disabled(!canRespond(clarify.status))
-                    }
-
-                    HStack(spacing: 8) {
-                        TextField(
-                            clarify.choices.isEmpty ? "Type your answer…" : "Something else…",
-                            text: $customAnswer,
-                            axis: .vertical
-                        )
-                        .lineLimit(1...4)
-                        .submitLabel(.send)
-                        .onSubmit { send(customAnswer, for: clarify) }
-                        .disabled(!canRespond(clarify.status))
-
-                        Button {
-                            send(customAnswer, for: clarify)
-                        } label: {
-                            Image(systemName: "arrow.up")
-                                .font(.subheadline.weight(.bold))
-                                .frame(width: 36, height: 36)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.white)
-                        .background(Color.orange, in: Circle())
-                        .disabled(customAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !canRespond(clarify.status))
-                        .opacity(customAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !canRespond(clarify.status) ? 0.45 : 1)
-                    }
-                    .padding(8)
-                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                ForEach(clarify.questions) { question in
+                    ClarifyQuestionRow(
+                        question: question,
+                        showsTitle: layout.rowsShowTitles,
+                        customAnswer: bindingForCustomAnswer(question),
+                        selection: bindingForSelection(question),
+                        onSend: { answer in send(answer, for: question, in: clarify) },
+                        onConfirmMultiSelect: { confirmMultiSelect(for: question, in: clarify) }
+                    )
                 }
 
                 if let error = clarify.error, !error.isEmpty {
@@ -1882,23 +2035,46 @@ struct ClarifyCard: View {
         }
     }
 
-    private func canRespond(_ status: ClarifyActivity.Status) -> Bool {
-        status == .pending || status == .error
+    private func bindingForCustomAnswer(_ question: ClarifyQuestion) -> Binding<String> {
+        Binding(
+            get: { customAnswers[question.id] ?? "" },
+            set: { customAnswers[question.id] = $0 }
+        )
     }
 
-    private func send(_ answer: String, for clarify: ClarifyActivity) {
+    private func bindingForSelection(_ question: ClarifyQuestion) -> Binding<Set<String>> {
+        Binding(
+            get: { multiSelections[question.id] ?? [] },
+            set: { multiSelections[question.id] = $0 }
+        )
+    }
+
+    private func send(_ answer: String, for question: ClarifyQuestion, in clarify: ClarifyActivity) {
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, canRespond(clarify.status) else { return }
-        customAnswer = ""
-        Task { await appState.respondToClarify(requestId: clarify.requestId, answer: trimmed) }
+        guard !trimmed.isEmpty, isAnswerable(question) else { return }
+        customAnswers[question.id] = ""
+        Task { await appState.respondToClarify(requestId: clarify.requestId, questionId: question.id, answer: trimmed) }
+    }
+
+    private func confirmMultiSelect(for question: ClarifyQuestion, in clarify: ClarifyActivity) {
+        // Preserve the gateway's choice order rather than selection order.
+        let values = question.choices.filter { multiSelections[question.id]?.contains($0.value) == true }
+            .map(\.value)
+        guard !values.isEmpty else { return }
+        send(ClarifyQuestion.multiSelectAnswer(values), for: question, in: clarify)
+    }
+
+    private func isAnswerable(_ question: ClarifyQuestion) -> Bool {
+        question.status == .pending || question.status == .error
     }
 
     private func statusTitle(for status: ClarifyActivity.Status) -> String {
         switch status {
-        case .pending: return "NEEDS YOUR INPUT"
-        case .submitting: return "SENDING ANSWER"
-        case .answered: return "ANSWERED"
-        case .error: return "TRY AGAIN"
+        case .pending: return AppLocalization.string("NEEDS YOUR INPUT")
+        case .submitting: return AppLocalization.string("SENDING ANSWER")
+        case .answered: return AppLocalization.string("ANSWERED")
+        case .error: return AppLocalization.string("TRY AGAIN")
+        case .expired: return AppLocalization.string("EXPIRED")
         }
     }
 
@@ -1907,13 +2083,286 @@ struct ClarifyCard: View {
         case .pending, .submitting: return .orange
         case .answered: return .green
         case .error: return .red
+        case .expired: return .secondary
         }
+    }
+}
+
+/// One question inside a clarification card: single-choice buttons, genuine
+/// multi-select toggles with a confirm step, or a free-text field. Each row
+/// owns its answer/lock lifecycle — one question submitting or failing never
+/// disables its siblings, and an accepted answer renders locked. In a batch
+/// each row draws its own grouped box and title; a single-question card keeps
+/// the legacy flat layout (the card header already carries the title).
+struct ClarifyQuestionRow: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    let question: ClarifyQuestion
+    var showsTitle: Bool = true
+    @Binding var customAnswer: String
+    @Binding var selection: Set<String>
+    let onSend: (String) -> Void
+    let onConfirmMultiSelect: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if showsTitle {
+                HStack(alignment: .top, spacing: 6) {
+                    SelectableTextView(
+                        text: question.question,
+                        font: .preferredFont(forTextStyle: .subheadline).withTraits(.traitBold),
+                        textColor: .label
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    statusIcon
+                }
+            }
+            // Without a title (single-question card) the card header already
+            // carries the question text and the status title/icon.
+
+            switch question.status {
+            case .answered:
+                answeredBlock
+            case .expired:
+                Text("No longer active")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .submitting:
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Locking your answer…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            case .pending, .error:
+                controls
+                if let error = question.error, !error.isEmpty {
+                    Label(error, systemImage: "exclamationmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+        .padding(showsTitle ? 12 : 0)
+        .background {
+            if showsTitle {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.primary.opacity(0.04))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var statusIcon: some View {
+        switch question.status {
+        case .answered:
+            Image(systemName: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.green)
+        case .error:
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+        case .expired:
+            Image(systemName: "clock.badge.xmark")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .pending, .submitting:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private var answeredBlock: some View {
+        if let answer = question.resolvedAnswer, !answer.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("YOUR ANSWER")
+                    .font(.caption2.weight(.bold))
+                    .tracking(0.5)
+                    .foregroundStyle(.green)
+                SelectableTextView(
+                    text: answer,
+                    font: .preferredFont(forTextStyle: .subheadline),
+                    textColor: .label
+                )
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        } else {
+            // Answered elsewhere (relay 409): settled, but this device's
+            // rejected text must not display as what Hermes received.
+            Text("Answered on another device")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var controls: some View {
+        if question.multiSelect {
+            multiSelectControls
+        } else {
+            singleChoiceControls
+        }
+    }
+
+    @ViewBuilder
+    private var singleChoiceControls: some View {
+        ForEach(question.choices) { choice in
+            Button {
+                onSend(choice.value)
+            } label: {
+                HStack {
+                    Text(choice.label)
+                        .font(.body)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .conduitGlassControl(cornerRadius: 14, tint: .conduitAccent.opacity(0.12))
+                .foregroundStyle(.primary)
+            }
+            .disabled(!isAnswerable)
+        }
+
+        HStack(spacing: 8) {
+            TextField(
+                question.choices.isEmpty ? AppLocalization.string("Type your answer…") : AppLocalization.string("Something else…"),
+                text: $customAnswer,
+                axis: .vertical
+            )
+            .lineLimit(1...4)
+            .submitLabel(.send)
+            .onSubmit { submitCustomAnswer() }
+            .disabled(!isAnswerable)
+
+            Button {
+                submitCustomAnswer()
+            } label: {
+                Image(systemName: "arrow.up")
+                    .font(.subheadline.weight(.bold))
+                    .frame(width: 36, height: 36)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .background(Color.orange, in: Circle())
+            .disabled(!canSubmitCustomAnswer)
+            .opacity(canSubmitCustomAnswer ? 1 : 0.45)
+        }
+        .padding(8)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private var multiSelectControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(question.choices) { choice in
+                Button {
+                    toggle(choice.value)
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: selection.contains(choice.value) ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(selection.contains(choice.value) ? Color.orange : Color.secondary)
+                            .accessibilityHidden(true)
+                        Text(choice.label)
+                            .font(.body)
+                            .foregroundStyle(.primary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .conduitGlassControl(cornerRadius: 14, tint: selection.contains(choice.value) ? .conduitAccent.opacity(0.2) : .conduitAccent.opacity(0.12))
+                }
+                .buttonStyle(.plain)
+                .disabled(!isAnswerable)
+                // VoiceOver announces "«choice», selected/not selected" from
+                // one label + trait pair; the decorative checkmark image is
+                // hidden so the state is never announced twice.
+                .accessibilityLabel(choice.label)
+                .accessibilityAddTraits(selection.contains(choice.value) ? .isSelected : [])
+            }
+
+            Button {
+                onConfirmMultiSelect()
+            } label: {
+                HStack {
+                    Text(confirmTitle)
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Image(systemName: "arrow.up")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .conduitGlassControl(cornerRadius: 14, tint: .conduitAccent.opacity(0.14))
+                .foregroundStyle(.primary)
+            }
+            .disabled(selection.isEmpty || !isAnswerable)
+            .opacity(selection.isEmpty || !isAnswerable ? 0.45 : 1)
+
+            HStack(spacing: 8) {
+                TextField(
+                    "Or type a custom answer…",
+                    text: $customAnswer,
+                    axis: .vertical
+                )
+                .lineLimit(1...4)
+                .submitLabel(.send)
+                .onSubmit { submitCustomAnswer() }
+                .disabled(!isAnswerable)
+
+                Button {
+                    submitCustomAnswer()
+                } label: {
+                    Image(systemName: "arrow.up")
+                        .font(.subheadline.weight(.bold))
+                        .frame(width: 36, height: 36)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .background(Color.orange, in: Circle())
+                .disabled(!canSubmitCustomAnswer)
+                .opacity(canSubmitCustomAnswer ? 1 : 0.45)
+            }
+            .padding(8)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+    }
+
+    private var confirmTitle: String {
+        selection.isEmpty ? AppLocalization.string("Select to confirm") : AppLocalization.string("Confirm \(selection.count) selected")
+    }
+
+    private var isAnswerable: Bool {
+        question.status == .pending || question.status == .error
+    }
+
+    private var canSubmitCustomAnswer: Bool {
+        isAnswerable && !customAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func toggle(_ value: String) {
+        guard isAnswerable else { return }
+        // Explicit copy-mutate-assign through the binding (a Binding<Set>'s
+        // wrappedValue also supports in-place mutation, but the explicit form
+        // makes the write-back unmistakable).
+        var updated = selection
+        if !updated.insert(value).inserted {
+            updated.remove(value)
+        }
+        selection = updated
+    }
+
+    private func submitCustomAnswer() {
+        guard canSubmitCustomAnswer else { return }
+        onSend(customAnswer)
     }
 }
 
 // MARK: - Approval Card
 
 struct ApprovalCard: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let message: ChatMessage
     @EnvironmentObject var appState: AppState
     @State private var confirmAlways = false
@@ -2039,21 +2488,21 @@ struct ApprovalCard: View {
 
     private func decisionTitle(_ choice: String) -> String {
         switch choice {
-        case "once": return "Approved once"
-        case "session": return "Approved for this session"
-        case "always": return "Always allowed"
-        case "deny": return "Rejected"
+        case "once": return AppLocalization.string("Approved once")
+        case "session": return AppLocalization.string("Approved for this session")
+        case "always": return AppLocalization.string("Always allowed")
+        case "deny": return AppLocalization.string("Rejected")
         default: return choice
         }
     }
 
     private func statusTitle(for status: ApprovalActivity.Status) -> String {
         switch status {
-        case .pending: return "APPROVAL NEEDED"
-        case .submitting: return "SENDING DECISION"
-        case .approved: return "APPROVED"
-        case .rejected: return "REJECTED"
-        case .error: return "TRY AGAIN"
+        case .pending: return AppLocalization.string("APPROVAL NEEDED")
+        case .submitting: return AppLocalization.string("SENDING DECISION")
+        case .approved: return AppLocalization.string("APPROVED")
+        case .rejected: return AppLocalization.string("REJECTED")
+        case .error: return AppLocalization.string("TRY AGAIN")
         }
     }
 
@@ -2138,9 +2587,10 @@ struct TypingIndicator: View {
 }
 
 private struct WorkingStatusLabel: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private let text = "Working…"
+    private let text = AppLocalization.string("Working…")
     private let cycleDuration = 1.9
     private let sweepFraction = 0.72
 

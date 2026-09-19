@@ -6,6 +6,7 @@
 import SwiftUI
 
 struct ProfilePickerSheet: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var isReordering = false
@@ -64,13 +65,14 @@ struct ProfilePickerSheet: View {
             }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .top, spacing: 0) {
-                ConduitSheetHeader(title: "Profiles", close: { dismiss() })
+                ConduitSheetHeader(title: AppLocalization.string("Profiles"), close: { dismiss() })
             }
         }
     }
 }
 
 private struct ProfilePickerRow: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
     let profile: String
     let isReordering: Bool
@@ -109,7 +111,7 @@ private struct ProfilePickerRow: View {
             Button(action: select) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(appState.profileDisplayName(profile)).font(.headline).foregroundStyle(.primary)
-                    Text(profile == "default" ? "Primary Hermes profile" : "Hermes profile").font(.caption).foregroundStyle(.secondary)
+                    Text(profile == "default" ? AppLocalization.string("Primary Hermes profile") : AppLocalization.string("Hermes profile")).font(.caption).foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
             }

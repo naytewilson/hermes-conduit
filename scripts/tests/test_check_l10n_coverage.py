@@ -1,0 +1,366 @@
+"""Regression coverage for scripts/check-l10n-coverage.py (catalog guard)."""
+
+import importlib.util
+import json
+import os
+import unittest
+
+SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SPEC = importlib.util.spec_from_file_location(
+    "check_l10n_coverage", os.path.join(SCRIPTS_DIR, "check-l10n-coverage.py"))
+check_l10n_coverage = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(check_l10n_coverage)
+
+parse = check_l10n_coverage.parse_swift_string_literal
+parse_parts = check_l10n_coverage.parse_swift_literal_parts
+typed_skeleton = check_l10n_coverage.typed_skeleton
+is_int = check_l10n_coverage.is_int_interpolation
+extract = check_l10n_coverage.extract_sites
+specs = check_l10n_coverage.placeholder_specs
+compatible = check_l10n_coverage.placeholders_compatible
+problems_for = check_l10n_coverage.catalog_problems
+
+
+class StringLiteralParsingTests(unittest.TestCase):
+    def test_plain_literal(self):
+        self.assertEqual(parse('"Hello"', 0), ("Hello", 7, False))
+
+    def test_escaped_quote_and_backslash(self):
+        self.assertEqual(parse('"a\\"b\\\\"', 0), ('a"b\\', 8, False))
+
+    def test_escapes_are_decoded_for_key_matching(self):
+        self.assertEqual(parse('"line\\nbreak"', 0), ("line\nbreak", 13, False))
+
+    def test_interpolation_becomes_placeholder(self):
+        skeleton, end, has_interp = parse('"prefix \\(value) suffix"', 0)
+        self.assertEqual(skeleton, "prefix %@ suffix")
+        self.assertTrue(has_interp)
+        self.assertEqual(end, len('"prefix \\(value) suffix"'))
+
+    def test_interpolation_expressions_are_returned(self):
+        skeleton, _end, exprs = parse_parts('"a \\(x) b \\(y.count)"', 0)
+        self.assertEqual(exprs, ["x", "y.count"])
+        self.assertEqual(skeleton, "a %@ b %@")
+
+    def test_nested_string_and_parens(self):
+        source = r'"a \(f("x", (1 + 2))) b"'
+        skeleton, _end, has_interp = parse(source, 0)
+        self.assertEqual(skeleton, "a %@ b")
+        self.assertTrue(has_interp)
+
+    def test_unterminated_returns_none(self):
+        self.assertIsNone(parse('"no close', 0))
+
+
+class InterpolationTypeTests(unittest.TestCase):
+    def test_string_wrapper_requests_object(self):
+        self.assertFalse(is_int("String(count)"))
+        self.assertFalse(is_int("String(n)"))
+
+    def test_count_shaped_expressions_request_int(self):
+        self.assertTrue(is_int("items.count"))
+        self.assertTrue(is_int("selection.count"))
+        self.assertTrue(is_int("activeCount"))
+        self.assertTrue(is_int("progress.total"))
+        self.assertTrue(is_int("Int(percent.rounded())"))
+        self.assertTrue(is_int("rows.count - renderedRowCount"))
+
+    def test_unknown_identifiers_default_to_object(self):
+        self.assertFalse(is_int("statusTitle"))
+        self.assertFalse(is_int("error.localizedDescription"))
+        self.assertFalse(is_int("title"))
+
+    def test_typed_skeleton_mixed_placeholder_families(self):
+        self.assertEqual(
+            typed_skeleton("a %@ b %@", ["String(x)", "y.count"]),
+            "a %@ b %lld")
+        self.assertEqual(
+            typed_skeleton("a %@ b %@", ["x", "y"]),
+            "a %@ b %@")
+
+    def test_typed_skeleton_ignores_non_placeholder_splits(self):
+        # A literal containing a literal % (e.g. "100%") cannot be rebuilt
+        # unambiguously and is returned untouched.
+        self.assertEqual(typed_skeleton("100% of %@", ["x"]), "100% of %@")
+
+
+class ExtractSiteTests(unittest.TestCase):
+    def test_string_localized_call_is_found(self):
+        source = 'return String(localized: "Hello \\(name)!")'
+        sites = list(extract(source))
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0][0], "Hello %@!")
+
+    def test_app_localization_string_call_is_found(self):
+        source = 'return AppLocalization.string("Hello \\(name)!")'
+        sites = list(extract(source))
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0][0], "Hello %@!")
+
+    def test_int_interpolation_requests_lld_key(self):
+        source = 'AppLocalization.string("\\(selection.count) selected")'
+        sites = list(extract(source))
+        self.assertEqual(sites[0][0], "%lld selected")
+
+    def test_string_wrapped_interpolation_requests_object_key(self):
+        source = 'AppLocalization.string("\\(String(selection.count)) selected")'
+        sites = list(extract(source))
+        self.assertEqual(sites[0][0], "%@ selected")
+
+    def test_multiline_app_localization_call_is_found(self):
+        source = 'return AppLocalization.string(\n    "Hello")'
+        sites = list(extract(source))
+        self.assertEqual([s[0] for s in sites], ["Hello"])
+
+    def test_swiftui_initializer_literal_is_found(self):
+        source = 'Text("Welcome back")'
+        sites = list(extract(source))
+        self.assertEqual(sites[0][0], "Welcome back")
+
+    def test_extended_swiftui_initializers_are_found(self):
+        source = ('ProgressView("Loading")\n'
+                  'ContentUnavailableView("Empty", systemImage: "tray")\n'
+                  'Section("Header") {}\n'
+                  'Menu("Title") {}\n'
+                  'GroupBox("Note") {}')
+        skeletons = [s[0] for s in extract(source)]
+        self.assertEqual(skeletons,
+                         ["Loading", "Empty", "Header", "Title", "Note"])
+
+    def test_alert_and_confirmation_dialog_literals_are_found(self):
+        source = ('view.alert("Delete?", isPresented: $shown) {}\n'
+                  'view.confirmationDialog("Archive 1 Task?", isPresented: $p) {}')
+        skeletons = [s[0] for s in extract(source)]
+        self.assertEqual(skeletons, ["Delete?", "Archive 1 Task?"])
+
+    def test_localized_string_key_modifiers_are_found(self):
+        source = ('.navigationTitle("Delegate agents")\n'
+                  '.accessibilityLabel("Delete \\(session.title)")\n'
+                  '.accessibilityHint("Starts a new conversation")\n'
+                  '.accessibilityValue("50 percent")')
+        skeletons = [s[0] for s in extract(source)]
+        self.assertEqual(skeletons,
+                         ["Delegate agents", "Delete %@",
+                          "Starts a new conversation", "50 percent"])
+
+    def test_raw_user_facing_assignment_patterns_are_found(self):
+        source = ('errorMessage = "Failed to send: \\(error.localizedDescription)"\n'
+                  'help: "Any custom port."\n'
+                  'purposeText: "Close the Voice conversation completely."')
+        skeletons = [s[0] for s in extract(source)]
+        self.assertEqual(skeletons,
+                         ["Failed to send: %@", "Any custom port.",
+                          "Close the Voice conversation completely."])
+
+    def test_wrapped_error_message_is_not_double_reported(self):
+        source = 'errorMessage = AppLocalization.string("Failed to send: \\(error)")'
+        skeletons = [s[0] for s in extract(source)]
+        self.assertEqual(skeletons, ["Failed to send: %@"])
+
+    def test_full_line_comments_are_skipped(self):
+        source = '// Text("not a call site")\nText("real")'
+        skeletons = [s[0] for s in extract(source)]
+        self.assertEqual(skeletons, ["real"])
+
+    def test_swiftui_variable_argument_is_skipped(self):
+        source = "Text(message)\nLabel(title, systemImage: \"star\")"
+        self.assertEqual(list(extract(source)), [])
+
+    def test_non_localized_string_is_skipped(self):
+        source = 'let url = URL(string: "https://example.com")'
+        self.assertEqual(list(extract(source)), [])
+
+
+class CatalogHasTests(unittest.TestCase):
+    def test_static_key_requires_exact_match(self):
+        keys = {"Hello"}
+        self.assertTrue(check_l10n_coverage.catalog_has(keys, "Hello"))
+        self.assertFalse(check_l10n_coverage.catalog_has(keys, "Hello!"))
+
+    def test_placeholder_type_families_are_never_normalized(self):
+        keys = {"%lld tokens"}
+        self.assertTrue(check_l10n_coverage.catalog_has(keys, "%lld tokens"))
+        # source %@ against a %lld catalog key: the runtime lookup would
+        # MISS (Delegate-agents class) and must fail the checker.
+        self.assertFalse(check_l10n_coverage.catalog_has(keys, "%@ tokens"))
+        keys2 = {"%@ tokens"}
+        self.assertTrue(check_l10n_coverage.catalog_has(keys2, "%@ tokens"))
+        self.assertFalse(check_l10n_coverage.catalog_has(keys2, "%lld tokens"))
+
+
+class PlaceholderTests(unittest.TestCase):
+    def test_printf_forms_are_typed(self):
+        self.assertEqual(specs("%@"), [(None, "object")])
+        self.assertEqual(specs("%lld"), [(None, "int")])
+        self.assertEqual(specs("%d"), [(None, "int")])
+        self.assertEqual(specs("%ld"), [(None, "int")])
+        self.assertEqual(specs("%f"), [(None, "float")])
+        self.assertEqual(specs("%%"), [])
+
+    def test_positional_forms_keep_indices(self):
+        self.assertEqual(specs("%1$@ and %2$@"),
+                         [(1, "object"), (2, "object")])
+        self.assertEqual(specs("%1$lld items"),
+                         [(1, "int")])
+
+    def test_multiple_placeholders(self):
+        self.assertEqual(specs("%@ of %lld (%@)"),
+                         [(None, "object"), (None, "int"), (None, "object")])
+
+    def test_type_family_matrix(self):
+        # source %@ / translation %@  → pass
+        self.assertTrue(compatible([(None, "object")], [(None, "object")]))
+        # source %lld / translation %lld → pass
+        self.assertTrue(compatible([(None, "int")], [(None, "int")]))
+        # source %lld / translation %@ → fail
+        self.assertFalse(compatible([(None, "int")], [(None, "object")]))
+        # source %@ / translation %lld → fail
+        self.assertFalse(compatible([(None, "object")], [(None, "int")]))
+
+    def test_missing_placeholder_fails(self):
+        self.assertFalse(compatible([(None, "object"), (None, "int")],
+                                    [(None, "object")]))
+
+    def test_extra_placeholder_fails(self):
+        self.assertFalse(compatible([(None, "object")],
+                                    [(None, "object"), (None, "int")]))
+
+    def test_valid_positional_reordering_passes(self):
+        key = [(None, "object"), (None, "int")]
+        self.assertTrue(compatible(key, [(1, "object"), (2, "int")]))
+        self.assertTrue(compatible(key, [(2, "int"), (1, "object")]))
+
+    def test_invalid_positional_index_fails(self):
+        key = [(None, "object"), (None, "int")]
+        self.assertFalse(compatible(key, [(1, "object"), (3, "int")]))
+        self.assertFalse(compatible(key, [(0, "object"), (1, "int")]))
+
+    def test_positional_on_both_sides_must_match(self):
+        self.assertTrue(compatible([(1, "object"), (2, "object")],
+                                   [(1, "object"), (2, "object")]))
+        self.assertTrue(compatible([(1, "object"), (2, "object")],
+                                   [(2, "object"), (1, "object")]))
+        self.assertFalse(compatible([(1, "object"), (2, "int")],
+                                    [(2, "object"), (1, "int")]))
+
+
+def zh_catalog(key, value, state="translated"):
+    return {"strings": {key: {"localizations": {"zh-Hans": {
+        "stringUnit": {"state": state, "value": value}}}}}}
+
+
+class CatalogProblemTests(unittest.TestCase):
+    def test_missing_zh_hans_is_reported(self):
+        catalog = {"strings": {"Hello": {"localizations": {
+            "en": {"stringUnit": {"state": "translated", "value": "Hello"}}}}}}
+        problems = problems_for(catalog)
+        self.assertIn("Hello", problems)
+        self.assertTrue(any("missing zh-Hans" in p for p in problems["Hello"]))
+
+    def test_empty_value_is_reported(self):
+        problems = problems_for(zh_catalog("Hello", "  "))
+        self.assertTrue(any("empty" in p for p in problems["Hello"]))
+
+    def test_untranslated_state_is_reported(self):
+        problems = problems_for(zh_catalog("Hello", "你好", state="new"))
+        self.assertTrue(any("state is 'new'" in p for p in problems["Hello"]))
+
+    def test_placeholder_type_mismatch_is_reported(self):
+        problems = problems_for(zh_catalog("%lld files", "%@ 个文件"))
+        self.assertTrue(any("placeholders" in p for p in problems["%lld files"]))
+
+    def test_malformed_literal_unicode_escape_is_reported(self):
+        problems = problems_for(zh_catalog("Rename conversation",
+                                           "\\u91cd\\u547d\\u540d\\u5bf9\\u8bdd"))
+        self.assertTrue(any("Unicode escape" in p
+                            for p in problems["Rename conversation"]))
+
+    def test_real_chinese_characters_pass(self):
+        self.assertEqual(problems_for(zh_catalog("Rename conversation", "重命名对话")), {})
+
+    def test_json_decoded_proper_unicode_passes(self):
+        # A catalog authored with \uXXXX JSON escapes decodes to real
+        # characters and must pass.
+        import json as j
+        raw = '{"strings": {"K": {"localizations": {"zh-Hans": {"stringUnit": ' \
+              '{"state": "translated", "value": "\\u91cd\\u547d\\u540d"}}}}}}'
+        problems = problems_for(j.loads(raw))
+        self.assertEqual(problems, {})
+
+    def test_positional_translation_is_accepted(self):
+        catalog = {"strings": {"Move %@ selected %@": {"localizations": {
+            "zh-Hans": {"stringUnit": {
+                "state": "translated",
+                "value": "移动所选 %1$@ 个 %2$@"}}}}}}
+        self.assertEqual(problems_for(catalog), {})
+
+    def test_translated_direct_entry_passes(self):
+        self.assertEqual(problems_for(zh_catalog("Hello", "你好")), {})
+
+    def test_variation_only_translation_passes(self):
+        catalog = {"strings": {"%lld conversations": {"localizations": {
+            "zh-Hans": {"variations": {"plural": {"other": {
+                "stringUnit": {"state": "translated", "value": "%lld 个会话"}}}}}}}}}
+        self.assertEqual(problems_for(catalog), {})
+
+    def test_variation_leaf_violation_is_reported(self):
+        catalog = {"strings": {"%lld conversations": {"localizations": {
+            "zh-Hans": {"variations": {"plural": {"other": {
+                "stringUnit": {"state": "new", "value": "%lld 个会话"}}}}}}}}}
+        problems = problems_for(catalog)
+        self.assertTrue(any("state is 'new'" in p for p in problems["%lld conversations"]))
+
+    def test_stale_en_unit_with_mismatched_placeholders_is_reported(self):
+        # The KanbanSelectionLayout regression: a key renamed to %@ while its
+        # en unit still read %lld misformatted English at runtime (garbage
+        # integer from the NSString pointer). Every language must validate.
+        catalog = {"strings": {"%@ tasks selected": {"localizations": {
+            "en": {"stringUnit": {"state": "translated",
+                                  "value": "%lld tasks selected"}},
+            "zh-Hans": {"stringUnit": {"state": "translated",
+                                       "value": "已选择 %@ 个任务"}}}}}}
+        problems = problems_for(catalog)
+        self.assertTrue(any("en placeholders" in p for p in problems["%@ tasks selected"]))
+
+    def test_matching_en_unit_passes(self):
+        catalog = {"strings": {"%lld conversations": {"localizations": {
+            "en": {"variations": {"plural": {"one": {
+                "stringUnit": {"state": "translated", "value": "%lld conversation"}},
+                "other": {"stringUnit": {"state": "translated",
+                                         "value": "%lld conversations"}}}}},
+            "zh-Hans": {"variations": {"plural": {"other": {
+                "stringUnit": {"state": "translated", "value": "%lld 个会话"}}}}}}}}}
+        self.assertEqual(problems_for(catalog), {})
+
+    def test_exempt_keys_are_not_required(self):
+        catalog = {"strings": {"Hermes": {"localizations": {}}}}
+        self.assertEqual(problems_for(catalog), {})
+
+    def test_regression_keys_are_enforced(self):
+        catalog = {"strings": {}}
+        problems = check_l10n_coverage.required_key_problems(
+            catalog, ["Missing regression key"])
+        self.assertIn("Missing regression key", problems)
+
+
+class CheckIntegrationTests(unittest.TestCase):
+    def test_repo_catalog_covers_every_call_site(self):
+        checked, missing, key_problems = check_l10n_coverage.check(
+            os.path.dirname(SCRIPTS_DIR))
+        self.assertEqual(
+            missing, {},
+            f"localizable keys missing from the catalog: {sorted(missing)}")
+        self.assertGreater(checked, 1000)
+        self.assertEqual(
+            key_problems, {},
+            f"catalog keys without usable zh-Hans: {sorted(key_problems)}")
+        catalog_path = os.path.join(os.path.dirname(SCRIPTS_DIR),
+                                    "Conduit", "Localizable.xcstrings")
+        with open(catalog_path, encoding="utf-8") as handle:
+            catalog_keys = set(json.load(handle)["strings"])
+        for key in check_l10n_coverage.REGRESSION_KEYS:
+            self.assertIn(key, catalog_keys)
+
+
+if __name__ == "__main__":
+    unittest.main()

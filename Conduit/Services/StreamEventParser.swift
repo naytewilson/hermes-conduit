@@ -9,6 +9,10 @@ enum StreamEventParser {
         let sessionId = obj["session_id"]?.stringValue ?? ""
         let payload = obj["payload"]?.objectValue
 
+        // Per-type required-field guards below are intentional: some events
+        // carry ids/fields their consumers require and are rejected here,
+        // while others degrade to optional fields. Do not widen or narrow a
+        // single guard without checking its consumers.
         switch type {
         case "message.start":
             return .messageStart(sessionId: sessionId)
@@ -49,7 +53,7 @@ enum StreamEventParser {
             return .messageComplete(sessionId: sessionId, messageId: messageId, content: content, reasoning: reasoning)
 
         case "error":
-            return .messageError(sessionId: sessionId, message: payload?["message"]?.stringValue ?? "Hermes reported an error.")
+            return .messageError(sessionId: sessionId, message: payload?["message"]?.stringValue ?? AppLocalization.string("Hermes reported an error."))
 
         case "message.interrupted", "session.interrupted":
             return .messageInterrupted(sessionId: sessionId)
@@ -60,6 +64,20 @@ enum StreamEventParser {
 
         case "session.info":
             return .sessionInfo(sessionId: sessionId, snapshot: SessionRuntimeSnapshot(object: payload ?? [:]))
+
+        case "status.update":
+            // A status edge without a session id cannot drive any
+            // conversation-scoped state; reject it rather than letting an
+            // empty key into compaction bookkeeping.
+            guard !sessionId.isEmpty else { return nil }
+            let kindRaw = payload?["kind"]?.stringValue ?? ""
+            let kind: StatusUpdateKind
+            switch kindRaw {
+            case "compacting": kind = .compacting
+            case "compacted": kind = .compacted
+            default: kind = .other(kindRaw)
+            }
+            return .statusUpdate(sessionId: sessionId, kind: kind, text: payload?["text"]?.stringValue)
 
         case "session.title":
             let storedSessionId = payload?["session_id"]?.stringValue ?? ""
@@ -93,12 +111,14 @@ enum StreamEventParser {
         case "clarify", "clarify.request":
             guard let payload,
                   let clarify = MessageNormalizer.clarifyActivity(from: payload) else { return nil }
-            return .clarify(
-                sessionId: sessionId,
-                requestId: clarify.requestId,
-                question: clarify.question,
-                choices: clarify.choices.map { (label: $0.label, value: $0.value) }
-            )
+            return .clarify(sessionId: sessionId, activity: clarify)
+
+        case "clarify.expire":
+            let requestId = (payload?["request_id"]?.stringValue
+                ?? payload?["requestId"]?.stringValue ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !requestId.isEmpty else { return nil }
+            return .clarifyExpire(sessionId: sessionId, requestId: requestId)
 
         case "approval.request":
             guard let payload,

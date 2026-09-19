@@ -1,5 +1,16 @@
 # Voice Capture Session Recovery Implementation Plan
 
+> **SUPERSEDED (2026-09-07, PR #143):** This plan's shared-session haptic
+> binding ("Core Haptics as a haptics-only engine bound to the shared
+> AVAudioSession") has been intentionally superseded. A shared-session-bound
+> engine activates the app session when it starts, so ordinary text-chat
+> response haptics interrupted external media (issue #140). The current
+> strategy is an **unbound, haptics-only** engine plus **suppressing the
+> custom Core Haptics pattern entirely while a voice session is live**
+> (`responseStarted(coreHapticsAllowed:)`, gated by
+> `VoiceConversationController.hasLiveVoiceSession`). Do not restore the
+> shared-session binding; the route-native capture hardening below remains
+> in force.
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the shared iOS microphone capture path start reliably after Core Haptics activity or route changes while preserving the existing 16 kHz mono PCM16 transcription contract.

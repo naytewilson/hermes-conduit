@@ -6,19 +6,22 @@
 //  calibrated response lifecycle patterns and subordinate tool activity.
 //
 
-import AVFAudio
 import CoreHaptics
 import SwiftUI
 import UIKit
 
+/// The response lifecycle's Core Haptics engine is haptics-only and
+/// deliberately unbound: it neither creates a binding to nor activates
+/// Conduit's shared voice `AVAudioSession` (issue #140 — a shared-session
+/// engine activates the app session on start, interrupting external media
+/// on every text-chat response). While a voice session may hold the session,
+/// the custom pattern is suppressed entirely (see
+/// `responseStarted(coreHapticsAllowed:)`) — the #48 coexistence guarantee
+/// is enforced by suppression, not by shared ownership.
 struct HapticsEnginePolicy: Equatable {
-    let usesSharedAudioSession: Bool
     let playsHapticsOnly: Bool
 
-    static let response = Self(
-        usesSharedAudioSession: true,
-        playsHapticsOnly: true
-    )
+    static let response = Self(playsHapticsOnly: true)
 }
 
 enum HapticsEngineStopPolicy {
@@ -133,7 +136,7 @@ enum ResponseHapticPolicy {
 
     static func signal(for event: StreamEvent) -> Signal? {
         switch event {
-        case .messageStart, .reasoningDelta, .clarify, .approval:
+        case .messageStart, .reasoningDelta, .clarify, .clarifyExpire, .approval:
             return .activity(playsStart: false)
         case .messageDelta:
             return .activity(playsStart: true)
@@ -182,6 +185,24 @@ enum Haptics {
 #if DEBUG
     static var testEmissionHandler: ((Event) -> Void)?
     static var testSuppressesHardware = false
+    /// Test seam: counts makeCoreHapticsEngine() attempts so tests can pin
+    /// that suppressed/disabled response haptics never create an engine.
+    static var coreHapticsEngineCreationCount = 0
+    /// Test seam: when set, replaces real CHHapticEngine construction so
+    /// tests can verify that the allowed path requests the custom engine
+    /// without touching haptic hardware. Throwing from the factory
+    /// simulates construction failure; returning an engine still runs the
+    /// response-engine configuration.
+    static var coreHapticsEngineFactoryForTesting: (() throws -> CHHapticEngine)?
+    /// Clears cached engine, pattern state, factory, and counter so engine
+    /// requests are deterministic regardless of test order.
+    static func resetCoreHapticsStateForTesting() {
+        cancelLifecyclePattern()
+        clearLifecyclePatternState()
+        coreHapticsEngine = nil
+        coreHapticsEngineCreationCount = 0
+        coreHapticsEngineFactoryForTesting = nil
+    }
 #endif
 
     static let preferenceKey = "conduit.haptics"
@@ -265,9 +286,19 @@ enum Haptics {
         softGenerator.prepare()
     }
 
-    static func responseStarted() {
+    /// The custom multi-hit response-start pattern. When `coreHapticsAllowed`
+    /// is false — a voice session may hold the audio session — the pattern
+    /// degrades to the UIKit fallback so Core Haptics never starts an engine
+    /// (and never touches any audio session) while voice capture or playback
+    /// is live. The parameter is deliberately required: every call site must
+    /// decide, so the audio-activating path cannot be reached by omission.
+    static func responseStarted(coreHapticsAllowed: Bool) {
         guard emit(.responseStarted) else { return }
         let token = beginLifecyclePattern(duration: 0.18)
+        guard coreHapticsAllowed else {
+            playResponseStartFallback(token: token)
+            return
+        }
         do {
             let engine: CHHapticEngine
             if let coreHapticsEngine {
@@ -366,12 +397,25 @@ enum Haptics {
         ]
     }
     private static func makeCoreHapticsEngine() throws -> CHHapticEngine {
-        let engine: CHHapticEngine
-        if enginePolicy.usesSharedAudioSession {
-            engine = try CHHapticEngine(audioSession: AVAudioSession.sharedInstance())
-        } else {
-            engine = try CHHapticEngine()
+#if DEBUG
+        coreHapticsEngineCreationCount += 1
+        if let factory = coreHapticsEngineFactoryForTesting {
+            let engine = try factory()
+            configureResponseHapticEngine(engine)
+            return engine
         }
+#endif
+        // Deliberately the session-free initializer: binding this engine to
+        // AVAudioSession.sharedInstance() re-introduces the issue #140
+        // media interruption (the engine activates the shared session on
+        // start). Coexistence with voice capture is enforced by suppression
+        // in responseStarted(coreHapticsAllowed:), not by session sharing.
+        let engine = try CHHapticEngine()
+        configureResponseHapticEngine(engine)
+        return engine
+    }
+
+    private static func configureResponseHapticEngine(_ engine: CHHapticEngine) {
         engine.playsHapticsOnly = enginePolicy.playsHapticsOnly
         engine.isAutoShutdownEnabled = true
         engine.resetHandler = { [weak engine] in
@@ -390,7 +434,6 @@ enum Haptics {
                 }
             }
         }
-        return engine
     }
 
     private static func clearLifecyclePatternState() {

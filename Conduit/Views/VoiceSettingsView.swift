@@ -7,41 +7,72 @@ import SwiftUI
 
 struct VoiceSettingsRoute: View {
     @StateObject private var service: HermesVoiceConfigurationService
+    /// The active VoiceConversationController, observed so the Record ASR
+    /// input meter tracks live capture without polling or a second capture
+    /// service.
+    @ObservedObject var conversationController: VoiceConversationController
     let actions: VoiceSettingsActions
     let voiceEnabled: Bool
     let transcriptionMode: VoiceTranscriptionMode
     let appleSpeechAvailability: AppleSpeechRecognitionAvailability
+    let continuousConversation: Bool
+    let spokenStopPhrases: [String]
+    let spokenEndConversationPhrases: [String]
     let setVoiceEnabled: (Bool) async -> Bool
     let setTranscriptionMode: (VoiceTranscriptionMode) async -> Bool
+    let setContinuousConversation: (Bool) async -> Bool
+    let setStopPhrases: ([String]) -> Void
+    let setEndConversationPhrases: ([String]) -> Void
 
     init(
         bridge: DashboardTicketBridge,
         profile: String,
+        conversationController: VoiceConversationController,
         actions: VoiceSettingsActions,
         voiceEnabled: Bool,
         transcriptionMode: VoiceTranscriptionMode,
         appleSpeechAvailability: AppleSpeechRecognitionAvailability,
+        continuousConversation: Bool = true,
+        spokenStopPhrases: [String] = VoiceSpokenCommands.defaultStopPhrases,
+        spokenEndConversationPhrases: [String] = VoiceSpokenCommands.defaultEndConversationPhrases,
         setVoiceEnabled: @escaping (Bool) async -> Bool,
-        setTranscriptionMode: @escaping (VoiceTranscriptionMode) async -> Bool
+        setTranscriptionMode: @escaping (VoiceTranscriptionMode) async -> Bool,
+        setContinuousConversation: @escaping (Bool) async -> Bool = { _ in true },
+        setStopPhrases: @escaping ([String]) -> Void = { _ in },
+        setEndConversationPhrases: @escaping ([String]) -> Void = { _ in }
     ) {
         _service = StateObject(wrappedValue: HermesVoiceConfigurationService(bridge: bridge, profile: profile))
+        _conversationController = ObservedObject(wrappedValue: conversationController)
         self.actions = actions
         self.voiceEnabled = voiceEnabled
         self.transcriptionMode = transcriptionMode
         self.appleSpeechAvailability = appleSpeechAvailability
+        self.continuousConversation = continuousConversation
+        self.spokenStopPhrases = spokenStopPhrases
+        self.spokenEndConversationPhrases = spokenEndConversationPhrases
         self.setVoiceEnabled = setVoiceEnabled
         self.setTranscriptionMode = setTranscriptionMode
+        self.setContinuousConversation = setContinuousConversation
+        self.setStopPhrases = setStopPhrases
+        self.setEndConversationPhrases = setEndConversationPhrases
     }
 
     var body: some View {
         VoiceSettingsView(
             service: service,
+            conversationController: conversationController,
             actions: actions,
             voiceEnabled: voiceEnabled,
             transcriptionMode: transcriptionMode,
             appleSpeechAvailability: appleSpeechAvailability,
+            continuousConversation: continuousConversation,
+            spokenStopPhrases: spokenStopPhrases,
+            spokenEndConversationPhrases: spokenEndConversationPhrases,
             setVoiceEnabled: setVoiceEnabled,
-            setTranscriptionMode: setTranscriptionMode
+            setTranscriptionMode: setTranscriptionMode,
+            setContinuousConversation: setContinuousConversation,
+            setStopPhrases: setStopPhrases,
+            setEndConversationPhrases: setEndConversationPhrases
         )
     }
 }
@@ -63,36 +94,62 @@ struct VoiceSettingsActions {
 /// standalone in a sheet; the host app supplies live-audio test closures after
 /// it has built the active VoiceConversationController.
 struct VoiceSettingsView: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @ObservedObject var service: HermesVoiceConfigurationService
+    /// Observed so the Record ASR meter tracks the active controller's raw
+    /// microphone level (issue #130): a moving meter proves capture works
+    /// and localizes detection failures to the VAD/provider boundary.
+    @ObservedObject var conversationController: VoiceConversationController
     var actions = VoiceSettingsActions()
     let setVoiceEnabled: (Bool) async -> Bool
     let setTranscriptionMode: (VoiceTranscriptionMode) async -> Bool
+    let setContinuousConversation: (Bool) async -> Bool
 
     @State private var values: [String: String] = [:]
     @State private var credentialDrafts: [String: String] = [:]
     @State private var savingField: String?
     @State private var testStatus: String?
     @State private var isRunningTest = false
+    @State private var isRecordingASRTest = false
     @State private var voiceEnabled: Bool
     @State private var transcriptionMode: VoiceTranscriptionMode
     @State private var appleSpeechAvailability: AppleSpeechRecognitionAvailability
+    @State private var continuousConversation: Bool
+    let spokenStopPhrases: [String]
+    let spokenEndConversationPhrases: [String]
+    let setStopPhrases: ([String]) -> Void
+    let setEndConversationPhrases: ([String]) -> Void
 
     init(
         service: HermesVoiceConfigurationService,
+        conversationController: VoiceConversationController,
         actions: VoiceSettingsActions = VoiceSettingsActions(),
         voiceEnabled: Bool = false,
         transcriptionMode: VoiceTranscriptionMode = .hermes,
         appleSpeechAvailability: AppleSpeechRecognitionAvailability = .permissionRequired(localeIdentifier: Locale.current.identifier),
+        continuousConversation: Bool = true,
+        spokenStopPhrases: [String] = VoiceSpokenCommands.defaultStopPhrases,
+        spokenEndConversationPhrases: [String] = VoiceSpokenCommands.defaultEndConversationPhrases,
         setVoiceEnabled: @escaping (Bool) async -> Bool = { _ in false },
-        setTranscriptionMode: @escaping (VoiceTranscriptionMode) async -> Bool = { _ in false }
+        setTranscriptionMode: @escaping (VoiceTranscriptionMode) async -> Bool = { _ in false },
+        setContinuousConversation: @escaping (Bool) async -> Bool = { _ in true },
+        setStopPhrases: @escaping ([String]) -> Void = { _ in },
+        setEndConversationPhrases: @escaping ([String]) -> Void = { _ in }
     ) {
         self.service = service
+        _conversationController = ObservedObject(wrappedValue: conversationController)
         self.actions = actions
         self.setVoiceEnabled = setVoiceEnabled
         self.setTranscriptionMode = setTranscriptionMode
+        self.setContinuousConversation = setContinuousConversation
+        self.spokenStopPhrases = spokenStopPhrases
+        self.spokenEndConversationPhrases = spokenEndConversationPhrases
+        self.setStopPhrases = setStopPhrases
+        self.setEndConversationPhrases = setEndConversationPhrases
         _voiceEnabled = State(initialValue: voiceEnabled)
         _transcriptionMode = State(initialValue: transcriptionMode)
         _appleSpeechAvailability = State(initialValue: appleSpeechAvailability)
+        _continuousConversation = State(initialValue: continuousConversation)
     }
 
     var body: some View {
@@ -106,10 +163,11 @@ struct VoiceSettingsView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 4)
                     } else if service.snapshot.capability.isGatewayConnected {
-                        providerSection(title: "Speech to text", symbol: "waveform", kind: .stt, providers: service.snapshot.sttProviders)
-                        providerSection(title: "Assistant speech", symbol: "speaker.wave.3", kind: .tts, providers: service.snapshot.ttsProviders)
+                        providerSection(title: AppLocalization.string("Speech to text"), symbol: "waveform", kind: .stt, providers: service.snapshot.sttProviders)
+                        providerSection(title: AppLocalization.string("Assistant speech"), symbol: "speaker.wave.3", kind: .tts, providers: service.snapshot.ttsProviders)
                         credentialsSection
                         testingSection
+                        spokenControlsSection
                         wakeSection
                     }
                 }
@@ -127,7 +185,7 @@ struct VoiceSettingsView: View {
     }
 
     private var capabilitySection: some View {
-        ConduitSettingsSection(title: "Voice on " + profileDisplayName, symbol: "mic.badge.plus", tint: .conduitAccent) {
+        ConduitSettingsSection(title: AppLocalization.string("Voice on \(profileDisplayName)"), symbol: "mic.badge.plus", tint: .conduitAccent) {
             Toggle("Enable voice on this device", isOn: Binding(
                 get: { voiceEnabled },
                 set: { requested in
@@ -139,6 +197,22 @@ struct VoiceSettingsView: View {
                 }
             ))
             Text("This preference is stored locally for this gateway and profile. Voice starts disabled until you opt in.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Toggle("Continuous Conversation", isOn: Binding(
+                get: { continuousConversation },
+                set: { requested in
+                    let previous = continuousConversation
+                    continuousConversation = requested
+                    Task {
+                        if !(await setContinuousConversation(requested)) {
+                            continuousConversation = previous
+                        }
+                    }
+                }
+            ))
+            .accessibilityHint("Automatically listens again after each response. Turn off to start each listening turn manually.")
+            Text("When enabled, Conduit automatically listens again after each response. When disabled, the session stays open and you start the next listening turn manually. This does not change Pause Mic, Interrupt, Close, or wake-word settings.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack(spacing: 10) {
@@ -160,7 +234,7 @@ struct VoiceSettingsView: View {
             Button {
                 Task { await load() }
             } label: {
-                Label(service.isLoading ? "Checking…" : "Check voice support", systemImage: "arrow.clockwise")
+                Label(service.isLoading ? AppLocalization.string("Checking…") : AppLocalization.string("Check voice support"), systemImage: "arrow.clockwise")
                     .frame(maxWidth: .infinity)
                     .frame(height: 44)
             }
@@ -179,7 +253,9 @@ struct VoiceSettingsView: View {
         let choices = providerChoices(kind: kind, providers: providers)
         ConduitSettingsSection(title: title, symbol: symbol, tint: kind == .stt ? .conduitAura : .conduitAccent) {
             if choices.isEmpty {
-                Text("No " + (kind == .stt ? "transcription" : "speech") + " providers were discovered for this Hermes profile.")
+                Text(kind == .stt
+                     ? AppLocalization.string("No transcription providers were discovered for this Hermes profile.")
+                     : AppLocalization.string("No speech providers were discovered for this Hermes profile."))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
@@ -191,7 +267,7 @@ struct VoiceSettingsView: View {
                     Text("Provider").foregroundStyle(.secondary)
                 }
                 .disabled(service.isLoading || savingField == "\(kind.rawValue).provider")
-                .accessibilityHint(kind == .stt ? "Choose on-device Apple speech or a provider reported by Hermes" : "Provider options are reported by Hermes for this profile")
+                .accessibilityHint(kind == .stt ? AppLocalization.string("Choose on-device Apple speech or a provider reported by Hermes") : AppLocalization.string("Provider options are reported by Hermes for this profile"))
 
                 if kind == .stt, transcriptionMode == .appleOnDevice {
                     appleOnDeviceDetail
@@ -263,12 +339,12 @@ struct VoiceSettingsView: View {
                 .foregroundStyle(.secondary)
         }
         if !descriptor.models.isEmpty {
-            Text("Suggested models: " + descriptor.models.joined(separator: ", "))
+            Text(AppLocalization.string("Suggested models: ") + descriptor.models.joined(separator: ", "))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
         if !descriptor.voices.isEmpty {
-            Text("Suggested voices: " + descriptor.voices.joined(separator: ", "))
+            Text(AppLocalization.string("Suggested voices: ") + descriptor.voices.joined(separator: ", "))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -287,7 +363,7 @@ struct VoiceSettingsView: View {
     }
 
     private var credentialsSection: some View {
-        ConduitSettingsSection(title: "Credentials on Hermes", symbol: "key.fill", tint: .conduitAura) {
+        ConduitSettingsSection(title: AppLocalization.string("Credentials on Hermes"), symbol: "key.fill", tint: .conduitAura) {
             Text("Keys stay on your Hermes host. Conduit only receives whether each key is set; it never reads a key back.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -308,7 +384,7 @@ struct VoiceSettingsView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(credential.key).font(.subheadline.weight(.semibold))
-                    Text(credential.isSet ? "Configured on Hermes" : "Not configured")
+                    Text(credential.isSet ? AppLocalization.string("Configured on Hermes") : AppLocalization.string("Not configured"))
                         .font(.caption)
                         .foregroundStyle(credential.isSet ? .green : .secondary)
                 }
@@ -344,7 +420,7 @@ struct VoiceSettingsView: View {
     }
 
     private var testingSection: some View {
-        ConduitSettingsSection(title: "Test this profile", symbol: "checkmark.seal", tint: .conduitAccent) {
+        ConduitSettingsSection(title: AppLocalization.string("Test this profile"), symbol: "checkmark.seal", tint: .conduitAccent) {
             Text("These checks use the selected speech route and active profile. Provider credentials remain on Hermes.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -374,11 +450,49 @@ struct VoiceSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            // The meter is visible only while the ASR test is actually
+            // recording (state .listening): once the sample is complete and
+            // the state becomes .transcribing, capture input is no longer
+            // the interesting signal, so the meter hides instead of
+            // freezing at its last value. Never shown during TTS playback.
+            if isRecordingASRTest, conversationController.state == .listening {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Microphone input")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    VoiceInputLevelMeter(level: conversationController.microphoneLevel, isActive: true)
+                        .frame(height: 20)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(Text("Microphone input level"))
+            }
+        }
+    }
+
+    private var spokenControlsSection: some View {
+        ConduitSettingsSection(title: "Spoken Controls", symbol: "text.bubble", tint: .conduitAura) {
+            Text("Phrases you can say during a Voice conversation. A phrase matches only when it is the entire spoken utterance — the same words inside a longer sentence do nothing.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            SpokenPhraseListEditor(
+                title: AppLocalization.string("Stop Phrases"),
+                purposeText: AppLocalization.string("Cancel the current response and keep Voice open."),
+                initialPhrases: spokenStopPhrases,
+                onChange: setStopPhrases
+            )
+            .id(spokenStopPhrases)
+            SpokenPhraseListEditor(
+                title: AppLocalization.string("End Conversation Phrases"),
+                purposeText: AppLocalization.string("Close the Voice conversation completely."),
+                initialPhrases: spokenEndConversationPhrases,
+                onChange: setEndConversationPhrases
+            )
+            .id(spokenEndConversationPhrases)
         }
     }
 
     private var wakeSection: some View {
-        ConduitSettingsSection(title: "Wake phrase", symbol: "ear.and.waveform", tint: .conduitAura) {
+        ConduitSettingsSection(title: AppLocalization.string("Wake phrase"), symbol: "ear.and.waveform", tint: .conduitAura) {
             Text("The bundled bilingual wake model is not active yet. Its redistribution terms and checksums must be reviewed before it can be included in Conduit.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -389,19 +503,19 @@ struct VoiceSettingsView: View {
     }
 
     private var profileDisplayName: String {
-        service.profile == "default" ? "Default profile" : service.profile.replacingOccurrences(of: "_", with: " ").capitalized
+        service.profile == "default" ? AppLocalization.string("Default profile") : service.profile.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
     private var availabilityTitle: String {
-        if supportsSelectedTranscription || service.snapshot.capability.supportsSpeech { return "Voice settings are available" }
-        return "Voice is unavailable"
+        if supportsSelectedTranscription || service.snapshot.capability.supportsSpeech { return AppLocalization.string("Voice settings are available") }
+        return AppLocalization.string("Voice is unavailable")
     }
 
     private var availabilityDetail: String {
         if transcriptionMode == .appleOnDevice, appleSpeechAvailability.canAttemptRecognition {
             return "Speech-to-text runs on this iPhone. Hermes retains assistant speech configuration and chat processing."
         }
-        return service.snapshot.capability.unavailableReason ?? "Hermes will retain all provider credentials and audio processing."
+        return service.snapshot.capability.unavailableReason ?? AppLocalization.string("Hermes will retain all provider credentials and audio processing.")
     }
 
     private var availabilityColor: Color {
@@ -422,7 +536,7 @@ struct VoiceSettingsView: View {
     ) -> [(id: String, title: String)] {
         let hermes = providers.map { (id: $0.descriptor.id, title: $0.descriptor.displayName) }
         guard kind == .stt else { return hermes }
-        return [(id: Self.appleProviderID, title: "On this iPhone")] + hermes
+        return [(id: Self.appleProviderID, title: AppLocalization.string("On this iPhone"))] + hermes
     }
 
     private var supportsSelectedTranscription: Bool {
@@ -442,11 +556,11 @@ struct VoiceSettingsView: View {
                     transcriptionMode = .appleOnDevice
                     testStatus = nil
                 } else if case .permissionRequired = appleSpeechAvailability {
-                    testStatus = "Enable Speech Recognition in Settings > Conduit > Speech Recognition, then retry selecting \"On this iPhone\"."
+                    testStatus = AppLocalization.string("Enable Speech Recognition in Settings > Conduit > Speech Recognition, then retry selecting \"On this iPhone\".")
                 } else if case .permissionDenied = appleSpeechAvailability {
-                    testStatus = "Speech Recognition permission was denied. Please enable it in Settings > Conduit > Speech Recognition."
+                    testStatus = AppLocalization.string("Speech Recognition permission was denied. Please enable it in Settings > Conduit > Speech Recognition.")
                 } else if case .unsupported = appleSpeechAvailability {
-                    testStatus = "On-device speech recognition is not available for your current language locale."
+                    testStatus = AppLocalization.string("On-device speech recognition is not available for your current language locale.")
                 }
             } else {
                 let providerSaved: Bool
@@ -471,8 +585,13 @@ struct VoiceSettingsView: View {
 
     private func save(value: String, field: VoiceTypedField) async {
         savingField = field.key
-        let saved = await service.save(value: value, for: field.key)
-        if !saved { values[field.key] = service.snapshot.values[field.key] ?? field.defaultValue }
+        _ = await service.save(value: value, for: field.key)
+        // Re-sync the draft with the confirmed server state either way: a
+        // canonicalized value ("1,5" → "1.5") or a removed override
+        // (blank → the field default) is what the editor should show, and
+        // a failed save restores the server value so the field never
+        // claims an unpersisted edit.
+        values[field.key] = service.snapshot.values[field.key] ?? field.defaultValue
         savingField = nil
     }
 
@@ -481,12 +600,14 @@ struct VoiceSettingsView: View {
         guard let action else { return }
         Task {
             isRunningTest = true
-            testStatus = kind == .stt ? "Listening for a short test…" : "Starting speech playback…"
+            isRecordingASRTest = kind == .stt
+            testStatus = kind == .stt ? AppLocalization.string("Listening for a short test…") : AppLocalization.string("Starting speech playback…")
             let result = await action()
             if kind == .stt, transcriptionMode == .appleOnDevice {
                 appleSpeechAvailability = AppleOnDeviceSpeechTranscriber.currentAvailability()
             }
             testStatus = result.message
+            isRecordingASRTest = false
             isRunningTest = false
         }
     }
@@ -494,11 +615,142 @@ struct VoiceSettingsView: View {
     private static let appleProviderID = "apple_on_device"
 }
 
+/// Compact phrase-list editor for one spoken-command category: view, add,
+/// edit, and delete entries, including down to an empty list (which disables
+/// that command category — defaults are not forced back). Every save
+/// canonicalizes through `VoiceSpokenCommands` so duplicates and blanks never
+/// reach persistence.
+private struct SpokenPhraseListEditor: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    let title: String
+    let purposeText: String
+    let initialPhrases: [String]
+    let onChange: ([String]) -> Void
+
+    @State private var phrases: [String]
+    @State private var draft = ""
+    @State private var editingIndex: Int?
+
+    init(title: String, purposeText: String, initialPhrases: [String], onChange: @escaping ([String]) -> Void) {
+        self.title = title
+        self.purposeText = purposeText
+        self.initialPhrases = initialPhrases
+        self.onChange = onChange
+        // Seed through the same canonicalization the write path uses: a
+        // legacy or externally written blob can carry duplicate/non-canonical
+        // entries, and the value-identity ForEach requires distinct values.
+        _phrases = State(initialValue: VoiceSpokenCommands.canonicalizedPhraseList(initialPhrases))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+            Text(purposeText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if phrases.isEmpty {
+                Label("No phrases. This spoken command is disabled.", systemImage: "minus.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            // Entries are pairwise distinct after canonicalization, so the
+            // value itself is a stable identity across deletes and dedupes.
+            ForEach(phrases, id: \.self) { phrase in
+                phraseRow(phrase)
+            }
+            HStack(spacing: 8) {
+                TextField(editingIndex == nil ? AppLocalization.string("Add a phrase") : AppLocalization.string("Edit phrase"), text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(commitDraft)
+                    .accessibilityLabel(Text(editingIndex == nil ? AppLocalization.string("Add \(title)") : AppLocalization.string("Edit \(title)")))
+                Button(editingIndex == nil ? "Add" : "Save", action: commitDraft)
+                    .disabled(draftCanonicalized.isEmpty)
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var draftCanonicalized: String {
+        VoiceSpokenCommands.canonicalized(draft)
+    }
+
+    private func phraseRow(_ phrase: String) -> some View {
+        HStack(spacing: 10) {
+            Text(phrase)
+                .font(.subheadline)
+            Spacer()
+            Button {
+                draft = phrase
+                editingIndex = phrases.firstIndex(of: phrase)
+            } label: {
+                Image(systemName: "pencil")
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(Text(AppLocalization.string("Edit phrase \(phrase)")))
+            Button {
+                deletePhrase(phrase)
+            } label: {
+                Image(systemName: "minus.circle.fill")
+                    .foregroundStyle(.red)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(Text("Delete phrase \(phrase)"))
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func commitDraft() {
+        // A draft that canonicalizes to empty ("   ", "!!!") would be
+        // dropped by the save-time canonicalization anyway — refuse it here
+        // so committing never silently no-ops.
+        guard !draftCanonicalized.isEmpty else { return }
+        var updated = phrases
+        if let editingIndex, phrases.indices.contains(editingIndex) {
+            updated[editingIndex] = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            updated.append(draft.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        save(updated)
+    }
+
+    private func deletePhrase(_ phrase: String) {
+        guard let index = phrases.firstIndex(of: phrase) else { return }
+        // Deleting any row discards the current in-progress edit: save()
+        // clears the draft and the edit target unconditionally.
+        var updated = phrases
+        updated.remove(at: index)
+        save(updated)
+    }
+
+    private func save(_ updated: [String]) {
+        let canonical = VoiceSpokenCommands.canonicalizedPhraseList(updated)
+        phrases = canonical
+        onChange(canonical)
+        draft = ""
+        editingIndex = nil
+    }
+}
+
 private struct VoiceProviderFieldEditor: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let field: VoiceTypedField
     @Binding var value: String
     let isSaving: Bool
     let save: (String) async -> Void
+
+    /// Mirrors the service-side save guard so out-of-range numbers are
+    /// rejected locally before a config round trip.
+    private var validationMessage: String? {
+        VoiceConfigurationParser.validationMessage(for: value, key: field.key)
+    }
+
+    private var saveHint: Text {
+        if let validationMessage {
+            return Text("Cannot save. \(validationMessage)")
+        }
+        return Text("Saves \(field.label) to this Hermes profile.")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -515,13 +767,21 @@ private struct VoiceProviderFieldEditor: View {
                 TextField(field.label, text: $value)
                     .keyboardType(.decimalPad)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { Task { await save(value) } }
+                    .onSubmit(submitIfValid)
+                    .accessibilityHint(Text(validationMessage ?? field.help))
             case .text:
                 TextField(field.label, text: $value)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { Task { await save(value) } }
+                    .onSubmit(submitIfValid)
+                    .accessibilityHint(Text(validationMessage ?? field.help))
+            }
+            if let validationMessage {
+                Text(validationMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityLabel(Text("Cannot save \(field.label): \(validationMessage)"))
             }
             HStack {
                 Text(field.help).font(.caption).foregroundStyle(.secondary)
@@ -529,12 +789,19 @@ private struct VoiceProviderFieldEditor: View {
                 if case .choice = field.kind {
                     EmptyView()
                 } else {
-                    Button(isSaving ? "Saving…" : "Save") { Task { await save(value) } }
+                    Button(isSaving ? AppLocalization.string("Saving…") : AppLocalization.string("Save")) { Task { await save(value) } }
                         .font(.caption.weight(.semibold))
-                        .disabled(isSaving)
+                        .disabled(isSaving || validationMessage != nil)
+                        .accessibilityHint(saveHint)
                 }
             }
         }
         .padding(.vertical, 3)
+    }
+
+    /// Keyboard submit must respect the same guard as the Save button.
+    private func submitIfValid() {
+        guard !isSaving, validationMessage == nil else { return }
+        Task { await save(value) }
     }
 }

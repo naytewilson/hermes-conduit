@@ -187,6 +187,530 @@ final class SessionPresentationCacheTests: XCTestCase {
         XCTAssertEqual(merged.count, 1)
     }
 
+    func testRemoveSessionsDropsEveryAliasRecordButLeavesSiblings() throws {
+        let (cache, _, _, _) = try makeIsolatedCache()
+        let profile = "remove-test"
+        let deletedPrimary = "remove-deleted-primary"
+        let deletedAlias = "remove-deleted-alias"
+        let sibling = "remove-sibling"
+
+        let messages = [
+            ChatMessage(id: "msg-1", role: .user, content: "Remove me", timestamp: "2024-01-01"),
+        ]
+        cache.save(messages, profile: profile, sessionIDs: [deletedPrimary, deletedAlias])
+        cache.save(
+            [ChatMessage(id: "msg-2", role: .user, content: "Keep me", timestamp: "2024-01-02")],
+            profile: profile,
+            sessionIDs: [sibling]
+        )
+
+        cache.removeSessions(profile: profile, sessionIDs: [deletedPrimary, deletedAlias])
+
+        let probe = ChatMessage(id: "msg-1", role: .user, content: "Remove me", timestamp: "")
+        for alias in [deletedPrimary, deletedAlias] {
+            XCTAssertEqual(
+                cache.merge([probe], profile: profile, sessionIDs: [alias]).first?.timestamp,
+                "",
+                "A deleted conversation's cached presentation must not survive under any alias"
+            )
+        }
+        XCTAssertEqual(
+            cache.merge(
+                [ChatMessage(id: "msg-2", role: .user, content: "Keep me", timestamp: "")],
+                profile: profile,
+                sessionIDs: [sibling]
+            ).first?.timestamp,
+            "2024-01-02",
+            "Sibling conversations keep their cached presentation"
+        )
+    }
+
+    // MARK: - Durable-owned persistence (runtime alias retirement)
+
+    func testConsolidationMigratesRuntimeOnlyRecordToDurableKeyWithoutLoss() throws {
+        // Runtime-only establishment: presentation cached under runtime-x
+        // must MIGRATE to the durable key when stored-A is established —
+        // never be lost — and the mutable runtime key must be retired.
+        let (cache, _, tickClock, _) = try makeIsolatedCache()
+        let profile = "consolidate"
+        let messages = [
+            ChatMessage(id: "m1", role: .assistant, content: "Answer", timestamp: "ts-1"),
+            ChatMessage(
+                id: "m2",
+                role: .user,
+                content: "Question",
+                timestamp: "ts-2",
+                tool: ToolActivity(id: "t1", name: "shell", input: "", output: "files", status: .complete)
+            ),
+        ]
+        cache.save(messages, profile: profile, sessionIDs: ["runtime-x"])
+        tickClock()
+
+        cache.consolidateUnderDurableKey(
+            profile: profile,
+            durableSessionID: "stored-a",
+            runtimeAliases: ["runtime-x"]
+        )
+
+        let probe = messages.map { message -> ChatMessage in
+            var row = ChatMessage(id: message.id, role: message.role, content: message.content, timestamp: "")
+            // The merge only ENRICHES an existing tool row — mirror the
+            // gateway's compact shape (tool present, details omitted).
+            if let tool = message.tool {
+                row.tool = ToolActivity(id: tool.id, name: tool.name, input: "", output: nil, status: tool.status)
+            }
+            return row
+        }
+        let merged = cache.merge(probe, profile: profile, sessionIDs: ["stored-a"])
+        XCTAssertEqual(merged.map(\.timestamp), ["ts-1", "ts-2"], "Establishment migrates the record")
+        XCTAssertEqual(merged[1].tool?.input, "files", "Tool metadata migrates with the record")
+        XCTAssertEqual(
+            cache.merge(probe, profile: profile, sessionIDs: ["runtime-x"]).map(\.timestamp),
+            ["", ""],
+            "The runtime-keyed copy is retired"
+        )
+    }
+
+    func testReattributedRuntimeCannotLeakPresentationIntoAnotherConversation() throws {
+        // The reported bleed: A's presentation (pending approval card
+        // included) was cached under runtime-x; the gateway later
+        // re-attributes runtime-x to stored-B. After consolidation retired
+        // the runtime key, restoring B through runtime-x must find NOTHING
+        // of A's — while A's own presentation survives under its durable key.
+        let (cache, _, tickClock, _) = try makeIsolatedCache()
+        let profile = "bleed"
+        let approval = ApprovalActivity(
+            sessionId: "runtime-x",
+            command: "",
+            description: "A's pending approval",
+            choices: ["once", "deny"],
+            allowPermanent: false,
+            smartDenied: false,
+            status: .pending,
+            choice: nil,
+            error: nil
+        )
+        let aMessages = [
+            ChatMessage(
+                id: "a-approval",
+                role: .approval,
+                content: "A's pending approval",
+                timestamp: "a-ts",
+                approval: approval
+            ),
+        ]
+        cache.save(aMessages, profile: profile, sessionIDs: ["stored-a", "runtime-x"])
+        tickClock()
+
+        cache.consolidateUnderDurableKey(
+            profile: profile,
+            durableSessionID: "stored-a",
+            runtimeAliases: ["runtime-x"]
+        )
+
+        // Restore B using the re-attributed runtime id.
+        let bProbe = [
+            ChatMessage(id: "b-row", role: .assistant, content: "B's own reply", timestamp: "")
+        ]
+        let restoredForB = cache.merge(
+            bProbe,
+            profile: profile,
+            sessionIDs: ["runtime-x"],
+            includePendingApprovals: true
+        )
+        XCTAssertNil(restoredForB[0].approval, "A's pending approval must not cross into B")
+        XCTAssertEqual(restoredForB[0].timestamp, "", "A's timestamps must not cross into B")
+        XCTAssertFalse(restoredForB.contains { $0.role == .approval })
+
+        // Positive control: A still restores through its durable key, and the
+        // migrated card now answers against the DURABLE session — after a
+        // later rotation of runtime-x, an approve tap can never dispatch to
+        // whatever the old runtime id routes to.
+        let aProbe = [
+            ChatMessage(id: "a-approval", role: .approval, content: "A's pending approval", timestamp: "")
+        ]
+        let restoredForA = cache.merge(
+            aProbe,
+            profile: profile,
+            sessionIDs: ["stored-a"],
+            includePendingApprovals: true
+        )
+        XCTAssertEqual(restoredForA[0].approval?.description, "A's pending approval")
+        XCTAssertEqual(restoredForA[0].timestamp, "a-ts")
+        XCTAssertEqual(
+            restoredForA[0].approval?.sessionId, "stored-a",
+            "Consolidation rewrites the card's routing identity to the durable session"
+        )
+    }
+
+    func testConsolidationKeepsExistingDurableRecordOverAliasCopy() throws {
+        // When the durable key already holds the live write, consolidation
+        // must keep it (dropping stale alias copies), not overwrite it with
+        // an older alias snapshot.
+        let (cache, _, tickClock, _) = try makeIsolatedCache()
+        let profile = "keep-live"
+        cache.save(
+            [ChatMessage(id: "live", role: .assistant, content: "Live durable write", timestamp: "live-ts")],
+            profile: profile,
+            sessionIDs: ["stored-a"]
+        )
+        tickClock()
+        cache.save(
+            [ChatMessage(id: "stale", role: .assistant, content: "Stale alias copy", timestamp: "stale-ts")],
+            profile: profile,
+            sessionIDs: ["runtime-x"]
+        )
+
+        cache.consolidateUnderDurableKey(
+            profile: profile,
+            durableSessionID: "stored-a",
+            runtimeAliases: ["runtime-x"]
+        )
+
+        let probe = [ChatMessage(id: "live", role: .assistant, content: "Live durable write", timestamp: "")]
+        XCTAssertEqual(
+            cache.merge(probe, profile: profile, sessionIDs: ["stored-a"]).first?.timestamp,
+            "live-ts",
+            "The durable record is the live write and survives"
+        )
+        XCTAssertEqual(
+            cache.merge(
+                [ChatMessage(id: "stale", role: .assistant, content: "Stale alias copy", timestamp: "")],
+                profile: profile,
+                sessionIDs: ["runtime-x"]
+            ).map(\.timestamp),
+            [""],
+            "The alias copy is retired"
+        )
+    }
+
+    func testConsolidationPromotesNewPendingApprovalIntoExistingDurableRecord() throws {
+        // The notification-promotion case: the durable record already holds
+        // normal presentation when a fresh pending approval arrives under a
+        // runtime alias. Consolidation must promote the CARD (deduped,
+        // routing id rewritten to the durable session) while keeping the
+        // durable transcript authoritative — and retire the alias key.
+        let (cache, _, tickClock, _) = try makeIsolatedCache()
+        let profile = "promote"
+        cache.save(
+            [ChatMessage(id: "d1", role: .assistant, content: "Durable transcript", timestamp: "durable-ts")],
+            profile: profile,
+            sessionIDs: ["stored-a"]
+        )
+        tickClock()
+        let approval = ApprovalActivity(
+            sessionId: "runtime-x",
+            command: "",
+            description: "Fresh push approval",
+            choices: ["once", "deny"],
+            allowPermanent: false,
+            smartDenied: false,
+            status: .pending,
+            choice: nil,
+            error: nil
+        )
+        cache.save(
+            [
+                ChatMessage(
+                    id: "approval-runtime-x",
+                    role: .approval,
+                    content: "Fresh push approval",
+                    timestamp: "push-ts",
+                    approval: approval
+                )
+            ],
+            profile: profile,
+            sessionIDs: ["runtime-old"]
+        )
+
+        cache.consolidateUnderDurableKey(
+            profile: profile,
+            durableSessionID: "stored-a",
+            // Production unions every runtime the admitted resume knows: the
+            // push-named key (runtime-old) AND the card's own embedded
+            // session key (runtime-x) — both are retired by promotion.
+            runtimeAliases: ["runtime-old", "runtime-x"]
+        )
+
+        let probe = [
+            ChatMessage(id: "d1", role: .assistant, content: "Durable transcript", timestamp: ""),
+            ChatMessage(id: "approval-runtime-x", role: .approval, content: "Fresh push approval", timestamp: ""),
+        ]
+        let merged = cache.merge(
+            probe,
+            profile: profile,
+            sessionIDs: ["stored-a"],
+            includePendingApprovals: true
+        )
+        XCTAssertEqual(merged[0].timestamp, "durable-ts", "The durable transcript stays authoritative")
+        XCTAssertEqual(
+            merged[1].approval?.sessionId, "stored-a",
+            "The promoted card answers against the durable session"
+        )
+        XCTAssertEqual(merged[1].approval?.status, .pending)
+        // No duplicates, no runtime key: consolidating again must not add a
+        // second card, and the runtime-old copy is gone.
+        cache.consolidateUnderDurableKey(
+            profile: profile,
+            durableSessionID: "stored-a",
+            runtimeAliases: ["runtime-old", "runtime-x"]
+        )
+        let mergedAgain = cache.merge(
+            probe,
+            profile: profile,
+            sessionIDs: ["stored-a"],
+            includePendingApprovals: true
+        )
+        XCTAssertEqual(mergedAgain.filter { $0.role == .approval }.count, 1)
+        XCTAssertNil(
+            cache.merge([probe[1]], profile: profile, sessionIDs: ["runtime-old"], includePendingApprovals: true)
+                .first?.approval,
+            "The runtime alias key is retired — no card answers from it"
+        )
+    }
+
+    func testConsolidationPromotesPendingClarifyIntoExistingDurableRecordWithoutRewritingRequestId() throws {
+        // Clarify request ids are request identity (relay-minted), not
+        // session routing identity: promotion must preserve them verbatim,
+        // dedupe on a second pass, and retire the alias key.
+        let (cache, _, tickClock, _) = try makeIsolatedCache()
+        let profile = "promote-clarify"
+        cache.save(
+            [ChatMessage(id: "d1", role: .assistant, content: "Durable transcript", timestamp: "durable-ts")],
+            profile: profile,
+            sessionIDs: ["stored-a"]
+        )
+        tickClock()
+        cache.save(
+            [
+                ChatMessage(
+                    id: "clarify-conduit-push-q1",
+                    role: .clarify,
+                    content: "Which env?",
+                    timestamp: "push-ts",
+                    clarify: ClarifyActivity(
+                        requestId: "conduit-push-q1",
+                        question: "Which env?",
+                        choices: [ClarifyChoice(label: "staging", value: "staging")],
+                        status: .pending,
+                        answer: nil,
+                        error: nil
+                    )
+                )
+            ],
+            profile: profile,
+            sessionIDs: ["runtime-old"]
+        )
+
+        cache.consolidateUnderDurableKey(
+            profile: profile,
+            durableSessionID: "stored-a",
+            runtimeAliases: ["runtime-old"]
+        )
+
+        let probe = [ChatMessage(id: "p", role: .assistant, content: "probe", timestamp: "")]
+        let merged = cache.merge(probe, profile: profile, sessionIDs: ["stored-a"], includePendingClarifications: true)
+        let cards = merged.filter { $0.clarify?.requestId == "conduit-push-q1" }
+        XCTAssertEqual(cards.count, 1, "Exactly one promoted clarify card")
+        XCTAssertEqual(cards.first?.clarify?.requestId, "conduit-push-q1", "Request ids are never rewritten")
+        cache.consolidateUnderDurableKey(
+            profile: profile,
+            durableSessionID: "stored-a",
+            runtimeAliases: ["runtime-old"]
+        )
+        let mergedAgain = cache.merge(probe, profile: profile, sessionIDs: ["stored-a"], includePendingClarifications: true)
+        XCTAssertEqual(
+            mergedAgain.filter { $0.clarify?.requestId == "conduit-push-q1" }.count, 1,
+            "Promotion dedupes by decision key"
+        )
+        XCTAssertTrue(
+            cache.merge(probe, profile: profile, sessionIDs: ["runtime-old"], includePendingClarifications: true)
+                .filter { $0.clarify?.requestId == "conduit-push-q1" }.isEmpty,
+            "The runtime alias key is retired"
+        )
+    }
+
+    func testConsolidationRefreshesExpiredDurableMarkerSoPromotedCardStaysVisible() throws {
+        // A durable record whose unconfirmed marker has expired must not
+        // kill a freshly promoted card: promotion refreshes the marker from
+        // the contributing alias so the card renders after the promotion.
+        let (cache, cacheDefaults, tickClock, _) = try makeIsolatedCache()
+        let profile = "expired-marker"
+        let expiredApproval = ApprovalActivity(
+            sessionId: "stored-a",
+            command: "",
+            description: "Old durable card",
+            choices: ["once", "deny"],
+            allowPermanent: false,
+            smartDenied: false,
+            status: .pending,
+            choice: nil,
+            error: nil
+        )
+        cache.save(
+            [
+                ChatMessage(
+                    id: "approval-old",
+                    role: .approval,
+                    content: "Old durable card",
+                    timestamp: "old-ts",
+                    approval: expiredApproval
+                )
+            ],
+            profile: profile,
+            sessionIDs: ["stored-a"],
+            unconfirmedPendingDecisionKeys: ["approval:stored-a"]
+        )
+        // Age the durable record's marker past the 24h unconfirmed window.
+        for _ in 0..<8_700 { tickClock() }
+        let freshApproval = ApprovalActivity(
+            sessionId: "runtime-x",
+            command: "",
+            description: "Fresh push approval",
+            choices: ["once", "deny"],
+            allowPermanent: false,
+            smartDenied: false,
+            status: .pending,
+            choice: nil,
+            error: nil
+        )
+        cache.recordPendingDecision(
+            ChatMessage(
+                id: "approval-fresh",
+                role: .approval,
+                content: "Fresh push approval",
+                timestamp: "fresh-ts",
+                approval: freshApproval
+            ),
+            profile: profile,
+            sessionIDs: ["runtime-x"]
+        )
+        XCTAssertEqual(
+            cache.storedPendingDecisionKeys(profile: profile, sessionIDs: ["runtime-x"]),
+            ["approval:runtime-x"],
+            "Fixture check: the fresh card is staged under the runtime key"
+        )
+        XCTAssertTrue(
+            cache.unconfirmedPendingDecisionDate(profile: profile, sessionIDs: ["stored-a"]).map {
+                cache.isUnconfirmedPendingDecisionExpired(since: $0)
+            } ?? false,
+            "Fixture check: the durable marker is expired at consolidation time"
+        )
+
+        cache.consolidateUnderDurableKey(
+            profile: profile,
+            durableSessionID: "stored-a",
+            runtimeAliases: ["runtime-x"]
+        )
+
+        XCTAssertEqual(
+            cache.storedPendingDecisionKeys(profile: profile, sessionIDs: ["stored-a"]),
+            ["approval:stored-a"],
+            "Promotion must land the fresh card in the durable record"
+        )
+
+        let probe = [
+            ChatMessage(id: "approval-fresh", role: .approval, content: "Fresh push approval", timestamp: "")
+        ]
+        let merged = cache.merge(
+            probe,
+            profile: profile,
+            sessionIDs: ["stored-a"],
+            includePendingApprovals: true
+        )
+        XCTAssertEqual(
+            merged.first?.approval?.description, "Fresh push approval",
+            "The freshly promoted card must not be killed by the durable record's expired marker"
+        )
+        XCTAssertEqual(merged.first?.approval?.sessionId, "stored-a")
+    }
+
+    func testConsolidationStaleAliasNeverOverwritesDurableTranscript() throws {
+        // Inverse protection: a stale alias snapshot with NO new pending
+        // decision must not touch the durable transcript presentation at
+        // all — the alias key is simply retired.
+        let (cache, _, tickClock, _) = try makeIsolatedCache()
+        let profile = "stale-alias"
+        let durableMessages = [
+            ChatMessage(id: "d1", role: .assistant, content: "Fresh row", timestamp: "fresh-ts"),
+            ChatMessage(id: "d2", role: .user, content: "Second", timestamp: "fresh-ts-2"),
+        ]
+        cache.save(durableMessages, profile: profile, sessionIDs: ["stored-a"])
+        tickClock()
+        let staleMessages = [
+            ChatMessage(id: "s1", role: .assistant, content: "Stale row", timestamp: "stale-ts"),
+        ]
+        cache.save(staleMessages, profile: profile, sessionIDs: ["runtime-x"])
+
+        cache.consolidateUnderDurableKey(
+            profile: profile,
+            durableSessionID: "stored-a",
+            runtimeAliases: ["runtime-x"]
+        )
+
+        let probe = durableMessages.map { message in
+            ChatMessage(id: message.id, role: message.role, content: message.content, timestamp: "")
+        }
+        XCTAssertEqual(
+            cache.merge(probe, profile: profile, sessionIDs: ["stored-a"]).map(\.timestamp),
+            ["fresh-ts", "fresh-ts-2"],
+            "The durable transcript presentation is unchanged"
+        )
+        XCTAssertTrue(
+            cache.merge(
+                staleMessages.map { message in
+                    ChatMessage(id: message.id, role: message.role, content: message.content, timestamp: "")
+                },
+                profile: profile,
+                sessionIDs: ["runtime-x"]
+            ).allSatisfy { $0.timestamp.isEmpty },
+            "The stale alias key is retired"
+        )
+    }
+
+    func testConsolidationPreservesPendingClarifyThroughEstablishment() throws {
+        // A pending clarify recorded under a runtime-only identity survives
+        // the runtime→durable establishment migration.
+        let (cache, _, tickClock, _) = try makeIsolatedCache()
+        let profile = "clarify-migrate"
+        let clarify = ClarifyActivity(
+            requestId: "conduit-push-xyz",
+            question: "Which env?",
+            choices: [ClarifyChoice(label: "staging", value: "staging")],
+            status: .pending,
+            answer: nil,
+            error: nil
+        )
+        cache.save(
+            [
+                ChatMessage(
+                    id: "clarify-conduit-push-xyz",
+                    role: .clarify,
+                    content: "Which env?",
+                    timestamp: "c-ts",
+                    clarify: clarify
+                )
+            ],
+            profile: profile,
+            sessionIDs: ["runtime-only"]
+        )
+        tickClock()
+
+        cache.consolidateUnderDurableKey(
+            profile: profile,
+            durableSessionID: "stored-a",
+            runtimeAliases: ["runtime-only"]
+        )
+
+        let probe = [ChatMessage(id: "probe", role: .assistant, content: "p", timestamp: "")]
+        let restored = cache.merge(probe, profile: profile, sessionIDs: ["stored-a"], includePendingClarifications: true)
+        XCTAssertTrue(
+            restored.contains { $0.clarify?.requestId == "conduit-push-xyz" && $0.clarify?.status == .pending },
+            "The pending clarify migrates with the record"
+        )
+    }
+
+
     // MARK: - Multiple session IDs
 
     func testSaveAndMergeAcrossLineageSessionIds() {
@@ -208,6 +732,242 @@ final class SessionPresentationCacheTests: XCTestCase {
 
         XCTAssertEqual(merged[0].timestamp, "2024-01-01")
 
+        cache.clear(profile: profile)
+    }
+
+    // MARK: - Multi-alias merge: logical-snapshot deduplication
+
+    /// Isolated cache with a manually advanced clock so alias-write order
+    /// (and therefore CachedSession.updatedAt comparisons) is deterministic.
+    private func makeIsolatedCache() throws -> (cache: SessionPresentationCache, defaults: UserDefaults, tickClock: () -> Void, suiteName: String) {
+        let suiteName = "SessionPresentationCacheTests.dedup." + UUID().uuidString
+        let defaults = try XCTUnwrap(
+            UserDefaults(suiteName: suiteName),
+            "Could not create isolated UserDefaults suite"
+        )
+        let clock = DeterministicClock()
+        let cache = SessionPresentationCache(defaults: defaults, now: { clock.currentValue() })
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        return (cache, defaults, { clock.advance() }, suiteName)
+    }
+
+    /// THE reported bug shape: one transcript saved under [primary,
+    /// resolved] and later REWRITTEN through only one alias with fresher
+    /// presentation metadata (same messages - Hermes re-stamped them).
+    /// Merging through both aliases must yield the freshest snapshot's
+    /// metadata exactly once per row. The old duplicated-candidate pool
+    /// flattened both generations and could attach stale metadata.
+    func testDualAliasMergeYieldsFreshestSnapshotOncePerRow() throws {
+        let (cache, _, tickClock, _) = try makeIsolatedCache()
+        let primaryId = "alias-primary-" + UUID().uuidString
+        let resolvedId = "alias-resolved-" + UUID().uuidString
+        let profile = "test"
+
+        func generation(prefix: String) -> [ChatMessage] {
+            (1...5).map { index in
+                ChatMessage(
+                    id: "gen-row-" + String(index),
+                    role: .assistant,
+                    content: "Status digest " + String(index),
+                    timestamp: prefix + String(index)
+                )
+            }
+        }
+
+        cache.save(generation(prefix: "stale-"), profile: profile, sessionIDs: [primaryId, resolvedId])
+        tickClock()
+        cache.save(generation(prefix: "fresh-"), profile: profile, sessionIDs: [resolvedId])
+
+        // Regenerated ids force fingerprint-based matching instead of the
+        // exact-id path.
+        let gatewayMessages = (1...5).map { index in
+            ChatMessage(id: "gw-" + String(index), role: .assistant, content: "Status digest " + String(index), timestamp: "")
+        }
+        let merged = cache.merge(gatewayMessages, profile: profile, sessionIDs: [primaryId, resolvedId])
+
+        XCTAssertEqual(
+            merged.map(\.timestamp),
+            ["fresh-1", "fresh-2", "fresh-3", "fresh-4", "fresh-5"]
+        )
+        cache.clear(profile: profile)
+    }
+
+    /// Tool-call flavor of the same drift: same tool name, fresher input
+    /// preview. Duplicated candidates must not cross-wire row one's input
+    /// with row two's.
+    func testRepeatedToolCallsKeepDistinctFreshMetadataAcrossAliases() throws {
+        let (cache, _, tickClock, _) = try makeIsolatedCache()
+        let primaryId = "tool-primary-" + UUID().uuidString
+        let resolvedId = "tool-resolved-" + UUID().uuidString
+        let profile = "test"
+
+        func toolGeneration(prefix: String) -> [ChatMessage] {
+            (1...2).map { index in
+                ChatMessage(
+                    id: "tool-row-" + String(index),
+                    role: .tool,
+                    content: "",
+                    timestamp: prefix + "ts-" + String(index),
+                    tool: ToolActivity(
+                        id: nil,
+                        name: "deploy",
+                        input: prefix + "input-" + String(index),
+                        output: prefix + "output-" + String(index),
+                        status: .complete
+                    )
+                )
+            }
+        }
+
+        cache.save(toolGeneration(prefix: "stale-"), profile: profile, sessionIDs: [primaryId, resolvedId])
+        tickClock()
+        cache.save(toolGeneration(prefix: "fresh-"), profile: profile, sessionIDs: [resolvedId])
+
+        let gatewayMessages = (1...2).map { index in
+            ChatMessage(
+                id: "gw-tool-" + String(index),
+                role: .tool,
+                content: "",
+                timestamp: "",
+                tool: ToolActivity(id: nil, name: "deploy", input: nil, output: nil, status: .complete)
+            )
+        }
+        let merged = cache.merge(gatewayMessages, profile: profile, sessionIDs: [primaryId, resolvedId])
+
+        XCTAssertEqual(merged[0].tool?.input, "fresh-input-1")
+        XCTAssertEqual(merged[1].tool?.input, "fresh-input-2")
+        XCTAssertEqual(merged[0].timestamp, "fresh-ts-1")
+        cache.clear(profile: profile)
+    }
+
+    /// Duplicate STRINGS inside sessionIDs behave like any other
+    /// multi-alias lookup rather than a doubled pool.
+    func testDuplicateStringsInsideSessionIDsDoNotDuplicateCandidates() throws {
+        let (cache, _, _, _) = try makeIsolatedCache()
+        let sessionId = "dup-string-" + UUID().uuidString
+        let profile = "test"
+
+        let savedMessages = [
+            ChatMessage(id: "twin-a", role: .assistant, content: "Twin status A", timestamp: "twin-ts-a"),
+            ChatMessage(id: "twin-b", role: .assistant, content: "Twin status B", timestamp: "twin-ts-b"),
+        ]
+        cache.save(savedMessages, profile: profile, sessionIDs: [sessionId])
+
+        let gatewayMessages = [
+            ChatMessage(id: "gw-twin-a", role: .assistant, content: "Twin status A", timestamp: ""),
+            ChatMessage(id: "gw-twin-b", role: .assistant, content: "Twin status B", timestamp: ""),
+        ]
+        let merged = cache.merge(gatewayMessages, profile: profile, sessionIDs: [sessionId, sessionId])
+
+        XCTAssertEqual(merged[0].timestamp, "twin-ts-a")
+        XCTAssertEqual(merged[1].timestamp, "twin-ts-b")
+        cache.clear(profile: profile)
+    }
+
+    /// Single-alias lookup keeps working exactly as before.
+    func testSingleAliasMergeUnchangedByDeduplication() throws {
+        let (cache, _, _, _) = try makeIsolatedCache()
+        let sessionId = "single-" + UUID().uuidString
+        let profile = "test"
+
+        cache.save(
+            [ChatMessage(id: "keep-1", role: .assistant, content: "Saved once", timestamp: "kept-ts")],
+            profile: profile,
+            sessionIDs: [sessionId]
+        )
+        let merged = cache.merge(
+            [ChatMessage(id: "keep-1", role: .assistant, content: "Saved once", timestamp: "")],
+            profile: profile,
+            sessionIDs: [sessionId]
+        )
+        XCTAssertEqual(merged[0].timestamp, "kept-ts")
+        cache.clear(profile: profile)
+    }
+
+    /// Two supplied IDs that hold genuinely DIFFERENT snapshots must both
+    /// stay available to the matcher: dedup keys on whole-record logical
+    /// identity, never on surface similarity of individual rows.
+    func testDifferentSnapshotsRemainAvailableToMatcher() throws {
+        let (cache, _, _, _) = try makeIsolatedCache()
+        let primaryId = "distinct-primary-" + UUID().uuidString
+        let resolvedId = "distinct-resolved-" + UUID().uuidString
+        let profile = "test"
+
+        cache.save(
+            [ChatMessage(id: "a-row", role: .assistant, content: "snapshot alpha", timestamp: "alpha-ts")],
+            profile: profile,
+            sessionIDs: [primaryId]
+        )
+        cache.save(
+            [
+                ChatMessage(id: "b-row", role: .assistant, content: "snapshot beta", timestamp: "beta-ts"),
+                ChatMessage(id: "c-row", role: .user, content: "snapshot gamma", timestamp: "gamma-ts"),
+            ],
+            profile: profile,
+            sessionIDs: [resolvedId]
+        )
+
+        let gatewayMessages = [
+            ChatMessage(id: "a-row", role: .assistant, content: "snapshot alpha", timestamp: ""),
+            ChatMessage(id: "b-row", role: .assistant, content: "snapshot beta", timestamp: ""),
+            ChatMessage(id: "c-row", role: .user, content: "snapshot gamma", timestamp: ""),
+        ]
+        let merged = cache.merge(gatewayMessages, profile: profile, sessionIDs: [primaryId, resolvedId])
+
+        XCTAssertEqual(merged[0].timestamp, "alpha-ts")
+        XCTAssertEqual(merged[1].timestamp, "beta-ts")
+        XCTAssertEqual(merged[2].timestamp, "gamma-ts")
+        cache.clear(profile: profile)
+    }
+
+    /// Pins the documented tie contract for DIVERGENT snapshots: equal-
+    /// scoring rows resolve to the earliest pool position, which is this
+    /// call's argument order (production passes [resolved, requested] so
+    /// the live write leads). Here the newer-written alias is listed
+    /// second; precedence still follows argument order by design.
+    func testDivergentSnapshotTieResolvesByAliasArgumentOrder() throws {
+        let (cache, _, tickClock, _) = try makeIsolatedCache()
+        let requestedId = "tie-requested-" + UUID().uuidString
+        let resolvedId = "tie-resolved-" + UUID().uuidString
+        let profile = "test"
+
+        // Older write lands under the SECOND-listed alias...
+        cache.save(
+            [ChatMessage(id: "", role: .assistant, content: "Drifted row", timestamp: "older-ts")],
+            profile: profile,
+            sessionIDs: [requestedId]
+        )
+        tickClock()
+        // ...and the newer write under the FIRST-listed alias. Rows share
+        // role+signature shape via identical content; identities diverge
+        // only through their stamps being absent from the identity key.
+        // Different toolName-free assistant rows with the same text and
+        // id have the SAME identity, so instead give genuinely different
+        // ids: both records stay in the pool and the tie must follow
+        // argument order.
+        cache.save(
+            [ChatMessage(id: "drift-b", role: .assistant, content: "Drifted row", timestamp: "newer-ts")],
+            profile: profile,
+            sessionIDs: [resolvedId]
+        )
+
+        let gatewayMessages = [
+            ChatMessage(id: "gw-drift-a", role: .assistant, content: "Drifted row", timestamp: ""),
+            ChatMessage(id: "gw-drift-b", role: .assistant, content: "Drifted row", timestamp: ""),
+        ]
+        let merged = cache.merge(gatewayMessages, profile: profile, sessionIDs: [resolvedId, requestedId])
+
+        XCTAssertEqual(
+            Set(merged.compactMap(\.timestamp)),
+            Set(["older-ts", "newer-ts"]),
+            "both divergent snapshots stay available to the matcher"
+        )
+        XCTAssertNotEqual(
+            merged[0].timestamp, merged[1].timestamp,
+            "distinct gateway rows must consume distinct candidates"
+        )
         cache.clear(profile: profile)
     }
 
@@ -252,7 +1012,7 @@ final class SessionPresentationCacheTests: XCTestCase {
         XCTAssertNotNil(restoredClarify, "Pending clarification should be restored from cache")
         XCTAssertEqual(restoredClarify?.clarify?.requestId, "req-123")
         XCTAssertEqual(restoredClarify?.clarify?.status, .pending)
-        XCTAssertEqual(restoredClarify?.clarify?.choices.count, 2)
+        XCTAssertEqual(restoredClarify?.clarify?.questions.first?.choices.count, 2)
     }
 
     func testMergeDoesNotRestoreClarificationWhenNotRequested() {
@@ -770,7 +1530,7 @@ final class SessionPresentationCacheTests: XCTestCase {
             ChatMessage(
                 id: "clarify-req-apply-resume",
                 role: .clarify,
-                content: clarify.question,
+                content: clarify.displayQuestion,
                 timestamp: "2024-01-01",
                 clarify: clarify
             )
@@ -904,7 +1664,7 @@ final class SessionPresentationCacheTests: XCTestCase {
         let gatewayMessage = ChatMessage(
             id: "clarify-gateway-pending",
             role: .clarify,
-            content: clarify.question,
+            content: clarify.displayQuestion,
             timestamp: "2024-01-01",
             clarify: clarify
         )
@@ -1031,7 +1791,7 @@ final class SessionPresentationCacheTests: XCTestCase {
         let message = ChatMessage(
             id: "clarify-expiring",
             role: .clarify,
-            content: clarify.question,
+            content: clarify.displayQuestion,
             timestamp: "2024-01-01",
             clarify: clarify
         )
@@ -1094,7 +1854,7 @@ final class SessionPresentationCacheTests: XCTestCase {
             ChatMessage(
                 id: "clarify-warm-expiring",
                 role: .clarify,
-                content: clarify.question,
+                content: clarify.displayQuestion,
                 timestamp: "2024-01-01",
                 clarify: clarify
             )
@@ -1149,7 +1909,7 @@ final class SessionPresentationCacheTests: XCTestCase {
             ChatMessage(
                 id: "clarify-background",
                 role: .clarify,
-                content: clarify.question,
+                content: clarify.displayQuestion,
                 timestamp: "2024-01-01",
                 clarify: clarify
             )
@@ -1370,22 +2130,22 @@ final class SessionPresentationCacheTests: XCTestCase {
             ChatMessage(
                 id: "clarify-\(pendingClarify.requestId)",
                 role: .clarify,
-                content: pendingClarify.question,
+                content: pendingClarify.displayQuestion,
                 timestamp: "2024-01-01",
                 clarify: pendingClarify
             )
         ], profile: profile, sessionIDs: [sessionId])
         let resolvedClarify = ClarifyActivity(
             requestId: pendingClarify.requestId,
-            question: pendingClarify.question,
-            choices: pendingClarify.choices,
+            question: pendingClarify.questions[0].question,
+            choices: pendingClarify.questions[0].choices,
             status: .answered,
             answer: "red"
         )
         let gatewayMessage = ChatMessage(
             id: "clarify-\(pendingClarify.requestId)",
             role: .clarify,
-            content: resolvedClarify.question,
+            content: resolvedClarify.displayQuestion,
             timestamp: "2024-01-02",
             clarify: resolvedClarify
         )
@@ -1495,7 +2255,7 @@ final class SessionPresentationCacheTests: XCTestCase {
             ChatMessage(
                 id: "clarify-running",
                 role: .clarify,
-                content: clarify.question,
+                content: clarify.displayQuestion,
                 timestamp: "2024-01-01",
                 clarify: clarify
             )
@@ -1545,7 +2305,7 @@ final class SessionPresentationCacheTests: XCTestCase {
         let gatewayMessage = ChatMessage(
             id: "clarify-gateway-pending-false",
             role: .clarify,
-            content: clarify.question,
+            content: clarify.displayQuestion,
             timestamp: "2024-01-01",
             clarify: clarify
         )
@@ -1778,5 +2538,25 @@ final class SessionPresentationCacheTests: XCTestCase {
             ).contains { $0.approval?.sessionId == sessionId },
             "An expired gateway approval must be removed from the presentation cache"
         )
+    }
+}
+
+/// Test-scope clock whose value only moves when a test advances it. Gives
+/// multi-write alias scenarios strictly increasing, deterministic
+/// CachedSession.updatedAt ordering without wall-clock dependence.
+final class DeterministicClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 1_000_000
+
+    func currentValue() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return Date(timeIntervalSince1970: value)
+    }
+
+    func advance() {
+        lock.lock()
+        defer { lock.unlock() }
+        value += 10
     }
 }

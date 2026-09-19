@@ -133,6 +133,31 @@ final class ChatResumeStore {
         persist()
     }
 
+    /// Removes every trace of the given sessions inside `profile`: their
+    /// scroll snapshots, and the profile's last-selected pointer when it
+    /// names one of them. The delete path calls this so a deleted
+    /// conversation cannot leave restorable state behind under any of its
+    /// identities.
+    func removeSessions(profile: String, sessionIDs: [String]) {
+        let normalizedProfile = ChatScrollIdentityNormalization.profile(profile)
+        let ids = Set(sessionIDs.compactMap(ChatScrollIdentityNormalization.sessionID))
+        guard let normalizedProfile, !ids.isEmpty else { return }
+        var changed = false
+        let before = payload.snapshots.count
+        payload.snapshots.removeAll {
+            $0.key.profile == normalizedProfile && ids.contains($0.key.sessionID)
+        }
+        changed = changed || payload.snapshots.count != before
+        if let last = payload.lastSessionIDsByProfile[normalizedProfile],
+           ids.contains(last) {
+            payload.lastSessionIDsByProfile.removeValue(forKey: normalizedProfile)
+            changed = true
+        }
+        if changed {
+            persist()
+        }
+    }
+
     func flush() {
         persist()
     }
