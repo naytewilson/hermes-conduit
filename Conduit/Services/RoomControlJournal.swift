@@ -20,8 +20,6 @@ import Foundation
 struct RoomControlJournal {
     static let schemaVersion = 1
     static let defaultStorageKey = "conduit.roomControlJournal.v1"
-    static let maximumEntries = 64
-
     enum Phase: String, Codable, Equatable {
         case pending
         case recorded
@@ -85,7 +83,6 @@ struct RoomControlJournal {
         )
         payload.order.removeAll { $0 == key }
         payload.order.append(key)
-        trimIfNeeded()
         persist()
         return candidate
     }
@@ -134,13 +131,6 @@ struct RoomControlJournal {
             && lhs.trigger == rhs.trigger
             && lhs.projectSlug == rhs.projectSlug
             && lhs.correlationID == rhs.correlationID
-    }
-
-    private mutating func trimIfNeeded() {
-        while payload.order.count > Self.maximumEntries, let oldest = payload.order.first {
-            payload.order.removeFirst()
-            payload.entries.removeValue(forKey: oldest)
-        }
     }
 
     private func persist() {
