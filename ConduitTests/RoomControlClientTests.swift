@@ -52,7 +52,7 @@ private final class ScriptedControlHub {
             self.requests.append(RecordedRequest(
                 method: request.httpMethod ?? "",
                 path: url.path(percentEncoded: true),
-                query: url.query,
+                query: URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQuery,
                 body: body
             ))
             let fixture = self.handler(request)
@@ -264,6 +264,23 @@ final class RoomControlClientTests: XCTestCase {
         XCTAssertTrue(query.contains("limit=50"))
         XCTAssertEqual(list.operations.count, 2)
         XCTAssertEqual(list.operations[0].operationId, Self.operationID)
+    }
+
+    func testListOperationsCannotInjectAdditionalQueryParameters() async throws {
+        hub.handler = { _ in (200, Self.opListBody) }
+        _ = try await makeClient().listOperations(
+            executionID: "exec&status=recorded",
+            op: "retry&limit=200",
+            status: .applied,
+            limit: 5
+        )
+
+        let query = try XCTUnwrap(hub.requests.first?.query)
+        XCTAssertTrue(query.contains("executionId=exec%26status%3Drecorded"))
+        XCTAssertTrue(query.contains("op=retry%26limit%3D200"))
+        XCTAssertTrue(query.contains("status=applied"))
+        XCTAssertTrue(query.contains("limit=5"))
+        XCTAssertEqual(query.components(separatedBy: "&").count, 4)
     }
 
     // MARK: - Authority distinctions
