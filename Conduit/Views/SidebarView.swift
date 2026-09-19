@@ -2,7 +2,7 @@
 //  SidebarView.swift
 //  Conduit
 //
-//  Full-screen slide-in sidebar with Sessions / Cron / Capabilities tabs.
+//  Full-screen slide-in sidebar with Sessions / Cron / Kanban tabs.
 //
 
 import SwiftUI
@@ -10,23 +10,18 @@ import SwiftUI
 struct SidebarView: View {
     @EnvironmentObject var appState: AppState
     let onRequestSettings: () -> Void
-    @AppStorage("conduit.sidebarTab") private var selectedTab: SidebarTab = .sessions
+    /// Drawer mode keeps the current modal-sheet behavior; persistent mode
+    /// renders the same content as a fixed root-layout column with no close
+    /// control and no dismissal.
+    var presentation: SidebarPresentation = .drawer
+    @AppStorage("conduit.sidebarTab") private var selectedTabRaw = SidebarTab.sessions.rawValue
+
+    private var selectedTab: SidebarTab {
+        get { SidebarTab.migrated(rawValue: selectedTabRaw) }
+        set { selectedTabRaw = newValue.rawValue }
+    }
     @State private var showProfilePicker = false
     @Environment(\.dismiss) private var dismiss
-
-    enum SidebarTab: String, CaseIterable {
-        case sessions = "Sessions"
-        case cron = "Cron"
-        case capabilities = "Capabilities"
-
-        var icon: String {
-            switch self {
-            case .sessions: return "bubble.left.and.bubble.right"
-            case .cron: return "clock"
-            case .capabilities: return "wrench.adjustable"
-            }
-        }
-    }
 
     var body: some View {
         NavigationStack {
@@ -77,15 +72,17 @@ struct SidebarView: View {
                             .conduitGlassControl(cornerRadius: 18)
                             .accessibilityLabel("Settings")
 
-                            Button {
-                                dismiss()
-                            } label: {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 15, weight: .semibold))
-                                    .frame(width: 44, height: 44)
+                            if presentation == .drawer {
+                                Button {
+                                    dismiss()
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .frame(width: 44, height: 44)
+                                }
+                                .conduitGlassControl(cornerRadius: 18)
+                                .accessibilityLabel("Close sessions")
                             }
-                            .conduitGlassControl(cornerRadius: 18)
-                            .accessibilityLabel("Close sessions")
                         }
                     }
 
@@ -95,10 +92,10 @@ struct SidebarView: View {
                                 Button {
                                     withAnimation(ConduitMotion.response) {
                                         Haptics.selection()
-                                        selectedTab = tab
+                                        selectedTabRaw = tab.rawValue
                                     }
                                 } label: {
-                                    Label(tab.rawValue, systemImage: tab.icon)
+                                    Label(tab.displayName, systemImage: tab.icon)
                                         .font(.caption.weight(.semibold))
                                         .frame(maxWidth: .infinity)
                                         .frame(height: 40)
@@ -119,10 +116,12 @@ struct SidebarView: View {
                         switch selectedTab {
                         case .sessions:
                             SessionList()
+                        case .bots:
+                            BotRosterView()
                         case .cron:
                             CronList()
-                        case .capabilities:
-                            CapabilitiesList()
+                        case .kanban:
+                            KanbanView()
                         }
                     }
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
@@ -137,12 +136,17 @@ struct SidebarView: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
+        .onAppear {
+            // Explicitly migrate removed raw values such as Capabilities.
+            selectedTabRaw = SidebarTab.migrated(rawValue: selectedTabRaw).rawValue
+        }
     }
 }
 
 // MARK: - Session List
 
 struct SessionList: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject var appState: AppState
     @State private var searchText = ""
     @State private var showFilterOrder = false
@@ -179,7 +183,7 @@ struct SessionList: View {
             HStack(spacing: 10) {
                 Button {
                     Haptics.medium()
-                    appState.showSidebar = false
+                    appState.dismissSidebarDrawer()
                     Task { await appState.createNewSession() }
                 } label: {
                     HStack(spacing: 6) {
@@ -256,7 +260,7 @@ struct SessionList: View {
                 }
                 .buttonStyle(.plain)
                 .conduitGlassControl(cornerRadius: 14, tint: showingProjects ? .conduitAccent.opacity(0.14) : .clear)
-                .accessibilityLabel(showingProjects ? "Show sessions" : "Browse projects")
+                .accessibilityLabel(showingProjects ? AppLocalization.string("Show sessions") : AppLocalization.string("Browse projects"))
             }
             .padding(.horizontal, 14)
             .padding(.top, 8)
@@ -269,9 +273,9 @@ struct SessionList: View {
                     projectContent
                 } else if displayedSessions.isEmpty {
                     ContentUnavailableView(
-                        selectedSource == nil ? "No Sessions" : "No \(selectedSource!.label) Sessions",
+                        selectedSource == nil ? AppLocalization.string("No Sessions") : AppLocalization.string("No \(selectedSource!.label) Sessions"),
                         systemImage: "tray",
-                        description: Text(searchText.isEmpty ? "Sessions will appear here once created." : "Try a different search.")
+                        description: Text(searchText.isEmpty ? AppLocalization.string("Sessions will appear here once created.") : AppLocalization.string("Try a different search."))
                     )
                 }
 
@@ -291,7 +295,7 @@ struct SessionList: View {
                     }
                 }
             }
-            .searchable(text: $searchText, prompt: showingProjects ? "Search projects" : "Search sessions")
+            .searchable(text: $searchText, prompt: showingProjects ? AppLocalization.string("Search projects") : AppLocalization.string("Search sessions"))
             .scrollContentBackground(.hidden)
             .listStyle(.plain)
             .refreshable {
@@ -377,11 +381,11 @@ struct SessionList: View {
                 .listRowSeparator(.hidden)
         } else if displayedProjects.isEmpty {
             ContentUnavailableView(
-                searchText.isEmpty ? "No Projects" : "No Matching Projects",
+                searchText.isEmpty ? AppLocalization.string("No Projects") : AppLocalization.string("No Matching Projects"),
                 systemImage: "folder",
                 description: Text(searchText.isEmpty
-                    ? "Projects created in Hermes Desktop will appear here."
-                    : "Try a different search.")
+                    ? AppLocalization.string("Projects created in Hermes Desktop will appear here.")
+                    : AppLocalization.string("Try a different search."))
             )
         } else {
             Section("Projects") {
@@ -429,7 +433,7 @@ struct SessionList: View {
     private var sourceFilters: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                sourceFilter(title: "All", count: appState.activeProfileSessions.filter { !$0.isArchived }.count, source: nil)
+                sourceFilter(title: AppLocalization.string("All"), count: appState.activeProfileSessions.filter { !$0.isArchived }.count, source: nil)
                 ForEach(availableSources, id: \.self) { source in
                     sourceFilter(title: source.label, count: appState.activeProfileSessions.filter { !$0.isArchived && $0.source == source }.count, source: source)
                 }
@@ -442,7 +446,7 @@ struct SessionList: View {
     private func sourceFilter(title: String, count: Int, source: SessionSource?) -> some View {
         Button { withAnimation(ConduitMotion.response) { Haptics.selection()
                 setSelectedSource(source) } } label: {
-            Text("\(title) \(count)")
+            Text("\(title) \(String(count))")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(selectedSource == source ? Color.conduitBackgroundColor : .secondary)
                 .padding(.horizontal, 11).padding(.vertical, 7)
@@ -454,7 +458,7 @@ struct SessionList: View {
     private func sessionRow(_ session: SessionSummary) -> some View {
         Button {
             Haptics.light()
-            appState.showSidebar = false
+            appState.dismissSidebarDrawer()
             appState.requestOpenSession(session.id)
         } label: {
             SessionRow(
@@ -480,7 +484,7 @@ struct SessionList: View {
                 Haptics.light()
                 appState.toggleSessionPinned(session)
             } label: {
-                Label(appState.isSessionPinned(session) ? "Unpin" : "Pin", systemImage: appState.isSessionPinned(session) ? "pin.slash" : "pin")
+                Label(appState.isSessionPinned(session) ? AppLocalization.string("Unpin") : AppLocalization.string("Pin"), systemImage: appState.isSessionPinned(session) ? "pin.slash" : "pin")
             }
 
             Button {
@@ -505,7 +509,7 @@ struct SessionList: View {
                 Haptics.light()
                 appState.toggleSessionPinned(session)
             } label: {
-                Label(appState.isSessionPinned(session) ? "Unpin" : "Pin", systemImage: appState.isSessionPinned(session) ? "pin.slash" : "pin")
+                Label(appState.isSessionPinned(session) ? AppLocalization.string("Unpin") : AppLocalization.string("Pin"), systemImage: appState.isSessionPinned(session) ? "pin.slash" : "pin")
             }
             .tint(.conduitAccent)
         }
@@ -567,6 +571,7 @@ private struct SessionFilterOrderSheet: View {
 }
 
 private struct ArchivedSessionsSheet: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var searchText = ""
@@ -585,7 +590,7 @@ private struct ArchivedSessionsSheet: View {
                             .listRowSeparator(.hidden)
                     } else if displayedSessions.isEmpty {
                         ContentUnavailableView(
-                            searchText.isEmpty ? "Nothing archived" : "No matching conversations",
+                            searchText.isEmpty ? AppLocalization.string("Nothing archived") : AppLocalization.string("No matching conversations"),
                             systemImage: "archivebox",
                             description: Text("Archived conversations stay here until you restore or permanently delete them.")
                         )
@@ -630,14 +635,14 @@ private struct ArchivedSessionsSheet: View {
                         }
                     }
                 }
-                .searchable(text: $searchText, prompt: "Search archived conversations")
+                .searchable(text: $searchText, prompt: AppLocalization.string("Search archived conversations"))
                 .scrollContentBackground(.hidden)
                 .listStyle(.plain)
                 .refreshable { await refresh() }
             }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .top, spacing: 0) {
-                ConduitSheetHeader(title: "Archived conversations", close: { dismiss() })
+                ConduitSheetHeader(title: AppLocalization.string("Archived conversations"), close: { dismiss() })
             }
         }
         .task { await refresh() }
@@ -740,7 +745,7 @@ private struct ProjectRow: View {
                 Text(project.title)
                     .font(.subheadline.weight(.medium))
                     .lineLimit(1)
-                Text("\(project.sessionCount) \(project.sessionCount == 1 ? "conversation" : "conversations")")
+                Text("\(project.sessionCount) conversations")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -790,7 +795,7 @@ private struct ProjectSessionsSheet: View {
                             Section(lane.title) {
                                 ForEach(lane.sessions) { session in
                                     Button {
-                                        appState.showSidebar = false
+                                        appState.dismissSidebarDrawer()
                                         dismiss()
                                         appState.requestOpenSession(session.id)
                                     } label: {
@@ -815,7 +820,7 @@ private struct ProjectSessionsSheet: View {
                 if let path = project.primaryPath, !path.isEmpty {
                     ToolbarItem(placement: .topBarLeading) {
                         Button {
-                            appState.showSidebar = false
+                            appState.dismissSidebarDrawer()
                             dismiss()
                             Task { await appState.createNewSession(cwd: path) }
                         } label: {
@@ -1024,6 +1029,7 @@ private struct ProjectFolderPickerSheet: View {
 // MARK: - Cron List
 
 struct CronList: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject var appState: AppState
     @State private var searchText = ""
     @State private var selectedJob: CronJob?
@@ -1045,7 +1051,7 @@ struct CronList: View {
 
             if filteredJobs.isEmpty && !appState.cronJobsLoading {
                 ContentUnavailableView(
-                    searchText.isEmpty ? "No Scheduled Jobs" : "No Matching Jobs",
+                    searchText.isEmpty ? AppLocalization.string("No Scheduled Jobs") : AppLocalization.string("No Matching Jobs"),
                     systemImage: "clock",
                     description: Text("Scheduled jobs from Hermes appear here.")
                 )
@@ -1073,7 +1079,7 @@ struct CronList: View {
                 Section("Recent runs") {
                     ForEach(appState.activeProfileCronSessions.prefix(20)) { session in
                     Button {
-                        appState.showSidebar = false
+                        appState.dismissSidebarDrawer()
                         appState.requestOpenSession(session.id)
                     } label: {
                         SessionRow(session: session, isSelected: session.id == appState.activeSessionId).contentShape(Rectangle())
@@ -1086,7 +1092,7 @@ struct CronList: View {
                 }
             }
         }
-        .searchable(text: $searchText, prompt: "Search scheduled jobs")
+        .searchable(text: $searchText, prompt: AppLocalization.string("Search scheduled jobs"))
         .scrollContentBackground(.hidden)
         .listStyle(.plain)
         .task(id: appState.activeProfile) { await appState.refreshCronContent() }
@@ -1105,6 +1111,7 @@ struct CronList: View {
 }
 
 private struct CronJobRow: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     let job: CronJob
     var body: some View {
         HStack(spacing: 11) {
@@ -1113,11 +1120,11 @@ private struct CronJobRow: View {
                 .frame(width: 30, height: 30).background((job.enabled ? Color.green : .secondary).opacity(0.13), in: Circle())
             VStack(alignment: .leading, spacing: 3) {
                 Text(job.displayName).font(.subheadline.weight(.medium)).lineLimit(1)
-                Text(job.scheduleDisplay ?? job.schedule?.display ?? job.schedule?.expr ?? "No schedule")
+                Text(job.scheduleDisplay ?? job.schedule?.display ?? job.schedule?.expr ?? AppLocalization.string("No schedule"))
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
-            Text(job.enabled ? "Active" : "Paused").font(.caption2.weight(.semibold)).foregroundStyle(job.enabled ? .green : .secondary)
+            Text(job.enabled ? AppLocalization.string("Active") : AppLocalization.string("Paused")).font(.caption2.weight(.semibold)).foregroundStyle(job.enabled ? .green : .secondary)
             Image(systemName: "chevron.right").font(.caption2.weight(.bold)).foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
@@ -1126,6 +1133,7 @@ private struct CronJobRow: View {
 }
 
 private struct CronJobDetailSheet: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     let job: CronJob
@@ -1137,10 +1145,10 @@ private struct CronJobDetailSheet: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         ConduitSettingsSection(title: job.displayName, symbol: "clock.fill", tint: .conduitAccent) {
-                            SettingsMetricRow(label: "Schedule", value: job.scheduleDisplay ?? job.schedule?.display ?? job.schedule?.expr ?? "—")
-                            SettingsMetricRow(label: "Next run", value: job.nextRunAt ?? "—")
-                            SettingsMetricRow(label: "Last run", value: job.lastRunAt ?? "—")
-                            SettingsMetricRow(label: "Delivery", value: job.deliver ?? "Local")
+                            SettingsMetricRow(label: AppLocalization.string("Schedule"), value: job.scheduleDisplay ?? job.schedule?.display ?? job.schedule?.expr ?? "—")
+                            SettingsMetricRow(label: AppLocalization.string("Next run"), value: job.nextRunAt ?? "—")
+                            SettingsMetricRow(label: AppLocalization.string("Last run"), value: job.lastRunAt ?? "—")
+                            SettingsMetricRow(label: AppLocalization.string("Delivery"), value: job.deliver ?? "Local")
                         }
                         HStack(spacing: 10) {
                             Button { Task { _ = await appState.performCronAction(job.enabled ? "pause" : "resume", for: job) } } label: {
@@ -1150,7 +1158,7 @@ private struct CronJobDetailSheet: View {
                             .frame(minHeight: 48)
                             .conduitGlassControl(cornerRadius: 16, tint: .orange.opacity(0.18))
                             Button { Task { _ = await appState.performCronAction("trigger", for: job); await appState.loadCronRuns(for: job) } } label: {
-                                Label(appState.cronJobActionID == job.id ? "Working…" : "Run now", systemImage: "play.fill")
+                                Label(appState.cronJobActionID == job.id ? "Working…" : AppLocalization.string("Run now"), systemImage: "play.fill")
                                     .frame(maxWidth: .infinity)
                                     .foregroundStyle(Color.white)
                             }
@@ -1160,12 +1168,12 @@ private struct CronJobDetailSheet: View {
                         }
                         .font(.subheadline.weight(.semibold))
                         if let prompt = job.prompt, !prompt.isEmpty {
-                            ConduitSettingsSection(title: "Prompt", symbol: "text.quote", tint: .conduitAura) { Text(prompt).textSelection(.enabled).font(.callout) }
+                            ConduitSettingsSection(title: AppLocalization.string("Prompt"), symbol: "text.quote", tint: .conduitAura) { Text(prompt).textSelection(.enabled).font(.callout) }
                         }
-                        ConduitSettingsSection(title: "Run history", symbol: "clock.arrow.circlepath", tint: .conduitAura) {
+                        ConduitSettingsSection(title: AppLocalization.string("Run history"), symbol: "clock.arrow.circlepath", tint: .conduitAura) {
                             if appState.cronRuns.isEmpty { Text("This job has not run yet.").font(.footnote).foregroundStyle(.secondary) }
                             ForEach(appState.cronRuns) { run in
-                                Button { appState.showSidebar = false; dismiss(); appState.requestOpenSession(run.id) } label: {
+                                Button { appState.dismissSidebarDrawer(); dismiss(); appState.requestOpenSession(run.id) } label: {
                                     HStack { VStack(alignment: .leading) { Text(run.title ?? run.preview ?? run.id).lineLimit(1); Text(run.model ?? "Hermes").font(.caption).foregroundStyle(.secondary) }; Spacer(); Text(run.lastActive.map(String.init) ?? "").font(.caption2).foregroundStyle(.tertiary) }
                                 }
                                 .buttonStyle(.plain)
@@ -1177,241 +1185,9 @@ private struct CronJobDetailSheet: View {
             }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .top, spacing: 0) {
-                ConduitSheetHeader(title: "Scheduled job", close: { dismiss() })
+                ConduitSheetHeader(title: AppLocalization.string("Scheduled job"), close: { dismiss() })
             }
         }
         .task { await appState.loadCronRuns(for: job) }
-    }
-}
-
-// MARK: - Capabilities List
-
-struct CapabilitiesList: View {
-    @EnvironmentObject var appState: AppState
-    @State private var searchText = ""
-    @State private var capabilitiesLoading = false
-    @State private var loadError: String?
-
-    var body: some View {
-        VStack(spacing: 0) {
-            if capabilitiesLoading && appState.skills.isEmpty && appState.toolsets.isEmpty {
-                Spacer()
-                ProgressView("Loading capabilities…")
-                    .tint(.conduitAccent)
-                Spacer()
-            } else if let loadError, appState.skills.isEmpty && appState.toolsets.isEmpty {
-                ContentUnavailableView(
-                    "Couldn't Load",
-                    systemImage: "exclamationmark.triangle",
-                    description: Text(loadError)
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                List {
-                    skillsSection
-                    toolsetsSection
-                }
-                .searchable(text: $searchText, prompt: "Search skills")
-                .scrollContentBackground(.hidden)
-                .listStyle(.plain)
-                .refreshable { await loadCapabilities() }
-            }
-        }
-        .task(id: appState.activeProfile) { await loadCapabilities() }
-    }
-
-    // MARK: Skills
-
-    @ViewBuilder
-    private var skillsSection: some View {
-        if !filteredSkills.isEmpty {
-            if hasCategories {
-                ForEach(skillsByCategory, id: \.0) { category, skills in
-                    Section(category) {
-                        ForEach(skills) { skill in
-                            CapabilitySkillRow(skill: skill)
-                        }
-                    }
-                }
-            } else {
-                Section("Skills") {
-                    ForEach(filteredSkills) { skill in
-                        CapabilitySkillRow(skill: skill)
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: Toolsets
-
-    @ViewBuilder
-    private var toolsetsSection: some View {
-        if !filteredToolsets.isEmpty {
-            Section("Toolsets") {
-                ForEach(filteredToolsets) { toolset in
-                    CapabilityToolsetRow(toolset: toolset)
-                }
-            }
-        }
-    }
-
-    // MARK: Filtering & grouping
-
-    private var filteredSkills: [CapabilitySkill] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return appState.skills }
-        return appState.skills.filter { skill in
-            [skill.name, skill.description ?? "", skill.category ?? ""]
-                .contains { $0.localizedCaseInsensitiveContains(query) }
-        }
-    }
-
-    private var filteredToolsets: [CapabilityToolset] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return appState.toolsets }
-        return appState.toolsets.filter { toolset in
-            [toolset.name, toolset.label ?? "", toolset.description ?? ""]
-                .contains { $0.localizedCaseInsensitiveContains(query) }
-        }
-    }
-
-    private var hasCategories: Bool {
-        appState.skills.contains { $0.category != nil && !($0.category?.isEmpty ?? true) }
-    }
-
-    private var skillsByCategory: [(String, [CapabilitySkill])] {
-        let groups = Dictionary(grouping: filteredSkills) { $0.category ?? "Uncategorized" }
-        return groups.sorted { $0.key < $1.key }
-    }
-
-    // MARK: Loading
-
-    private func loadCapabilities() async {
-        capabilitiesLoading = true
-        defer { capabilitiesLoading = false }
-        await appState.loadCapabilities()
-        if appState.skills.isEmpty && appState.toolsets.isEmpty {
-            loadError = appState.errorMessage ?? "No capabilities found."
-        } else {
-            loadError = nil
-        }
-    }
-}
-
-// MARK: - Skill Row
-
-private struct CapabilitySkillRow: View {
-    @EnvironmentObject var appState: AppState
-    let skill: CapabilitySkill
-
-    private var provenanceIcon: String? {
-        switch skill.provenance {
-        case "hub": return "bag"
-        case "bundled": return "shippingbox"
-        case "agent": return "wrench"
-        default: return nil
-        }
-    }
-
-    var body: some View {
-        Toggle(isOn: Binding(
-            get: { skill.enabled },
-            set: { newValue in
-                Task { await appState.toggleSkill(name: skill.name, enabled: newValue) }
-            }
-        )) {
-            HStack(spacing: 11) {
-                Image(systemName: provenanceIcon ?? "puzzlepiece.extension")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(skill.enabled ? .conduitAccent : .secondary)
-                    .frame(width: 30, height: 30)
-                    .background(
-                        (skill.enabled ? Color.conduitAccent : Color.secondary).opacity(0.13),
-                        in: Circle()
-                    )
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Text(skill.name)
-                            .font(.subheadline.weight(.medium))
-                            .lineLimit(1)
-                        if let category = skill.category, !category.isEmpty {
-                            Text(category)
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.conduitAura.opacity(0.14), in: Capsule())
-                        }
-                    }
-                    if let desc = skill.description, !desc.isEmpty {
-                        Text(desc)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                }
-            }
-        }
-        .tint(.conduitAccent)
-        .listRowBackground(Color.clear)
-        .listRowSeparator(.hidden)
-        .listRowInsets(EdgeInsets(top: 3, leading: 0, bottom: 3, trailing: 0))
-    }
-}
-
-// MARK: - Toolset Row
-
-private struct CapabilityToolsetRow: View {
-    @EnvironmentObject var appState: AppState
-    let toolset: CapabilityToolset
-
-    var body: some View {
-        Toggle(isOn: Binding(
-            get: { toolset.enabled },
-            set: { newValue in
-                Task { await appState.toggleToolset(name: toolset.name, enabled: newValue) }
-            }
-        )) {
-            HStack(spacing: 11) {
-                Image(systemName: "wrench.and.screwdriver")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(toolset.enabled ? .conduitAccent : .secondary)
-                    .frame(width: 30, height: 30)
-                    .background(
-                        (toolset.enabled ? Color.conduitAccent : Color.secondary).opacity(0.13),
-                        in: Circle()
-                    )
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(toolset.label ?? toolset.name.capitalized)
-                        .font(.subheadline.weight(.medium))
-                        .lineLimit(1)
-                    if let desc = toolset.description, !desc.isEmpty {
-                        Text(desc)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                    if let tools = toolset.tools, !tools.isEmpty {
-                        Text(tools.joined(separator: ", "))
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-                    }
-                }
-
-                Spacer(minLength: 0)
-
-                Image(systemName: toolset.configured == true ? "checkmark.circle.fill" : "circle.dashed")
-                    .font(.caption)
-                    .foregroundStyle(toolset.configured == true ? .green : .secondary)
-            }
-        }
-        .tint(.conduitAccent)
-        .listRowBackground(Color.clear)
-        .listRowSeparator(.hidden)
-        .listRowInsets(EdgeInsets(top: 3, leading: 0, bottom: 3, trailing: 0))
     }
 }

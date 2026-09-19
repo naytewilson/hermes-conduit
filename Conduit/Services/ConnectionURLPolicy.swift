@@ -9,7 +9,7 @@ enum ConnectionURLPolicyError: LocalizedError, Equatable {
         case .invalidURL:
             return "Enter a valid dashboard URL."
         case .insecureTransport:
-            return "Remote dashboards must use HTTPS; HTTP is allowed only for localhost and Tailscale tailnet hosts."
+            return "Remote dashboards must use HTTPS; HTTP is allowed only for local networks (localhost, private LAN, and Tailscale)."
         }
     }
 }
@@ -24,6 +24,34 @@ enum ConnectionURLPolicy {
               components.user == nil,
               components.password == nil else { return false }
         return scheme == "https" || (scheme == "http" && isInsecureTransportAllowed(host))
+    }
+
+    /// The `about:` documents Cloudflare's Turnstile WebView requirements
+    /// call out ("Allow connections to `about:blank` and `about:srcdoc`").
+    /// Allowed only in SUBframes. Those documents inherit the parent page's
+    /// origin, so script inside them could attempt a top-level navigation —
+    /// but any such navigation is evaluated as a MAIN frame against the
+    /// strict transport/dashboard-origin rules, so this allowance never
+    /// widens the top-level boundary.
+    static func isTurnstileRequiredSubframeDocument(_ url: URL?) -> Bool {
+        // Classify from the absolute string: WebKit's own URL objects for
+        // these subframe navigations do not necessarily expose the document
+        // tail through `path`/`host` the way a string-constructed URL does
+        // (observed directly in the boundary tests).
+        guard var raw = url?.absoluteString.lowercased() else { return false }
+        guard raw.hasPrefix("about:") else { return false }
+        raw.removeFirst("about:".count)
+        // Strip any trailing slashes WebKit may append to about: URLs.
+        while raw.hasSuffix("/") { raw.removeLast() }
+        return raw == "blank" || raw == "srcdoc"
+    }
+
+    /// Transport policy for WebView SUBFRAME navigations: ordinary HTTP(S)
+    /// (identity providers, challenges.cloudflare.com) plus the about:
+    /// documents Turnstile requires. Everything else (custom schemes,
+    /// other about: variants, data:) is denied.
+    static func isAllowedWebViewSubframeTransport(_ url: URL?) -> Bool {
+        isAllowedTransport(url) || isTurnstileRequiredSubframeDocument(url)
     }
 
     static func normalizedBaseURL(_ value: String) throws -> String {
@@ -143,7 +171,7 @@ enum ConnectionURLPolicy {
 
     private static func isInsecureTransportAllowed(_ value: String) -> Bool {
         let host = value.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        return isLoopbackHost(host) || isTailscaleHost(host)
+        return isLoopbackHost(host) || isPrivateLANHost(host) || isTailscaleHost(host)
     }
 
     private static func isLoopbackHost(_ value: String) -> Bool {
@@ -158,9 +186,31 @@ enum ConnectionURLPolicy {
         // Tailscale CGNAT range: 100.64.0.0/10 (100.64.0.0 – 100.127.255.255)
         // Require a well-formed IPv4 address to prevent label-based bypasses
         // like 100.64.attacker.example being accepted.
-        let octets = host.split(separator: ".").compactMap { Int($0) }
-        guard octets.count == 4,
-              octets.allSatisfy({ (0...255).contains($0) }) else { return false }
+        guard let octets = ipv4Octets(host) else { return false }
         return octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127
+    }
+
+    private static func isPrivateLANHost(_ value: String) -> Bool {
+        // RFC1918 private ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+        guard let octets = ipv4Octets(value) else { return false }
+        switch octets[0] {
+        case 10:
+            return true
+        case 172:
+            return (16...31).contains(octets[1])
+        case 192:
+            return octets[1] == 168
+        default:
+            return false
+        }
+    }
+
+    private static func ipv4Octets(_ value: String) -> [Int]? {
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard components.count == 4 else { return nil }
+        let octets = components.compactMap { Int($0) }
+        guard octets.count == 4,
+              octets.allSatisfy({ (0...255).contains($0) }) else { return nil }
+        return octets
     }
 }

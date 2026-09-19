@@ -2,6 +2,16 @@ import XCTest
 @testable import Conduit
 
 final class ChatResumePolicyTests: XCTestCase {
+    func testPreserveCurrentNeverFallsBackWhenCatalogOmitsCurrentConversation() {
+        XCTAssertNil(ChatResumeSessionResolver.target(
+            in: [session("unrelated")],
+            behavior: .latestActivity,
+            purpose: .preserveCurrent,
+            savedSessionID: "stored-a",
+            currentSessionID: "runtime-a"
+        ))
+    }
+
     private func session(
         _ id: String,
         alternates: [String] = [],

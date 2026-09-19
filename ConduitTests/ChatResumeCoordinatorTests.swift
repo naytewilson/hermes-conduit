@@ -341,6 +341,107 @@ final class ChatResumeCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.store.snapshot(for: wrongKey), .latest)
     }
 
+    func testDeletingStagedConversationBeforePublicationPreventsRestoration() {
+        // Automatic return stages B (pendingSessionKey, viewport frozen).
+        // Deleting B must invalidate the staged work: settling afterwards can
+        // publish nothing for B, the viewport is not stuck frozen, and B's
+        // persisted state is gone while unrelated state survives.
+        let harness = makeHarness()
+        let keyB = ChatScrollSessionKey(profile: "default", sessionID: "stored-b")
+        let keyOther = ChatScrollSessionKey(profile: "default", sessionID: "other")
+        let reading = ChatScrollSnapshot(anchorMessageID: "anchor-b", followsLatest: false)
+        harness.store.save(reading, for: keyB, at: Date())
+        harness.store.setLastSessionID("stored-b", for: "default")
+        harness.store.setLastSessionID("other", for: "work")
+
+        _ = harness.coordinator.selectTarget(
+            in: [session("stored-a"), session("stored-b")],
+            profile: "default",
+            purpose: .automaticReturn,
+            currentSessionID: "stored-b"
+        )
+        XCTAssertNil(harness.coordinator.pendingRestoration)
+        // The staged key freezes recording.
+        harness.coordinator.recordViewport(.latest, for: keyOther)
+        XCTAssertNil(harness.store.snapshot(for: keyOther))
+
+        harness.coordinator.removeSessions(profile: "default", sessionIDs: ["stored-b"])
+
+        XCTAssertNil(harness.store.snapshot(for: keyB))
+        XCTAssertNil(harness.store.lastSessionID(for: "default"))
+        XCTAssertEqual(
+            harness.store.lastSessionID(for: "work"),
+            "other",
+            "Deletion is scoped: another profile's pointer survives"
+        )
+        // Settling the (now-deleted) conversation can produce no restoration.
+        XCTAssertNil(harness.coordinator.reconciliationSettled(sessionKey: keyB))
+        // The viewport must not be left permanently frozen.
+        harness.coordinator.recordViewport(.latest, for: keyOther)
+        XCTAssertEqual(harness.store.snapshot(for: keyOther), .latest)
+    }
+
+    func testDeletingPublishedConversationInvalidatesItsRestorationRequest() throws {
+        // After a restoration request for B is published, deleting B must
+        // invalidate it: the stale generation is no longer current, and
+        // completion/abandon of that generation cannot resurrect it.
+        let harness = makeHarness()
+        let keyB = ChatScrollSessionKey(profile: "default", sessionID: "stored-b")
+        let reading = ChatScrollSnapshot(anchorMessageID: "anchor-b", followsLatest: false)
+        harness.store.save(reading, for: keyB, at: Date())
+        harness.store.setLastSessionID("stored-b", for: "default")
+
+        _ = harness.coordinator.selectTarget(
+            in: [session("stored-b")],
+            profile: "default",
+            purpose: .automaticReturn,
+            currentSessionID: "stored-b"
+        )
+        let request = try XCTUnwrap(harness.coordinator.reconciliationSettled(sessionKey: keyB))
+
+        harness.coordinator.removeSessions(profile: "default", sessionIDs: ["stored-b"])
+
+        XCTAssertFalse(
+            harness.coordinator.isCurrent(generation: request.generation),
+            "The deleted conversation's published restoration is no longer current"
+        )
+        harness.coordinator.completeRestoration(generation: request.generation)
+        harness.coordinator.abandonRestoration(generation: request.generation)
+        XCTAssertNil(
+            harness.coordinator.pendingRestoration,
+            "A stale generation cannot resurrect the deleted request"
+        )
+        // Viewport recording works again for the surviving conversation.
+        let keyOther = ChatScrollSessionKey(profile: "default", sessionID: "other")
+        harness.coordinator.recordViewport(.latest, for: keyOther)
+        XCTAssertEqual(harness.store.snapshot(for: keyOther), .latest)
+    }
+
+    func testDeletingUnrelatedConversationKeepsPendingRestoration() throws {
+        // Deleting A while restoration B is staged+published leaves B's
+        // pending work — and B's persisted state — fully intact.
+        let harness = makeHarness()
+        let keyA = ChatScrollSessionKey(profile: "default", sessionID: "stored-a")
+        let keyB = ChatScrollSessionKey(profile: "default", sessionID: "stored-b")
+        let readingB = ChatScrollSnapshot(anchorMessageID: "anchor-b", followsLatest: false)
+        harness.store.save(readingB, for: keyB, at: Date())
+        harness.store.setLastSessionID("stored-b", for: "default")
+
+        _ = harness.coordinator.selectTarget(
+            in: [session("stored-a"), session("stored-b")],
+            profile: "default",
+            purpose: .automaticReturn,
+            currentSessionID: "stored-b"
+        )
+        let request = try XCTUnwrap(harness.coordinator.reconciliationSettled(sessionKey: keyB))
+
+        harness.coordinator.removeSessions(profile: "default", sessionIDs: ["stored-a"])
+
+        XCTAssertTrue(harness.coordinator.isCurrent(generation: request.generation))
+        XCTAssertNotNil(harness.coordinator.pendingRestoration)
+        XCTAssertEqual(harness.store.snapshot(for: keyB), readingB)
+    }
+
     private func makeHarness() -> (
         coordinator: ChatResumeCoordinator,
         store: ChatResumeStore,

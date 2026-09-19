@@ -9,11 +9,15 @@ import Foundation
 @MainActor
 final class VoiceConversationController: ObservableObject {
     struct Configuration: Equatable {
-        var voiceActivityThreshold: Float = 0.075
+        /// Conservative acoustic barge-in threshold, unchanged from the
+        /// legacy single VAD threshold. Listening-side speech detection no
+        /// longer uses this value; it adapts via `speechDetector` instead.
+        var bargeInActivityThreshold: Float = 0.075
         var trailingSilence: TimeInterval = 1.25
         var idleSilence: TimeInterval = 12
         var maximumUtterance: TimeInterval = 60
         var bargeInDuration: TimeInterval = 0.3
+        var speechDetector = VoiceSpeechDetectorConstants()
     }
 
     @Published private(set) var state: VoiceConversationState = .idle
@@ -21,7 +25,29 @@ final class VoiceConversationController: ObservableObject {
     @Published private(set) var lastBargeInState: VoiceConversationState?
     @Published private(set) var isOutputMuted = false
     @Published private(set) var isMicrophonePaused = false
+    /// Latest raw microphone input peak from the capture service. This is
+    /// presentation state: it moves whenever audio reaches Conduit,
+    /// regardless of whether the speech detector classifies it as speech,
+    /// and returns to zero whenever capture is paused, stopped, suspended,
+    /// or interrupted.
+    @Published private(set) var microphoneLevel: Float = 0
+    /// Publication clock for meter throttling: level events arrive at tap
+    /// buffer rate (~50 Hz), far faster than any useful UI animation, and
+    /// every @Published assignment re-renders observing surfaces.
+    private var lastMeterPublication: Date?
+    /// Automatic speaker-safe suspension while Hermes is audibly playing on
+    /// a route whose output can feed the microphone. Deliberately separate
+    /// from `isMicrophonePaused`: that flag is explicit user intent ("Microphone
+    /// paused"), this one is Conduit protecting the barge-in detector from
+    /// the assistant's own TTS and must never read as a user-selected pause.
+    @Published private(set) var isPlaybackCaptureSuspended = false
     @Published private(set) var conversationTranscript: [VoiceConversationTranscriptEntry] = []
+    /// Set by `suspendRuntimeForLifecycle()` until the runtime is explicitly
+    /// re-armed by a fresh listen or torn down by `stop()`. Suspended runtime
+    /// state rejects capture events outright: `hasLiveVoiceSession` remains
+    /// LOGICAL ownership (the conversation is restorable) and must never be
+    /// read as a claim that capture is live.
+    private(set) var isRuntimeSuspended = false
     private var preferences = VoiceProfilePreferences()
 
     let configuration: Configuration
@@ -29,8 +55,22 @@ final class VoiceConversationController: ObservableObject {
     private let playback: SpeechPlaybackService
     private let deviceTranscriber: DeviceSpeechTranscriptionService
     private var gateway: VoiceGatewayService?
+    /// Decides whether acoustic barge-in is safe while Hermes speaks.
+    /// Production reads the live AVAudioSession route; tests inject a fixed
+    /// or mutable policy so route classification is deterministic.
+    private let routePolicyProvider: @MainActor () -> VoiceBargeInRoutePolicy
     private let submit: @MainActor (String) async -> Bool
-    private let interrupt: @MainActor () async -> Void
+    /// Cancels the authoritative Hermes turn. Returns whether the
+    /// cancellation actually succeeded (true also when there was nothing
+    /// left to cancel). Call sites that only need the interrupt to have been
+    /// *attempted* (barge-in, manual Interrupt, spoken End Conversation)
+    /// discard the result; the suspended-orphan path acts on it.
+    private let interrupt: @MainActor () async -> Bool
+    /// Installed by AppState: the authoritative Voice Close teardown
+    /// (persist mute → `endVoiceSession` → sheet dismissal). A spoken End
+    /// Conversation phrase converges on it instead of a second teardown;
+    /// nil falls back to the controller-owned `stop()`.
+    private let endConversationRequest: (@MainActor () -> Void)?
     private var captureEventsTask: Task<Void, Never>?
     private var speechDeltas: [String] = []
     private var isDrainingSpeech = false
@@ -44,7 +84,17 @@ final class VoiceConversationController: ObservableObject {
     private var isVoiceSessionActive = false
     private var isAwaitingVoiceAssistant = false
     private var awaitedAssistantResponseStarted = false
-    private var expectedAssistantSessionID: String?
+    /// Every session id POSITIVELY confirmed to route this conversation's
+    /// assistant stream: the id captured at `beginVoiceTurn` plus any runtime
+    /// rebind admitted while the turn is live. Hermes events carry runtime
+    /// routing ids, so raw equality with the captured id alone would silently
+    /// drop the assistant's voice the moment a resume rebinds the runtime.
+    private var expectedAssistantSessionIDs: Set<String> = []
+    /// Set when a suspension retired the voice-side continuation of a
+    /// still-running Hermes turn. The next user submission cancels that
+    /// orphaned turn first (user-initiated, same seam as Stop) so its late
+    /// events can never alias onto the new turn's ownership.
+    private var suspendedInFlightTurnOrphaned = false
     private var operationGeneration: UInt64 = 0
     private var utteranceTask: Task<Void, Never>?
     private var bargeInTask: Task<Void, Never>?
@@ -52,6 +102,10 @@ final class VoiceConversationController: ObservableObject {
     private var speechDrainRevision: UInt64 = 0
     private var isProviderTestRunning = false
     private var activeAssistantTranscriptEntryID: UUID?
+    /// Adaptive listening-side speech detector (issue #130). Acoustic
+    /// barge-in does not use it; that path keeps the conservative fixed
+    /// threshold in `configuration.bargeInActivityThreshold`.
+    private var speechDetector: VoiceSpeechDetector
 
     init(
         capture: AudioCaptureService? = nil,
@@ -59,8 +113,10 @@ final class VoiceConversationController: ObservableObject {
         deviceTranscriber: DeviceSpeechTranscriptionService? = nil,
         gateway: VoiceGatewayService? = nil,
         configuration: Configuration = Configuration(),
+        routePolicyProvider: (@MainActor () -> VoiceBargeInRoutePolicy)? = nil,
         submit: @escaping @MainActor (String) async -> Bool,
-        interrupt: @escaping @MainActor () async -> Void
+        interrupt: @escaping @MainActor () async -> Bool,
+        onEndConversation: (@MainActor () -> Void)? = nil
     ) {
         let capture = capture ?? AVAudioCaptureService()
         self.capture = capture
@@ -68,8 +124,17 @@ final class VoiceConversationController: ObservableObject {
         self.deviceTranscriber = deviceTranscriber ?? AppleOnDeviceSpeechTranscriber()
         self.gateway = gateway
         self.configuration = configuration
+        speechDetector = VoiceSpeechDetector(constants: configuration.speechDetector)
+        // Built here (not as a default parameter value) so the live route
+        // read stays in MainActor context, matching the capture default.
+        if let routePolicyProvider {
+            self.routePolicyProvider = routePolicyProvider
+        } else {
+            self.routePolicyProvider = { VoiceBargeInRoutePolicy.current() }
+        }
         self.submit = submit
         self.interrupt = interrupt
+        self.endConversationRequest = onEndConversation
         captureEventsTask = Task { [weak self, capture] in
             for await event in capture.events {
                 guard !Task.isCancelled else { return }
@@ -80,6 +145,15 @@ final class VoiceConversationController: ObservableObject {
 
     deinit { captureEventsTask?.cancel() }
 
+    /// Swaps the gateway for FUTURE operations only (pinned Option B
+    /// semantics): an in-flight conversation keeps the gateway it captured at
+    /// its operation boundaries, and the caller that replaces connection
+    /// ownership must stop this controller first — the server-replacement
+    /// boundary in `AppState.retireSpeechOperationsForServerReplacement`
+    /// does. A plain swap is deliberately not an ownership change: capability
+    /// refreshes install fresh-but-equivalent instances (same bridge, server,
+    /// and profile) mid-conversation by design, so pointer inequality is not
+    /// a signal that the old operation's server authority ended.
     func setGateway(_ gateway: VoiceGatewayService?) { self.gateway = gateway }
 
     /// Establishes explicit ownership of assistant events for one voice turn.
@@ -88,9 +162,27 @@ final class VoiceConversationController: ObservableObject {
         isVoiceSessionActive = true
         isAwaitingVoiceAssistant = false
         awaitedAssistantResponseStarted = false
-        expectedAssistantSessionID = sessionID
+        expectedAssistantSessionIDs = [sessionID]
         conversationTranscript.removeAll(keepingCapacity: true)
         activeAssistantTranscriptEntryID = nil
+    }
+
+    /// Adds session ids an admitted resume positively rebound to this
+    /// conversation while the voice turn is live (runtime-old → runtime-new).
+    /// `ofConversationContaining` is the reconciled conversation's accepted
+    /// id set: the extension only applies when the turn's captured ids
+    /// POSITIVELY overlap it, so a reconcile belonging to a different
+    /// conversation can never inject its runtime into this turn's ownership.
+    /// Inactive sessions ignore the call: a fresh turn's capture starts from
+    /// its own id only.
+    func extendAssistantSessionIDs(
+        _ sessionIDs: Set<String>,
+        ofConversationContaining knownIDs: Set<String>
+    ) {
+        guard isVoiceSessionActive,
+              !expectedAssistantSessionIDs.isEmpty,
+              !expectedAssistantSessionIDs.isDisjoint(with: knownIDs) else { return }
+        expectedAssistantSessionIDs.formUnion(sessionIDs.filter { !$0.isEmpty })
     }
 
     func endVoiceSession() { stop() }
@@ -100,30 +192,75 @@ final class VoiceConversationController: ObservableObject {
         isOutputMuted = preferences.outputMuted
     }
 
+    /// Whether a completed assistant response automatically opens the next
+    /// listening turn. This is conversation continuation only — it does not
+    /// control session lifetime, user pause, barge-in, or route policy.
+    var isContinuousConversationEnabled: Bool {
+        preferences.continuousConversation
+    }
+
+    /// Observability seam: the preference blob currently applied to the
+    /// controller (mirrors the last `setProfilePreferences`), so hosts and
+    /// tests can read back what a preference mutation path actually reapplied.
+    var activePreferences: VoiceProfilePreferences {
+        preferences
+    }
+
+    /// True while a voice session or provider test is armed or live — i.e.
+    /// while voice audio ownership may exist or is being acquired — so
+    /// audio-adjacent side features (response haptics) stand down.
+    ///
+    /// Deliberately does NOT key off `state != .idle`: a terminal
+    /// `.failed("Audio was interrupted.")` has no live operation and must
+    /// not suppress Core Haptics indefinitely. The explicit ownership flags
+    /// cover every real ownership window: `startListening` raises
+    /// `isVoiceSessionActive` before its permission await (arming window),
+    /// all listening/thinking/speaking/muted/transcribing states occur with
+    /// it raised, and provider tests raise `isProviderTestRunning`. A failed
+    /// arming attempt keeps the flag until the session is stopped or
+    /// re-armed — bounded by the voice sheet's lifetime and conservative in
+    /// the safe direction.
+    var hasLiveVoiceSession: Bool {
+        isVoiceSessionActive || isProviderTestRunning
+    }
+
+    /// Observability seam: whether a gateway reference is currently installed.
+    /// The server-replacement boundary clears this reference; tests pin the
+    /// clearing through here because a stale gateway's failure mode (reaching
+    /// the outgoing server's bridge) is behavioral and hard to observe.
+    var isGatewayAttached: Bool { gateway != nil }
+
+    /// Voice presentation-surface gate (AppState feeds it): true while at
+    /// least one legitimate Voice presentation surface is active — the phone
+    /// foreground scene, or CarPlay presenting the shared conversation.
+    /// Listening and microphone work only under this gate. Deactivation-side
+    /// teardown is owned by the caller: AppState routes an open Voice
+    /// conversation through `suspendRuntimeForLifecycle()` (logical
+    /// preservation) and a closed one through `stop()` (full teardown).
     func setForegroundActive(_ active: Bool) {
         isForegroundActive = active
-        guard !active else { return }
-        stop()
     }
 
     func requestOnDeviceTranscriptionPermissions() async -> VoiceProviderTestResult {
         guard isForegroundActive else {
-            return .failure("Voice permissions can only be requested while Conduit is in the foreground.")
+            return .failure(AppLocalization.string("Voice permissions can only be requested while Conduit is in the foreground."))
         }
         guard await capture.requestPermission() else {
             return .failure(VoiceAudioError.microphonePermissionDenied.localizedDescription)
         }
         guard await deviceTranscriber.requestPermission() else {
-            return .failure("Speech Recognition permission is required for on-device transcription.")
+            return .failure(AppLocalization.string("Speech Recognition permission is required for on-device transcription."))
         }
-        return .success("On-device speech recognition is ready.")
+        return .success(AppLocalization.string("On-device speech recognition is ready."))
     }
 
     func startListening(includePreRoll: Bool = false) async {
         guard isForegroundActive else { return }
         let generation = operationGeneration
         isVoiceSessionActive = true
-        guard let gateway else { state = .failed("Voice is unavailable for this gateway."); return }
+        // A fresh listen re-arms the runtime: suspended state ends here.
+        rearmRuntimeAfterCaptureRestart()
+        guard let gateway else { state = .failed(AppLocalization.string("Voice is unavailable for this gateway.")); return }
         _ = gateway // keeps the availability check explicit at the state edge.
         guard await capture.requestPermission() else {
             guard isCurrent(generation) else { return }
@@ -133,7 +270,13 @@ final class VoiceConversationController: ObservableObject {
         guard isCurrent(generation) else { return }
         do {
             try capture.startListening(includePreRoll: includePreRoll)
-            if isMicrophonePaused { capture.pause() }
+            // Defense in depth: capture must never end up live over audible
+            // playback, whichever flag paused it.
+            if isMicrophonePaused || isPlaybackCaptureSuspended { capture.pause() }
+            // Fresh listening window: the detector must not inherit noise or
+            // speech state from the previous one.
+            speechDetector.reset()
+            resetMicrophoneMeter()
             utteranceStartedAt = Date()
             lastSpeechAt = nil
             bargeInStartedAt = nil
@@ -144,12 +287,26 @@ final class VoiceConversationController: ObservableObject {
     }
 
     func pauseMicrophone() {
+        // Explicit user intent never discards the speaker-safety fact: while
+        // the suspension flag survives, any later listen request during
+        // audible playback still routes through the interrupt path instead
+        // of resuming a live microphone over Hermes' voice. Presentation is
+        // handled by the sheet, which shows the user-paused state whenever
+        // `isMicrophonePaused` is set.
         capture.pause()
+        speechDetector.reset()
+        resetMicrophoneMeter()
         isMicrophonePaused = true
     }
 
     func resumeMicrophone() async {
         guard isForegroundActive else { return }
+        if isPlaybackCaptureSuspended {
+            // On a speaker-safe route there is no "listen while Hermes
+            // speaks": a listen request during playback means interrupt.
+            await interruptAssistantPlayback()
+            return
+        }
         if !isMicrophonePaused {
             switch state {
             case .idle, .failed:
@@ -163,13 +320,110 @@ final class VoiceConversationController: ObservableObject {
         do {
             try capture.resume()
             isMicrophonePaused = false
+            // Un-pausing after a lifecycle suspension is a genuine
+            // recapture: the runtime gate must end here exactly as it does
+            // in startListening(), or a restored previously-paused session
+            // would present Listening with a microphone that hears nothing.
+            rearmRuntimeAfterCaptureRestart()
+            // Pause is a real resource pause, so resume opens a fresh
+            // listening window: speech timestamps from before the pause must
+            // not immediately finish an utterance or idle-pause again, and
+            // the detector must not inherit pre-pause noise/speech state.
+            speechDetector.reset()
+            utteranceStartedAt = Date()
+            lastSpeechAt = nil
+            bargeInStartedAt = nil
+            // Listen from a settled continuous-OFF session: capture is live
+            // again, so the state must not remain .idle.
+            if state == .idle { state = .listening }
         } catch {
             state = .failed(error.localizedDescription)
         }
     }
 
+    /// The speaker-safe manual override for when automatic playback
+    /// suspension is active (the sheet's Interrupt control): stop playback,
+    /// retire the in-flight assistant turn through the authoritative
+    /// interruption seam, and open a fresh microphone window. Pre-roll is
+    /// deliberately not reused — while Hermes spoke on an open speaker it
+    /// may contain the assistant's own TTS.
+    func interruptAssistantPlayback() async {
+        guard isPlaybackCaptureSuspended else { return }
+        cachedRoutePolicy = nil
+        // Deliberately leaves lastBargeInState alone: that property records
+        // acoustic barge-in provenance, and this path always lands in
+        // .listening.
+        let generation = operationGeneration
+        playback.stop()
+        cancelSpeechDrainAndStream()
+        speechDeltas.removeAll()
+        assistantFinished = false
+        // The in-flight assistant response is intentionally interrupted; its
+        // terminal event belongs to the retired turn, not the next one.
+        isAwaitingVoiceAssistant = false
+        awaitedAssistantResponseStarted = false
+        isPlaybackCaptureSuspended = false
+        // The tap itself is an explicit request to speak now, so a pending
+        // user pause ends with it.
+        isMicrophonePaused = false
+        // Manual Interrupt proceeds on the attempt regardless of the
+        // cancellation result: the local turn retirement below already
+        // re-opened the listening window.
+        _ = await interrupt()
+        // The interruption is a real re-entrant async boundary (Hermes
+        // cancellation/recovery), and the sheet can close while it is in
+        // flight — stop() then advances the generation and tears the session
+        // down. The fence stops the stale continuation from resurrecting
+        // capture (isCurrent also covers foreground loss and session teardown).
+        guard isCurrent(generation) else { return }
+        await startListening()
+    }
+
     func stop() {
+        releaseRuntimeResources()
+        isMicrophonePaused = false
+        isVoiceSessionActive = false
+        isAwaitingVoiceAssistant = false
+        awaitedAssistantResponseStarted = false
+        expectedAssistantSessionIDs = []
+        suspendedInFlightTurnOrphaned = false
+        isRuntimeSuspended = false
+        state = .idle
+    }
+
+    /// Lifecycle suspension (app backgrounded / scene inactive) for a Voice
+    /// conversation that stays logically open: releases every runtime audio
+    /// and task ownership through the same primitive as `stop()`, but
+    /// preserves the conversation — transcript, session ownership, and an
+    /// explicit user pause — so AppState can restore it on foreground return.
+    /// State settles to .idle (open, not listening). The in-flight assistant
+    /// turn's voice-side continuation is retired WITHOUT cancelling the
+    /// Hermes turn (its outcome reconciles through the authoritative chat
+    /// transcript); the orphan is remembered so the next user submission
+    /// cancels it, preventing its late events from aliasing onto the new
+    /// turn's ownership.
+    func suspendRuntimeForLifecycle() {
+        releaseRuntimeResources()
+        // Sticky across consecutive suspensions: the first suspension already
+        // cleared isAwaitingVoiceAssistant, so a plain overwrite would forget
+        // an orphan that is still running server-side. Safe to retain — the
+        // cancel seam no-ops once the orphan has settled.
+        suspendedInFlightTurnOrphaned = suspendedInFlightTurnOrphaned || isAwaitingVoiceAssistant
+        isAwaitingVoiceAssistant = false
+        awaitedAssistantResponseStarted = false
+        isRuntimeSuspended = true
+        state = .idle
+    }
+
+    /// Shared teardown primitive for `stop()` and
+    /// `suspendRuntimeForLifecycle()`: releases every audio/task ownership
+    /// and fences all in-flight work with a generation bump. Logical
+    /// conversation identity (session ownership, awaiting state, transcript,
+    /// user pause) is intentionally untouched here — `stop()` erases it for
+    /// Close; suspension preserves it for restoration.
+    private func releaseRuntimeResources() {
         operationGeneration &+= 1
+        cachedRoutePolicy = nil
         utteranceTask?.cancel()
         utteranceTask = nil
         bargeInTask?.cancel()
@@ -180,12 +434,9 @@ final class VoiceConversationController: ObservableObject {
         playback.stop()
         speechDeltas.removeAll()
         assistantFinished = false
-        isMicrophonePaused = false
-        isVoiceSessionActive = false
-        isAwaitingVoiceAssistant = false
-        awaitedAssistantResponseStarted = false
-        expectedAssistantSessionID = nil
-        state = .idle
+        isPlaybackCaptureSuspended = false
+        speechDetector.reset()
+        resetMicrophoneMeter()
     }
 
     func setOutputMuted(_ muted: Bool) {
@@ -195,8 +446,24 @@ final class VoiceConversationController: ObservableObject {
             cancelSpeechDrainAndStream()
             speechDeltas.removeAll()
             if state == .speaking { state = .muted }
+            endPlaybackCaptureSuspensionAfterMute()
         } else if state == .muted {
             state = .thinking
+        }
+    }
+
+    /// Muting stops the audible playback that justified a playback capture
+    /// suspension, so capture becomes live again for monitoring — unless the
+    /// user explicitly paused it, which stays authoritative.
+    private func endPlaybackCaptureSuspensionAfterMute() {
+        guard isPlaybackCaptureSuspended else { return }
+        isPlaybackCaptureSuspended = false
+        guard !isMicrophonePaused, isVoiceSessionActive else { return }
+        do {
+            try capture.resume()
+            beginBargeInMonitoring()
+        } catch {
+            state = .failed(error.localizedDescription)
         }
     }
 
@@ -206,10 +473,10 @@ final class VoiceConversationController: ObservableObject {
     func runTranscriptionTest(duration: TimeInterval = 4) async -> VoiceProviderTestResult {
         stop()
         guard isForegroundActive else {
-            return .failure("Voice tests only run while Conduit is in the foreground.")
+            return .failure(AppLocalization.string("Voice tests only run while Conduit is in the foreground."))
         }
         guard let gateway else {
-            return .failure("Conduit could not connect this test to the selected profile.")
+            return .failure(AppLocalization.string("Conduit could not connect this test to the selected profile."))
         }
         isVoiceSessionActive = true
         isProviderTestRunning = true
@@ -217,6 +484,9 @@ final class VoiceConversationController: ObservableObject {
         defer {
             capture.stop()
             isProviderTestRunning = false
+            // The test recording is over: the meter must not freeze at the
+            // last captured level.
+            resetMicrophoneMeter()
             if isCurrent(generation) { state = .idle }
             isVoiceSessionActive = false
         }
@@ -224,26 +494,29 @@ final class VoiceConversationController: ObservableObject {
             return .failure(VoiceAudioError.microphonePermissionDenied.localizedDescription)
         }
         guard isCurrent(generation) else {
-            return .failure("The speech-to-text test was cancelled.")
+            return .failure(AppLocalization.string("The speech-to-text test was cancelled."))
         }
         do {
             try capture.startListening(includePreRoll: false)
             state = .listening
             try await Task.sleep(for: .seconds(duration))
             guard isCurrent(generation) else {
-                return .failure("The speech-to-text test was cancelled.")
+                return .failure(AppLocalization.string("The speech-to-text test was cancelled."))
             }
             let audio = try capture.finishUtterance()
             state = .transcribing
+            // Recording is done: the settings meter must not freeze at the
+            // last captured level while the provider transcribes.
+            resetMicrophoneMeter()
             let transcript = try await transcribe(audio, gateway: gateway)
             guard isCurrent(generation) else {
-                return .failure("The speech-to-text test was cancelled.")
+                return .failure(AppLocalization.string("The speech-to-text test was cancelled."))
             }
             guard !transcript.isEmpty else {
-                return .failure("The selected speech-to-text provider returned an empty transcript.")
+                return .failure(AppLocalization.string("The selected speech-to-text provider returned an empty transcript."))
             }
             latestTranscript = transcript
-            return .success("Transcribed: \(transcript)")
+            return .success(AppLocalization.string("Transcribed: \(transcript)"))
         } catch {
             if isCurrent(generation) { state = .failed(error.localizedDescription) }
             return .failure(error.localizedDescription)
@@ -255,24 +528,32 @@ final class VoiceConversationController: ObservableObject {
     func runSpeechTest(text: String) async -> VoiceProviderTestResult {
         stop()
         guard isForegroundActive else {
-            return .failure("Voice tests only run while Conduit is in the foreground.")
+            return .failure(AppLocalization.string("Voice tests only run while Conduit is in the foreground."))
         }
         guard let gateway else {
-            return .failure("Conduit could not connect this test to the selected profile.")
+            return .failure(AppLocalization.string("Conduit could not connect this test to the selected profile."))
         }
         isVoiceSessionActive = true
         isProviderTestRunning = true
+        // The TTS provider test runs outside a voice conversation, so its
+        // playback must claim standalone (output-only) session ownership.
+        playback.ownershipIntent = .standalonePlayback
         let generation = operationGeneration
         defer {
             speechStream?.cancel()
             speechStream = nil
             playback.stop()
             isProviderTestRunning = false
+            resetMicrophoneMeter()
             if isCurrent(generation) { state = .idle }
             isVoiceSessionActive = false
         }
         do {
             state = .thinking
+            // The test passes only when the route actually delivered speech:
+            // a stream that connects and finishes silently is a failed
+            // provider test, not a passed one.
+            var deliveredAudio = false
             let stream = try await gateway.openSpeechStream(
                 onStart: { [weak self] rate in
                     guard let self else { return }
@@ -281,29 +562,42 @@ final class VoiceConversationController: ObservableObject {
                 },
                 onPCM16: { [weak self] data, rate in
                     guard let self else { return }
-                    _ = try self.playback.enqueuePCM16(data, sampleRate: rate)
+                    // Only PCM the playback service actually accepted and
+                    // scheduled counts as delivered speech — an unaligned
+                    // or empty chunk schedules zero bytes and must not
+                    // turn the provider test into a false pass.
+                    let acceptedBytes = try self.playback.enqueuePCM16(data, sampleRate: rate)
+                    if acceptedBytes > 0 { deliveredAudio = true }
                 },
                 onEncodedAudio: { [weak self] data in
                     guard let self else { return }
+                    // Mirror the PCM path: only audio that actually reaches
+                    // playback counts as delivered, so an empty payload
+                    // cannot turn the test into a false pass.
+                    guard !data.isEmpty else { return }
                     try self.playback.playEncodedAudioData(data)
+                    deliveredAudio = true
                     self.state = .speaking
                 }
             )
             speechStream = stream
             try await stream.append(text)
             guard isCurrent(generation) else {
-                return .failure("The speech playback test was cancelled.")
+                return .failure(AppLocalization.string("The speech playback test was cancelled."))
             }
             _ = try await stream.finish()
             guard isCurrent(generation) else {
-                return .failure("The speech playback test was cancelled.")
+                return .failure(AppLocalization.string("The speech playback test was cancelled."))
             }
             try playback.finish()
             await playback.drain()
             guard isCurrent(generation) else {
-                return .failure("The speech playback test was cancelled.")
+                return .failure(AppLocalization.string("The speech playback test was cancelled."))
             }
-            return .success("Speech playback completed.")
+            guard deliveredAudio else {
+                return .failure(AppLocalization.string("Hermes connected, but the selected speech provider returned no audio."))
+            }
+            return .success(AppLocalization.string("Speech playback completed."))
         } catch {
             if isCurrent(generation) { state = .failed(error.localizedDescription) }
             return .failure(error.localizedDescription)
@@ -316,7 +610,10 @@ final class VoiceConversationController: ObservableObject {
         switch state {
         case .listening:
             if utteranceStartedAt == nil { utteranceStartedAt = date }
-            if level >= configuration.voiceActivityThreshold { lastSpeechAt = date }
+            switch speechDetector.observe(level) {
+            case .started, .continued: lastSpeechAt = date
+            case .none: break
+            }
             if let started = utteranceStartedAt, date.timeIntervalSince(started) >= configuration.maximumUtterance {
                 scheduleFinishUtterance()
             } else if let speech = lastSpeechAt, date.timeIntervalSince(speech) >= configuration.trailingSilence {
@@ -326,7 +623,12 @@ final class VoiceConversationController: ObservableObject {
                 pauseMicrophone()
             }
         case .thinking, .speaking, .muted:
-            if level >= configuration.voiceActivityThreshold {
+            // Speaker-safe suspension: while capture is suspended during
+            // assistant playback, no acoustic barge-in may be scheduled —
+            // even from a stale level event that slipped past the paused
+            // tap.
+            guard !isPlaybackCaptureSuspended else { break }
+            if level >= configuration.bargeInActivityThreshold {
                 if bargeInStartedAt == nil { bargeInStartedAt = date }
                 if let started = bargeInStartedAt,
                    date.timeIntervalSince(started) >= configuration.bargeInDuration {
@@ -349,8 +651,7 @@ final class VoiceConversationController: ObservableObject {
         }
         guard isVoiceSessionActive,
               isAwaitingVoiceAssistant,
-              let expectedAssistantSessionID,
-              sessionID == expectedAssistantSessionID else { return }
+              expectedAssistantSessionIDs.contains(sessionID) else { return }
         if case .idle = state { return }
         if case .failed = state { return }
         switch event {
@@ -393,30 +694,99 @@ final class VoiceConversationController: ObservableObject {
             state = .failed(message)
             playback.stop()
             cancelSpeechDrainAndStream()
+            isPlaybackCaptureSuspended = false
         case .interrupted:
             guard awaitedAssistantResponseStarted else { return }
             isAwaitingVoiceAssistant = false
             awaitedAssistantResponseStarted = false
             playback.stop()
             cancelSpeechDrainAndStream()
+            isPlaybackCaptureSuspended = false
             state = .idle
         }
     }
 
     private func handleCaptureEvent(_ event: VoiceCaptureEvent) {
-        if isProviderTestRunning {
-            if case .interrupted = event { failForAudioInterruption() }
-            return
-        }
         switch event {
-        case .level(let level, let date): ingestAudioLevel(level, at: date)
-        case .interrupted:
+        case .level(let level, let date, let generation):
+            // Raw capture level always feeds the visible input meter —
+            // including provider tests, where seeing "the microphone hears
+            // me" distinguishes capture failure from detection failure —
+            // while conversational VAD stays exclusive to the live Voice
+            // Conversation. Publication is meter-resolution (~20 Hz), not
+            // tap-buffer resolution: every assignment re-renders observing
+            // surfaces.
+            //
+            // Generation identity first: a frame is valid only for the
+            // input-tap generation that produced it, so queued frames from
+            // a torn-down tap are rejected even when a new generation is
+            // already live. Then defense in depth — logical capture state:
+            // stale events must also not reach presentation or VAD during
+            // a user pause, a #146 suspension, or after the voice session
+            // ended. Provider tests are live capture and still count.
+            guard generation == capture.captureGeneration else { return }
+            // Suspended runtime rejects capture events outright — before the
+            // meter, before VAD: hasLiveVoiceSession is logical ownership
+            // only and never means capture is live here.
+            guard !isRuntimeSuspended else { return }
+            let captureLive = !isMicrophonePaused
+                && !isPlaybackCaptureSuspended
+                && isVoiceSessionActive
+            guard captureLive || isProviderTestRunning else { return }
+            // A same-generation event can still surface after
+            // finishUtterance() closed the turn: capture keeps running into
+            // the transcription wait. The meter was reset for that state and
+            // the UI hides it there, so republishing would only churn
+            // @Published state.
+            guard state != .transcribing else { return }
+            if lastMeterPublication == nil || date.timeIntervalSince(lastMeterPublication!) >= 0.05 {
+                microphoneLevel = level
+                lastMeterPublication = date
+            }
+            guard !isProviderTestRunning else { return }
+            ingestAudioLevel(level, at: date)
+        case .interrupted(let generation):
+            // An interruption event against lifecycle-suspended runtime
+            // belongs to the capture that was already released: it must not
+            // destroy the preserved logical session (ownership, orphan
+            // bookkeeping, restoration eligibility). Real interruptions of
+            // live foreground capture still reach failForAudioInterruption.
+            guard !isRuntimeSuspended else { return }
+            // Defense-in-depth (the service fences this before emitting):
+            // only an interruption belonging to the currently installed
+            // capture generation may fail the session.
+            guard generation == capture.captureGeneration else { return }
             failForAudioInterruption()
         case .routeChanged:
+            // Provider tests own the session exclusively; no capture is live
+            // during the TTS test, so route-driven suspension would only
+            // pollute speaker-safe state across the test boundary.
+            guard !isProviderTestRunning else { return }
             // AVAudioEngine's tap remains valid across normal Bluetooth/wired
-            // route changes. The next capture event re-establishes timing.
+            // route changes. The next capture event re-establishes timing,
+            // and a different microphone means a different noise floor.
             bargeInStartedAt = nil
+            cachedRoutePolicy = nil
+            if state == .listening { speechDetector.reset() }
+            suspendIfRouteBecameOpenSpeaker()
         }
+    }
+
+    /// Zeroes the visible meter and clears the publication clock so the
+    /// first event of a fresh capture window always publishes.
+    private func resetMicrophoneMeter() {
+        microphoneLevel = 0
+        lastMeterPublication = nil
+    }
+
+    /// Safety net for routes that change while Hermes is audibly speaking:
+    /// moving onto an open speaker must never leave live acoustic barge-in
+    /// running. Moving onto a headset mid-utterance stays conservative — the
+    /// suspension holds until the next playback boundary.
+    private func suspendIfRouteBecameOpenSpeaker() {
+        guard currentRoutePolicy() == .speakerSafeHalfDuplex else { return }
+        guard state == .speaking || isPlaybackCaptureSuspended else { return }
+        suspendCaptureForPlayback()
     }
 
     private func scheduleFinishUtterance() {
@@ -433,6 +803,11 @@ final class VoiceConversationController: ObservableObject {
         do {
             let audio = try capture.finishUtterance()
             state = .transcribing
+            // Utterance complete: the meter follows the now-inactive capture
+            // and the detector must not carry this turn's noise/speech state
+            // into the next one.
+            resetMicrophoneMeter()
+            speechDetector.reset()
             let transcript = try await transcribe(audio, gateway: gateway)
             guard isCurrent(generation) else { return }
             latestTranscript = transcript
@@ -440,11 +815,22 @@ final class VoiceConversationController: ObservableObject {
                 await startListening()
                 return
             }
+            // Command boundary: spoken commands are recognized only on the
+            // existing transcription completion path, never during raw
+            // capture. End Conversation is checked first so a phrase present
+            // in both lists deterministically takes the stronger action.
+            if isWholeUtteranceEndConversationCommand(transcript) {
+                await endConversationForSpokenCommand()
+                return
+            }
             conversationTranscript.append(
                 VoiceConversationTranscriptEntry(speaker: .user, text: transcript)
             )
             if isWholeUtteranceStopCommand(transcript) {
-                await interrupt()
+                // Spoken Stop proceeds on the attempt: its local semantics
+                // (cancel, stop playback, relisten) do not depend on the
+                // server-side cancellation result.
+                _ = await interrupt()
                 guard isCurrent(generation) else { return }
                 playback.stop()
                 await startListening()
@@ -452,6 +838,31 @@ final class VoiceConversationController: ObservableObject {
             }
             state = .thinking
             beginBargeInMonitoring()
+            // A turn orphaned by lifecycle suspension is still running
+            // server-side; the user speaking now is a user-initiated
+            // cancellation of that orphan (same seam as Stop), and it must
+            // happen before the new submission so the orphan's late events
+            // can never be consumed as the new turn's reply. The orphan flag
+            // is cleared only on a SUCCESSFUL cancellation in a still-current
+            // operation: a failed cancel (or a superseded await) retains it
+            // and blocks this submission — the orphan's late events must
+            // never be admitted as the new turn's reply.
+            if suspendedInFlightTurnOrphaned {
+                let cancelledOrphan = await interrupt()
+                guard isCurrent(generation) else { return }
+                guard cancelledOrphan else {
+                    // A failed cancellation must not leave the microphone,
+                    // barge-in monitoring, playback, or runtime tasks alive
+                    // under a failed UI state. Release runtime ownership via
+                    // the shared primitive while PRESERVING the logical
+                    // session and the sticky orphan — the user's next
+                    // Listen + utterance retries the cancellation.
+                    releaseRuntimeResources()
+                    state = .failed(AppLocalization.string("Hermes could not cancel the previous response."))
+                    return
+                }
+                suspendedInFlightTurnOrphaned = false
+            }
             // Completion clears ownership for the previous response. Arm the
             // same authoritative session again immediately before each new
             // voice submission so continuous conversation accepts its reply.
@@ -460,7 +871,7 @@ final class VoiceConversationController: ObservableObject {
             guard await submit(transcript) else {
                 guard isCurrent(generation) else { return }
                 isAwaitingVoiceAssistant = false
-                state = .failed("Hermes could not submit the transcription.")
+                state = .failed(AppLocalization.string("Hermes could not submit the transcription."))
                 return
             }
             guard isCurrent(generation) else { return }
@@ -481,6 +892,10 @@ final class VoiceConversationController: ObservableObject {
     }
 
     private func beginBargeInMonitoring() {
+        // Seam-level invariant: no barge-in monitoring affordance while a
+        // playback suspension is active, so a future capture service cannot
+        // reintroduce the feedback loop one layer down.
+        guard !isPlaybackCaptureSuspended else { return }
         do {
             try capture.beginBargeInMonitoring()
             if isMicrophonePaused { capture.pause() }
@@ -488,8 +903,58 @@ final class VoiceConversationController: ObservableObject {
         catch { state = .failed(error.localizedDescription) }
     }
 
+    /// Hermes begins audible playback. On routes where the output can feed
+    /// the microphone, capture is suspended so the assistant's own TTS can
+    /// never enter the level detector, pre-roll, or transcription input.
+    /// Isolated headset routes keep live barge-in monitoring.
+    private func applyPlaybackCapturePolicy() {
+        // Fast path for the per-encoded-chunk callback: once suspended, the
+        // policy can only flip back at a playback boundary.
+        guard !isPlaybackCaptureSuspended else { return }
+        if currentRoutePolicy() == .speakerSafeHalfDuplex {
+            suspendCaptureForPlayback()
+        } else {
+            beginBargeInMonitoring()
+        }
+    }
+
+    /// Route classification cached between capture `.routeChanged` events:
+    /// `AVAudioSession.currentRoute` materializes port descriptions, which
+    /// is too expensive to repeat on every encoded-audio chunk.
+    private var cachedRoutePolicy: VoiceBargeInRoutePolicy?
+
+    private func currentRoutePolicy() -> VoiceBargeInRoutePolicy {
+        if let cachedRoutePolicy { return cachedRoutePolicy }
+        let policy = routePolicyProvider()
+        cachedRoutePolicy = policy
+        return policy
+    }
+
+    /// Tears microphone rendering down for the duration of assistant
+    /// playback. Uses the real resource pause (tap, engine, converter, and
+    /// capture session lease all go away) without touching the explicit
+    /// user-pause flag, and freezes barge-in timing so playback audio that
+    /// leaked in before the suspension cannot half-schedule a barge-in.
+    private func suspendCaptureForPlayback() {
+        // A barge-in scheduled just before audible playback (or before a
+        // route change) must not fire after suspension: it would stop
+        // playback and reopen capture with speaker-contaminated pre-roll.
+        bargeInTask?.cancel()
+        bargeInTask = nil
+        guard !isPlaybackCaptureSuspended else { return }
+        isPlaybackCaptureSuspended = true
+        bargeInStartedAt = nil
+        // Capture is torn down for the duration of playback: the meter must
+        // read zero (not frozen) and the detector must not carry state into
+        // the next listening window.
+        speechDetector.reset()
+        resetMicrophoneMeter()
+        capture.pause()
+    }
+
     private func failForAudioInterruption() {
         operationGeneration &+= 1
+        cachedRoutePolicy = nil
         utteranceTask?.cancel()
         utteranceTask = nil
         bargeInTask?.cancel()
@@ -501,9 +966,26 @@ final class VoiceConversationController: ObservableObject {
         speechDeltas.removeAll()
         assistantFinished = false
         isMicrophonePaused = false
+        isPlaybackCaptureSuspended = false
+        speechDetector.reset()
+        resetMicrophoneMeter()
+        isVoiceSessionActive = false
         isAwaitingVoiceAssistant = false
         awaitedAssistantResponseStarted = false
-        state = .failed("Audio was interrupted.")
+        expectedAssistantSessionIDs = []
+        suspendedInFlightTurnOrphaned = false
+        isRuntimeSuspended = false
+        // Terminal path: release session-ownership bookkeeping so audio-
+        // adjacent side features (response haptics) do not stand down
+        // forever after an interruption.
+        state = .failed(AppLocalization.string("Audio was interrupted."))
+    }
+
+    /// Clears the lifecycle-suspension gate after the capture runtime has
+    /// genuinely been re-armed (fresh listen or un-pause recapture). One seam
+    /// so `startListening` and `resumeMicrophone` cannot diverge.
+    private func rearmRuntimeAfterCaptureRestart() {
+        isRuntimeSuspended = false
     }
 
     private func scheduleBargeIn() {
@@ -515,7 +997,15 @@ final class VoiceConversationController: ObservableObject {
     }
 
     private func beginBargeIn(generation: UInt64) async {
-        defer { if operationGeneration == generation { bargeInTask = nil } }
+        // A cancelled task must neither act nor stomp a successor's handle.
+        defer {
+            if operationGeneration == generation, !Task.isCancelled { bargeInTask = nil }
+        }
+        // Cancellation is binding before the destructive prefix: a barge-in
+        // that lost the race to a playback suspension must not stop the
+        // playback or retire the turn it is supposed to protect.
+        guard !Task.isCancelled else { return }
+        guard !isPlaybackCaptureSuspended else { return }
         guard state == .thinking || state == .speaking || state == .muted else { return }
         lastBargeInState = state
         playback.stop()
@@ -526,17 +1016,55 @@ final class VoiceConversationController: ObservableObject {
         // Its terminal event belongs to the retired turn, not the next one.
         isAwaitingVoiceAssistant = false
         awaitedAssistantResponseStarted = false
-        await interrupt()
+        // The barge-in proceeds on the attempt: its local recovery (stop
+        // playback, retire the turn, relisten) does not depend on the
+        // server-side cancellation result.
+        _ = await interrupt()
+        // Cancellation is re-checked after the await: the suspension may have
+        // engaged while the interruption was in flight, and reopening capture
+        // now would hear the assistant's own speaker output.
+        guard !Task.isCancelled else { return }
         guard isCurrent(generation) else { return }
+        guard !isPlaybackCaptureSuspended else { return }
         await startListening(includePreRoll: true)
     }
 
-    private func isWholeUtteranceStopCommand(_ transcript: String) -> Bool {
-        let normalized = transcript.lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
-        return preferences.spokenStopPhrases.contains { phrase in
-            normalized == phrase.lowercased()
+    /// A spoken End Conversation phrase consumed the utterance locally: the
+    /// session closes through the same effective teardown as the sheet's
+    /// Close action — AppState installs that path here (persist mute →
+    /// `endVoiceSession` → sheet dismissal); the fallback covers callers
+    /// without the seam. This runs regardless of `continuousConversation`
+    /// and is never followed by a relisten.
+    ///
+    /// Closing FIRST fences every stale continuation (the teardown bumps
+    /// the operation generation and cancels the in-flight tasks) before the
+    /// interrupt await, so a completion racing the Hermes cancellation
+    /// cannot reopen capture or playback. One self-interaction needs care:
+    /// this method runs INSIDE `utteranceTask`, and the teardown's
+    /// `utteranceTask?.cancel()` would mark the current task cancelled —
+    /// `HermesClient.rpc` throws `CancellationError` for cancelled tasks,
+    /// which would abort the turn-cancel below exactly when there is a live
+    /// Hermes turn to cancel. Clearing the handle first makes that cancel a
+    /// no-op; the task ends on its own right after.
+    private func endConversationForSpokenCommand() async {
+        utteranceTask = nil
+        if let endConversationRequest {
+            endConversationRequest()
+        } else {
+            stop()
         }
+        // Spoken End Conversation proceeds on the attempt: the session is
+        // already closed above, so the server-side cancellation result
+        // cannot change local state anymore.
+        _ = await interrupt()
+    }
+
+    private func isWholeUtteranceEndConversationCommand(_ transcript: String) -> Bool {
+        VoiceSpokenCommands.matches(transcript, phrases: preferences.spokenEndConversationPhrases)
+    }
+
+    private func isWholeUtteranceStopCommand(_ transcript: String) -> Bool {
+        VoiceSpokenCommands.matches(transcript, phrases: preferences.spokenStopPhrases)
     }
 
     private func appendAssistantTranscriptDelta(_ text: String) {
@@ -584,6 +1112,9 @@ final class VoiceConversationController: ObservableObject {
         do {
             guard isSpeechDrainCurrent(operation: operation, revision: revision), let gateway else { return }
             if speechStream == nil && !speechDeltas.isEmpty {
+                // Assistant speech during a live voice conversation joins the
+                // capture-owned session instead of reconfiguring it.
+                playback.ownershipIntent = .conversationPlayback
                 let openedStream = try await gateway.openSpeechStream(
                     onStart: { [weak self] rate in
                         guard let self,
@@ -591,7 +1122,7 @@ final class VoiceConversationController: ObservableObject {
                               !self.isOutputMuted else { return }
                         try self.playback.start(sampleRate: rate)
                         self.state = .speaking
-                        self.beginBargeInMonitoring()
+                        self.applyPlaybackCapturePolicy()
                     },
                     onPCM16: { [weak self] data, rate in
                         guard let self,
@@ -605,7 +1136,7 @@ final class VoiceConversationController: ObservableObject {
                               !self.isOutputMuted else { return }
                         try self.playback.playEncodedAudioData(data)
                         self.state = .speaking
-                        self.beginBargeInMonitoring()
+                        self.applyPlaybackCapturePolicy()
                     }
                 )
                 guard isSpeechDrainCurrent(operation: operation, revision: revision) else {
@@ -632,18 +1163,55 @@ final class VoiceConversationController: ObservableObject {
                 speechStream = nil
                 if assistantFinished {
                     assistantFinished = false
+                    // Speaker-safe: a suspended capture must not resume
+                    // while the cancelled stream's already-scheduled audio
+                    // still renders out of the speaker.
+                    if isPlaybackCaptureSuspended { playback.stop() }
+                    isPlaybackCaptureSuspended = false
                     await startListening()
                 }
                 return
             }
+            // Terminal drain failure: settle playback like every other
+            // terminal path so the lease and engine do not outlive the turn.
+            // (The cancellation branch above intentionally keeps ownership —
+            // an interrupted stream's already-scheduled audio renders out.)
+            playback.stop()
+            isPlaybackCaptureSuspended = false
             if state == .speaking || state == .thinking { state = .failed(error.localizedDescription) }
             return
         }
         if assistantFinished && speechDeltas.isEmpty && speechStream == nil {
             assistantFinished = false
             guard isSpeechDrainCurrent(operation: operation, revision: revision) else { return }
-            await startListening()
+            // Conversation continuation only. Safety/recovery restarts
+            // (barge-in, manual Interrupt, empty transcript, spoken stop,
+            // stream cancellation after the assistant finished) always
+            // re-listen and are intentionally not gated here.
+            if preferences.continuousConversation {
+                cachedRoutePolicy = nil
+                isPlaybackCaptureSuspended = false
+                await startListening()
+            } else {
+                settleOpenSessionAfterAssistantTurn()
+            }
         }
+    }
+
+    /// Continuous conversation OFF: leave the voice session/sheet open after
+    /// a completed assistant turn without opening the next listening window.
+    /// Capture is paused without the user-pause flag so the sheet's Listen
+    /// control remains "start the next turn", not "unpause".
+    private func settleOpenSessionAfterAssistantTurn() {
+        cachedRoutePolicy = nil
+        isPlaybackCaptureSuspended = false
+        // Full-duplex routes keep capture live through TTS for barge-in.
+        if !isMicrophonePaused {
+            capture.pause()
+        }
+        speechDetector.reset()
+        resetMicrophoneMeter()
+        state = .idle
     }
 
     private func cancelSpeechDrainAndStream() {

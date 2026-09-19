@@ -133,6 +133,16 @@ final class SessionYoloStore {
         clearOverride(for: profile, sessionIDs: [sessionID])
     }
 
+    /// Drops every override in every profile. The server-change boundary
+    /// calls this: overrides are keyed only by (profile, session id), so
+    /// without the clear, one Hermes server's choices would leak into a
+    /// different server whose profile and session strings happen to collide.
+    func clearAllOverrides() {
+        guard !payload.overrides.isEmpty else { return }
+        payload.overrides = [:]
+        persist()
+    }
+
     func clearOverride(for profile: String, sessionIDs: [String]) {
         var changed = false
         for sessionID in sessionIDs {

@@ -8,9 +8,15 @@ import SwiftUI
 /// The sheet is deliberately presentation-only. AppState remains responsible
 /// for submitting, interrupting, and rendering the associated Hermes turn.
 struct VoiceConversationSheet: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @ObservedObject var controller: VoiceConversationController
     let profile: String
     let onClose: () -> Void
+    /// One-shot gate armed by a fresh `openVoiceConversation` and consumed
+    /// exactly once. A restored suspended conversation deliberately does NOT
+    /// auto-listen: the gate stays disarmed even if SwiftUI recreates this
+    /// view's identity while the presentation binding survives.
+    let shouldAutoListen: () -> Bool
     var startsListening: Bool = true
 
     @State private var didRequestStart = false
@@ -35,19 +41,20 @@ struct VoiceConversationSheet: View {
             }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .top, spacing: 0) {
-                ConduitSheetHeader(title: "Voice conversation", close: close)
+                ConduitSheetHeader(title: AppLocalization.string("Voice conversation"), close: close)
             }
         }
         .task {
             guard startsListening, !didRequestStart else { return }
             didRequestStart = true
+            guard shouldAutoListen() else { return }
             await controller.startListening()
         }
         .accessibilityElement(children: .contain)
     }
 
     private var statusCard: some View {
-        ConduitSettingsSection(title: "\(profileDisplayName) voice", symbol: stateSymbol, tint: stateTint) {
+        ConduitSettingsSection(title: AppLocalization.string("\(profileDisplayName) voice"), symbol: stateSymbol, tint: stateTint) {
             HStack(spacing: 12) {
                 Image(systemName: stateSymbol)
                     .font(.system(size: 22, weight: .semibold))
@@ -63,11 +70,22 @@ struct VoiceConversationSheet: View {
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Voice status: \(statusTitle). \(statusDetail)")
+            HStack(spacing: 8) {
+                Text("Mic input")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                VoiceInputLevelMeter(level: inputMeterLevel, isActive: isInputMeterActive)
+                    .frame(height: 20)
+                    .accessibilityHint(Text(isInputMeterActive
+                        ? "Shows audio reaching Conduit while the microphone is live."
+                        : "The microphone is not capturing right now."))
+                Spacer(minLength: 0)
+            }
         }
     }
 
     private var conversationCard: some View {
-        ConduitSettingsSection(title: "Conversation", symbol: "text.bubble", tint: .conduitAura) {
+        ConduitSettingsSection(title: AppLocalization.string("Conversation"), symbol: "text.bubble", tint: .conduitAura) {
             if controller.conversationTranscript.isEmpty {
                 Text("Your spoken words and Hermes' replies will appear here.")
                     .font(.footnote)
@@ -85,7 +103,7 @@ struct VoiceConversationSheet: View {
     }
 
     private var controlsCard: some View {
-        ConduitSettingsSection(title: "Microphone and audio", symbol: "slider.horizontal.3", tint: .conduitAccent) {
+        ConduitSettingsSection(title: AppLocalization.string("Microphone and audio"), symbol: "slider.horizontal.3", tint: .conduitAccent) {
             HStack(spacing: 10) {
                 Button { microphoneTapped() } label: {
                     Label(microphoneLabel, systemImage: microphoneSymbol)
@@ -111,21 +129,53 @@ struct VoiceConversationSheet: View {
     }
 
     private var profileDisplayName: String {
-        profile == "default" ? "Default profile" : profile.replacingOccurrences(of: "_", with: " ").capitalized
+        profile == "default" ? AppLocalization.string("Default profile") : profile.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    /// Automatic speaker-safe suspension while Hermes audibly speaks on an
+    /// open-speaker route: the mic control becomes Interrupt instead of a
+    /// pause, so this never reads as a user-selected mic pause. An explicit
+    /// user pause keeps precedence — the sheet stays in the paused state,
+    /// and its Listen tap routes through `resumeMicrophone`, which acts as
+    /// an interrupt while playback is suspended.
+    private var isInterruptAvailable: Bool {
+        controller.isPlaybackCaptureSuspended && !controller.isMicrophonePaused
+    }
+
+    /// The input meter is live exactly when microphone capture is live:
+    /// listening, and (on headset routes) the thinking/speaking/muted
+    /// windows where barge-in monitoring is actually armed. A user-paused
+    /// mic, transcribing, and #146 speaker-safe suspension all read as
+    /// inactive/zero — there, the status text explains why (e.g. "Hermes is
+    /// speaking / Tap Interrupt to speak."), so a zero meter never implies
+    /// malfunction.
+    private var isInputMeterActive: Bool {
+        guard !controller.isMicrophonePaused, !controller.isPlaybackCaptureSuspended else { return false }
+        switch controller.state {
+        case .listening, .thinking, .speaking, .muted: return true
+        case .idle, .transcribing, .failed: return false
+        }
+    }
+
+    private var inputMeterLevel: Float {
+        isInputMeterActive ? controller.microphoneLevel : 0
     }
 
     private var microphoneLabel: String {
-        if controller.state == .transcribing { return "Transcribing" }
-        return microphoneIsActive ? "Pause mic" : "Listen"
+        if controller.state == .transcribing { return AppLocalization.string("Transcribing") }
+        if isInterruptAvailable { return AppLocalization.string("Interrupt") }
+        return microphoneIsActive ? AppLocalization.string("Pause mic") : AppLocalization.string("Listen")
     }
 
     private var microphoneSymbol: String {
         if controller.state == .transcribing { return "waveform" }
+        if isInterruptAvailable { return "stop.fill" }
         return microphoneIsActive ? "mic.slash.fill" : "mic.fill"
     }
 
     private var microphoneHint: String {
-        microphoneIsActive ? "Pauses microphone capture while keeping the voice session open" : "Starts or resumes microphone capture"
+        if isInterruptAvailable { return AppLocalization.string("Stops Hermes' speech and starts listening right away") }
+        return microphoneIsActive ? AppLocalization.string("Pauses microphone capture while keeping the voice session open") : AppLocalization.string("Starts or resumes microphone capture")
     }
 
     private var microphoneIsActive: Bool {
@@ -137,27 +187,29 @@ struct VoiceConversationSheet: View {
     }
 
     private var statusTitle: String {
-        if controller.isMicrophonePaused { return "Microphone paused" }
+        if isInterruptAvailable { return AppLocalization.string("Hermes is speaking") }
+        if controller.isMicrophonePaused { return AppLocalization.string("Microphone paused") }
         switch controller.state {
-        case .idle: return "Ready to listen"
-        case .listening: return "Listening"
-        case .transcribing: return "Transcribing"
-        case .thinking: return "Hermes is thinking"
-        case .speaking: return "Hermes is speaking"
-        case .muted: return "Assistant audio muted"
-        case .failed: return "Voice needs attention"
+        case .idle: return AppLocalization.string("Ready to listen")
+        case .listening: return AppLocalization.string("Listening")
+        case .transcribing: return AppLocalization.string("Transcribing")
+        case .thinking: return AppLocalization.string("Hermes is thinking")
+        case .speaking: return AppLocalization.string("Hermes is speaking")
+        case .muted: return AppLocalization.string("Assistant audio muted")
+        case .failed: return AppLocalization.string("Voice needs attention")
         }
     }
 
     private var statusDetail: String {
-        if controller.isMicrophonePaused { return "Tap Listen when you are ready to resume." }
+        if isInterruptAvailable { return AppLocalization.string("Tap Interrupt to speak.") }
+        if controller.isMicrophonePaused { return AppLocalization.string("Tap Listen when you are ready to resume.") }
         switch controller.state {
-        case .idle: return "Tap Listen when you are ready."
-        case .listening: return "Pause the microphone whenever you need a break."
-        case .transcribing: return "Sending your speech to Hermes."
-        case .thinking: return "Speak to interrupt and start a new turn."
-        case .speaking: return "Speak over Hermes to interrupt it."
-        case .muted: return "Assistant text is still continuing in chat."
+        case .idle: return AppLocalization.string("Tap Listen when you are ready.")
+        case .listening: return AppLocalization.string("Pause the microphone whenever you need a break.")
+        case .transcribing: return AppLocalization.string("Sending your speech to Hermes.")
+        case .thinking: return AppLocalization.string("Speak to interrupt and start a new turn.")
+        case .speaking: return AppLocalization.string("Speak over Hermes to interrupt it.")
+        case .muted: return AppLocalization.string("Assistant text is still continuing in chat.")
         case .failed(let detail): return detail
         }
     }
@@ -186,7 +238,9 @@ struct VoiceConversationSheet: View {
     }
 
     private func microphoneTapped() {
-        if microphoneIsActive {
+        if isInterruptAvailable {
+            Task { await controller.interruptAssistantPlayback() }
+        } else if microphoneIsActive {
             controller.pauseMicrophone()
         } else {
             Task { await controller.resumeMicrophone() }
@@ -205,7 +259,7 @@ private struct VoiceConversationTranscriptBubble: View {
 
     var body: some View {
         VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
-            Text(isUser ? "You" : "Hermes")
+            Text(isUser ? AppLocalization.string("You") : AppLocalization.string("Hermes"))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
             Text(entry.text)

@@ -6,6 +6,7 @@
 import AVFAudio
 import Foundation
 import OSLog
+import os
 
 private let voiceAudioLogger = Logger(subsystem: "com.milim.relay", category: "VoiceAudio")
 
@@ -19,6 +20,7 @@ final class AVAudioCaptureService: NSObject, AudioCaptureService {
 
     private let engine = AVAudioEngine()
     private let session = AVAudioSession.sharedInstance()
+    private let coordinator: VoiceAudioSessionCoordinator
     /// AVAudioEngine and AVAudioConverter use deinterleaved Float32 as their
     /// canonical PCM representation. Quantize to PCM16 only after resampling.
     private let outputFormat = AVAudioFormat(
@@ -26,17 +28,53 @@ final class AVAudioCaptureService: NSObject, AudioCaptureService {
         channels: AVAudioCaptureService.outputChannelCount
     )!
     private var converter: AVAudioConverter?
-    private var capturedPCM = Data()
-    private var preRollPCM = Data()
+    // Capture state below is internal rather than private so ConduitTests
+    // can drive the frame-admission seam directly with synthetic PCM
+    // buffers instead of audio hardware. Production code must mutate these
+    // only through the lifecycle methods; direct writes outside ConduitTests
+    // can create flag combinations the lifecycle never produces and are not
+    // supported.
+    var capturedPCM = Data()
+    var preRollPCM = Data()
     private let maximumPreRollBytes = Int(AVAudioCaptureService.outputSampleRate * AVAudioCaptureService.preRollDuration) * AVAudioCaptureService.outputBytesPerFrame
-    private var activelyRecording = false
-    private var paused = false
-    private var shouldKeepEngineRunning = false
+    var activelyRecording = false
+    var paused = false
+    /// Monotonic identity of the installed input-tap/rendering lifetime.
+    /// Bumped at every teardown (pause/stop) and every tap reinstall, so
+    /// frames queued from a previous generation can be recognized and
+    /// dropped after the boundary.
+    private(set) var captureGeneration: UInt64 = 0
+    /// Thread-safe mirror of `captureGeneration` for observers that run
+    /// outside the MainActor. Session interruption notifications arrive on
+    /// an arbitrary thread and must record which capture generation they
+    /// belong to SYNCHRONOUSLY, before the MainActor hop — reading the value
+    /// later would observe whatever generation is installed by then, which
+    /// is exactly the stale-teardown race this exists to prevent.
+    private let observedCaptureGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+
+    nonisolated private var generationForInterruptionObservers: UInt64 {
+        observedCaptureGeneration.withLock { $0 }
+    }
+
+    private func publishGenerationForInterruptionObservers() {
+        let current = captureGeneration
+        observedCaptureGeneration.withLock { $0 = current }
+    }
+    var shouldKeepEngineRunning = false
     private var lastCaptureFailure: String?
     private var continuation: AsyncStream<VoiceCaptureEvent>.Continuation?
+    /// Capture holds one lease for the whole capture window (listening,
+    /// barge-in monitoring) and releases it on stop — or on pause, which is a
+    /// real resource pause: engine, tap, and session ownership all go away
+    /// while the Voice Conversation stays logically open.
+    private var captureLease: VoiceAudioLease?
     let events: AsyncStream<VoiceCaptureEvent>
 
-    override init() {
+    /// Optional injection instead of a default `.shared` argument: default
+    /// parameter values are evaluated in a nonisolated context, which cannot
+    /// read the MainActor-isolated singleton.
+    init(coordinator: VoiceAudioSessionCoordinator? = nil) {
+        self.coordinator = coordinator ?? .shared
         var capturedContinuation: AsyncStream<VoiceCaptureEvent>.Continuation?
         events = AsyncStream { capturedContinuation = $0 }
         continuation = capturedContinuation
@@ -87,6 +125,7 @@ final class AVAudioCaptureService: NSObject, AudioCaptureService {
     }
 
     func beginBargeInMonitoring() throws {
+        guard !paused else { return }
         do {
             try startCaptureIfNeeded()
         } catch {
@@ -98,7 +137,20 @@ final class AVAudioCaptureService: NSObject, AudioCaptureService {
         shouldKeepEngineRunning = true
     }
 
-    func pause() { paused = true }
+    /// A real resource pause: the engine, tap, converter, and capture's
+    /// audio-session lease are released so microphone hardware and the
+    /// system session are not held while the user believes the mic is
+    /// paused. `resume()` reacquires everything. The Voice Conversation
+    /// stays logically open across the pause.
+    func pause() {
+        guard !paused else { return }
+        paused = true
+        shouldKeepEngineRunning = false
+        captureGeneration &+= 1
+        publishGenerationForInterruptionObservers()
+        teardownRendering()
+        releaseLease()
+    }
 
     func resume() throws {
         do {
@@ -133,26 +185,22 @@ final class AVAudioCaptureService: NSObject, AudioCaptureService {
         activelyRecording = false
         paused = false
         shouldKeepEngineRunning = false
-        let input = engine.inputNode
-        input.removeTap(onBus: 0)
-        engine.stop()
-        converter = nil
-        try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        // Deliberately unguarded (unlike pause): a redundant stop bumps the
+        // generation again, which is always fail-closed.
+        captureGeneration &+= 1
+        publishGenerationForInterruptionObservers()
+        teardownRendering()
+        releaseLease()
     }
 
     private func startCaptureIfNeeded() throws {
-        try configureSession()
+        if captureLease == nil {
+            // Acquiring configures the conversation policy (category/mode/
+            // options) and activates the session through the coordinator, so
+            // concurrent owners can never fight over the singleton.
+            captureLease = try coordinator.acquire(.conversationCapture)
+        }
         if !engine.isRunning { try startEngine() }
-    }
-
-    private func configureSession() throws {
-        let configuration = VoiceAudioSessionConfiguration.capture
-        try session.setCategory(
-            configuration.category,
-            mode: configuration.mode,
-            options: configuration.options
-        )
-        try session.setActive(true)
     }
 
     private func handleStartupFailure(_ error: Error, stage: String) {
@@ -175,10 +223,22 @@ final class AVAudioCaptureService: NSObject, AudioCaptureService {
         let input = engine.inputNode
         let hardwareFormat = input.inputFormat(forBus: 0)
         guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0 else {
-            throw VoiceAudioError.unavailable("The selected microphone is unavailable.")
+            throw VoiceAudioError.unavailable(AppLocalization.string("The selected microphone is unavailable."))
         }
         converter = nil
+        // Defensive: a recovery restart (e.g. after a route change stops the
+        // engine) can reach startEngine while a stale tap still hangs on bus
+        // 0 even though the engine is not running. Removing first keeps the
+        // reinstall from stacking a second tap; removeTap is a no-op when
+        // none exists.
         input.removeTap(onBus: 0)
+        // A freshly installed tap begins a new rendering generation: frames
+        // it produces are stamped with this identity, and any teardown
+        // invalidates it so queued frames from the old tap are recognized
+        // as stale.
+        captureGeneration &+= 1
+        publishGenerationForInterruptionObservers()
+        let frameGeneration = captureGeneration
         input.installTap(onBus: 0, bufferSize: 1_024, format: nil) { [weak self] buffer, _ in
             // AVAudioEngine owns and reuses tap buffers as soon as this block
             // returns. Copy the frame bytes before crossing onto MainActor so
@@ -197,14 +257,52 @@ final class AVAudioCaptureService: NSObject, AudioCaptureService {
                 destinationData.copyMemory(from: sourceData, byteCount: byteCount)
                 destination[index].mDataByteSize = source[index].mDataByteSize
             }
-            Task { @MainActor [weak self] in self?.consume(copy) }
+            Task { @MainActor [weak self] in
+                // Capture-generation fence: pause()/stop() tear the tap
+                // down, but a frame already in flight across this hop
+                // belongs to the previous generation and must not surface
+                // into the new one — even when a stop was immediately
+                // followed by a restart that re-armed the live flags. The
+                // admission seam checks the frame's own generation against
+                // the currently installed tap before anything downstream
+                // (including consume's own defense-in-depth guard) runs.
+                guard let self, self.acceptsFrame(generation: frameGeneration) else { return }
+                self.consume(copy, generation: frameGeneration)
+            }
         }
         engine.prepare()
         try engine.start()
     }
 
-    private func consume(_ buffer: AVAudioPCMBuffer) {
-        guard !paused else { return }
+    private func teardownRendering() {
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
+        engine.stop()
+        converter = nil
+    }
+
+    private func releaseLease() {
+        guard let lease = captureLease else { return }
+        captureLease = nil
+        coordinator.release(lease)
+    }
+
+    /// Single admission gate for tap frames on their way into PCM state.
+    /// A frame is admitted only when it was produced by the currently
+    /// installed tap generation while capture is unpaused and the engine is
+    /// expected to stay live. Both the MainActor hop and consume() gate on
+    /// this seam, so an invalidated generation's bytes can never reach
+    /// conversion state, pre-roll, captured audio, the meter, or VAD — even
+    /// when a stop was immediately followed by a restart that re-armed the
+    /// live flags.
+    func acceptsFrame(generation: UInt64) -> Bool {
+        generation == captureGeneration && !paused && shouldKeepEngineRunning
+    }
+
+    func consume(_ buffer: AVAudioPCMBuffer, generation: UInt64) {
+        // Defense-in-depth: the hop already admitted this frame, but any
+        // future caller path must equally fail closed before PCM admission.
+        guard acceptsFrame(generation: generation) else { return }
         if converter == nil || !Self.converter(converter, accepts: buffer.format) {
             converter = AVAudioConverter(from: buffer.format, to: outputFormat)
         }
@@ -250,7 +348,7 @@ final class AVAudioCaptureService: NSObject, AudioCaptureService {
         lastCaptureFailure = nil
         appendPreRoll(pcm)
         if activelyRecording { capturedPCM.append(pcm) }
-        continuation?.yield(.level(encoded.peak, date: Date()))
+        continuation?.yield(.level(encoded.peak, date: Date(), generation: generation))
     }
 
     private func appendPreRoll(_ pcm: Data) {
@@ -260,26 +358,66 @@ final class AVAudioCaptureService: NSObject, AudioCaptureService {
         }
     }
 
-    @objc private func handleInterruption(_ notification: Notification) {
+    /// Internal for tests: the deterministic stale-interruption regression
+    /// drives this entry point directly.
+    ///
+    /// Hopped through `Task { @MainActor }`: session notifications are not
+    /// guaranteed to arrive on the main thread, and stop() now releases the
+    /// capture lease through the MainActor coordinator. The interruption's
+    /// capture generation is captured SYNCHRONOUSLY on the notifying thread
+    /// — reading it later on the MainActor would observe whatever generation
+    /// is installed by then. The fence runs BEFORE any mutation: an
+    /// interruption that observed a torn-down generation must never stop the
+    /// live one, release its lease, or emit a failure that applies to it.
+    @objc func handleInterruption(_ notification: Notification) {
         guard let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
-        if type == .began {
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue), type == .began else { return }
+        // PRE-STOP generation: identifies the capture runtime the
+        // notification belonged to, captured synchronously on the notifying
+        // thread before any MainActor work.
+        let observedGeneration = generationForInterruptionObservers
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Stale-callback fence BEFORE mutation: a queued interruption
+            // that observed a torn-down generation must never stop the
+            // live one, release its lease, or emit a failure that applies
+            // to it.
+            guard observedGeneration == captureGeneration else {
+                voiceAudioLogger.notice(
+                    "Discarding interruption for torn-down capture generation \(observedGeneration, privacy: .public); current \(self.captureGeneration, privacy: .public)"
+                )
+                return
+            }
             stop()
-            continuation?.yield(.interrupted)
+            // POST-STOP generation: the authoritative service state after
+            // the accepted runtime was torn down. Emitting this (not the
+            // pre-stop value) lets the controller recognize the event as
+            // belonging to the state it actually left behind.
+            let postStopGeneration = captureGeneration
+            continuation?.yield(.interrupted(generation: postStopGeneration))
         }
     }
 
+    /// Hopped through `Task { @MainActor }` for the same reason as
+    /// `handleInterruption`; `coordinator.reassert()` is MainActor-isolated.
     @objc private func handleRouteChange(_ notification: Notification) {
+        Task { @MainActor [weak self] in self?.handleRouteChangeOnMain() }
+    }
+
+    private func handleRouteChangeOnMain() {
         // A nil-format tap follows the input node's actual route format. Rebuild
         // the converter lazily without churning an already-running engine.
         converter = nil
         if shouldKeepEngineRunning, !engine.isRunning {
             do {
-                try configureSession()
+                // The lease is still held, but the system may have torn the
+                // session down with the old route: reapply the conversation
+                // policy before restarting the engine.
+                try coordinator.reassert()
                 try startEngine()
             } catch {
                 handleStartupFailure(error, stage: "routeChange")
-                continuation?.yield(.interrupted)
+                continuation?.yield(.interrupted(generation: captureGeneration))
                 return
             }
         }

@@ -1,5 +1,16 @@
 # Voice Capture Session Recovery Design
 
+> **SUPERSEDED (2026-09-07, PR #143):** The "Shared haptic audio-session
+> ownership" section below has been intentionally superseded. Binding the
+> response haptic engine to the shared `AVAudioSession` made every
+> text-chat response activate the app session, interrupting external media
+> (issue #140). The current strategy is an **unbound, haptics-only**
+> engine plus **suppressing the custom Core Haptics pattern while a voice
+> session is live** — the #48 contention concern is addressed by keeping
+> Core Haptics inactive during voice ownership, not by sharing the
+> session.
+
+
 ## Context
 
 On an iPhone 16 Pro Max running iOS 27, the Voice settings action **Record ASR** fails before transcription with:

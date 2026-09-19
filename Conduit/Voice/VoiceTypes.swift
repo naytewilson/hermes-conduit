@@ -24,12 +24,15 @@ struct VoiceCapabilitySnapshot: Equatable {
     var supportsSpeech: Bool
     var unavailableReason: String?
 
-    static let unavailable = VoiceCapabilitySnapshot(
-        isGatewayConnected: false,
-        supportsTranscription: false,
-        supportsSpeech: false,
-        unavailableReason: "This Hermes gateway does not expose voice endpoints."
-    )
+    /// Computed so the reason re-resolves under the in-app App Language.
+    static var unavailable: VoiceCapabilitySnapshot {
+        VoiceCapabilitySnapshot(
+            isGatewayConnected: false,
+            supportsTranscription: false,
+            supportsSpeech: false,
+            unavailableReason: AppLocalization.string("This Hermes gateway does not expose voice endpoints.")
+        )
+    }
 }
 
 struct VoiceProviderDescriptor: Codable, Equatable, Identifiable {
@@ -52,16 +55,130 @@ struct VoiceProviderDescriptor: Codable, Equatable, Identifiable {
     }
 }
 
+/// Shared canonicalization and whole-utterance matching for the spoken Voice
+/// command phrase lists (Stop, End Conversation). Matching is deliberately
+/// conservative: a command fires only when the ENTIRE transcribed utterance
+/// equals an ENTIRE configured phrase after normalization — no substring,
+/// fuzzy, or semantic matching. Both the transcript and the configured
+/// phrases are normalized the same way, so stored phrases need not be
+/// pre-trimmed or lowercased.
+enum VoiceSpokenCommands {
+    /// Built-in spoken commands. Additive across languages BY DESIGN: both
+    /// the English and the Simplified Chinese commands are recognized no
+    /// matter which App Language the interface uses — commands match the
+    /// transcribed utterance, never the UI locale.
+    static let defaultStopPhrases = [
+        "stop", "stop talking", "be quiet",
+        "停止", "别说了", "不要说了",
+    ]
+    static let defaultEndConversationPhrases = [
+        "goodbye", "bye", "end conversation", "that's all",
+        "再见", "拜拜", "结束对话", "就这样吧",
+    ]
+
+    /// Defaults as originally shipped. The spoken-phrase preferences have
+    /// not shipped in a stable release, but development builds may have
+    /// persisted the original lists verbatim.
+    static let previousDefaultStopPhrases = ["stop", "stop talking", "be quiet"]
+    static let previousDefaultEndConversationPhrases = ["goodbye", "bye", "end conversation", "that's all"]
+
+    /// Persistence migration for extended built-ins: a stored list that is
+    /// exactly a previous default (the user never customized it) upgrades
+    /// to the current defaults, so multilingual commands appear for
+    /// existing persisted blobs. A customized list — including one where
+    /// the user deliberately removed a built-in — is preserved untouched.
+    static func migratedDefaultPhrases(_ stored: [String], previous: [String], current: [String]) -> [String] {
+        let canonicalStored = Set(stored.map(canonicalized))
+        let canonicalPrevious = Set(previous.map(canonicalized))
+        return canonicalStored == canonicalPrevious ? current : stored
+    }
+
+    /// The single normalization used on both utterances and configured
+    /// phrases: case folding, typographic apostrophe folding (ASR emits
+    /// U+2019 for the U+0027 in defaults like "that's all"), and
+    /// leading/trailing whitespace and punctuation stripping (internal
+    /// punctuation such as the folded apostrophe survives).
+    static func canonicalized(_ text: String) -> String {
+        text.lowercased()
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+    }
+
+    /// True only when the whole utterance matches a whole configured phrase.
+    /// An utterance that canonicalizes to empty never matches.
+    static func matches(_ utterance: String, phrases: [String]) -> Bool {
+        let normalized = canonicalized(utterance)
+        guard !normalized.isEmpty else { return false }
+        return phrases.contains { canonicalized($0) == normalized }
+    }
+
+    /// Save-time canonicalization for a phrase list: trim each entry, drop
+    /// entries that canonicalize to empty, and de-duplicate by the same
+    /// canonical form used at runtime — keeping the first occurrence's
+    /// trimmed display form so user capitalization survives.
+    static func canonicalizedPhraseList(_ phrases: [String]) -> [String] {
+        var seen: Set<String> = []
+        var result: [String] = []
+        for phrase in phrases {
+            let trimmed = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+            let canonical = canonicalized(trimmed)
+            guard !canonical.isEmpty, seen.insert(canonical).inserted else { continue }
+            result.append(trimmed)
+        }
+        return result
+    }
+}
+
 struct VoiceProfilePreferences: Codable, Equatable {
     var outputMuted: Bool = false
+    /// Whether a completed assistant response automatically opens the next
+    /// listening turn. Does not control session lifetime, user pause,
+    /// barge-in, or route policy.
     var continuousConversation: Bool = true
     var continueWakeConversation: Bool = false
-    var spokenStopPhrases: [String] = ["stop", "stop talking", "be quiet"]
+    var spokenStopPhrases: [String] = VoiceSpokenCommands.defaultStopPhrases
+    /// Spoken phrases that close the whole Voice session through the
+    /// existing Close teardown path. An empty list disables the category.
+    var spokenEndConversationPhrases: [String] = VoiceSpokenCommands.defaultEndConversationPhrases
     /// Nil decodes older preferences as the Hermes-hosted route.
     var transcriptionMode: VoiceTranscriptionMode? = nil
 
     var resolvedTranscriptionMode: VoiceTranscriptionMode {
         transcriptionMode ?? .hermes
+    }
+
+    /// Explicit zero-arg initializer: a custom `init(from:)` removes the
+    /// synthesized memberwise/default initializer, and callers use
+    /// `VoiceProfilePreferences()` then mutate fields.
+    init() {}
+
+    /// Missing keys decode to the field defaults so a stored blob that never
+    /// wrote `continuousConversation` still yields ON (backward compatible).
+    /// Synthesized Codable would throw `keyNotFound` for absent non-optional
+    /// keys even when the property has a default value.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        outputMuted = try container.decodeIfPresent(Bool.self, forKey: .outputMuted) ?? false
+        continuousConversation = try container.decodeIfPresent(Bool.self, forKey: .continuousConversation) ?? true
+        continueWakeConversation = try container.decodeIfPresent(Bool.self, forKey: .continueWakeConversation) ?? false
+        spokenStopPhrases = try container.decodeIfPresent([String].self, forKey: .spokenStopPhrases)
+            .map {
+                VoiceSpokenCommands.migratedDefaultPhrases(
+                    $0,
+                    previous: VoiceSpokenCommands.previousDefaultStopPhrases,
+                    current: VoiceSpokenCommands.defaultStopPhrases
+                )
+            } ?? VoiceSpokenCommands.defaultStopPhrases
+        spokenEndConversationPhrases = try container.decodeIfPresent(
+            [String].self, forKey: .spokenEndConversationPhrases
+        ).map {
+            VoiceSpokenCommands.migratedDefaultPhrases(
+                $0,
+                previous: VoiceSpokenCommands.previousDefaultEndConversationPhrases,
+                current: VoiceSpokenCommands.defaultEndConversationPhrases
+            )
+        } ?? VoiceSpokenCommands.defaultEndConversationPhrases
+        transcriptionMode = try container.decodeIfPresent(VoiceTranscriptionMode.self, forKey: .transcriptionMode)
     }
 }
 
@@ -85,10 +202,10 @@ enum AppleSpeechRecognitionAvailability: Equatable {
 
     var title: String {
         switch self {
-        case .ready: return "Ready"
-        case .permissionRequired: return "Permission required"
-        case .permissionDenied: return "Permission denied"
-        case .unsupported: return "Unavailable"
+        case .ready: return AppLocalization.string("Ready")
+        case .permissionRequired: return AppLocalization.string("Permission required")
+        case .permissionDenied: return AppLocalization.string("Permission denied")
+        case .unsupported: return AppLocalization.string("Unavailable")
         }
     }
 
@@ -104,6 +221,13 @@ struct PendingVoiceIntent: Equatable {
     var profile: String?
     var startsFreshConversation: Bool
     var source: Source
+    /// Wall-clock deadline metadata (tests / identity). The actual timeout
+    /// wait uses `externalLaunchElapsedDeadline` so a backward clock step
+    /// cannot extend the Siri budget.
+    var externalLaunchDeadline: Date? = nil
+    /// Monotonic elapsed deadline armed at enqueue. Authoritative for the
+    /// deadline waiter; nil for requests with no external budget.
+    var externalLaunchElapsedDeadline: ContinuousClock.Instant? = nil
 
     enum Source: String, Equatable { case composer, wakePhrase, siri }
 }
@@ -147,8 +271,16 @@ struct VoiceCapturedAudio: Equatable {
 }
 
 enum VoiceCaptureEvent: Equatable {
-    case level(Float, date: Date)
-    case interrupted
+    /// Raw converted microphone peak. `generation` identifies the
+    /// input-tap/rendering lifetime that produced the frame, so the
+    /// controller can drop events queued before a pause/stop/restart: a
+    /// frame is valid only for the generation that produced it.
+    case level(Float, date: Date, generation: UInt64)
+    /// `generation` identifies the capture runtime the interruption belongs
+    /// to, so a queued interruption observed for a torn-down generation can
+    /// never fail a later capture (the controller rejects foreign
+    /// generations before applying the interrupted-failure semantics).
+    case interrupted(generation: UInt64)
     case routeChanged
 }
 
@@ -159,8 +291,8 @@ enum VoiceAudioError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .microphonePermissionDenied: return "Microphone access is required for voice conversations."
-        case .noAudioCaptured: return "No speech was captured."
+        case .microphonePermissionDenied: return AppLocalization.string("Microphone access is required for voice conversations.")
+        case .noAudioCaptured: return AppLocalization.string("No speech was captured.")
         case .unavailable(let detail): return detail
         }
     }
@@ -182,6 +314,11 @@ struct VoiceProviderTestResult: Equatable {
 @MainActor
 protocol AudioCaptureService: AnyObject {
     var events: AsyncStream<VoiceCaptureEvent> { get }
+    /// Monotonic identity of the currently installed input-tap/rendering
+    /// lifetime. Bumped whenever the tap is torn down or reinstalled; level
+    /// events carry the generation that produced them so stale frames from
+    /// a previous generation can be rejected.
+    var captureGeneration: UInt64 { get }
     func requestPermission() async -> Bool
     func startListening(includePreRoll: Bool) throws
     func beginBargeInMonitoring() throws
@@ -201,6 +338,10 @@ protocol DeviceSpeechTranscriptionService: AnyObject {
 @MainActor
 protocol SpeechPlaybackService: AnyObject {
     var isPlaying: Bool { get }
+    /// Which audio-session ownership playback claims while it plays.
+    /// Conversation playback joins the capture-owned session; standalone
+    /// flows (Read Aloud, provider tests) own the session alone.
+    var ownershipIntent: VoiceAudioIntent { get set }
     func start(sampleRate: Double) throws
     func enqueuePCM16(_ data: Data, sampleRate: Double) throws -> Int
     func playEncodedAudioData(_ data: Data) throws

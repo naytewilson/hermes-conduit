@@ -12,6 +12,7 @@ import PhotosUI
 import UniformTypeIdentifiers
 
 struct ComposerBar: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -26,12 +27,26 @@ struct ComposerBar: View {
     @State private var composerErrorMessage: String?
     @State private var draftStore = ComposerDraftStore()
     @State private var editorIdentity = UUID()
+    /// Generation of intentional composer text replacements. Every program
+    /// path that replaces the composer content routes through
+    /// `replaceComposerText(_:)` and advances this, so the UIKit editor
+    /// bridge applies the change exactly once — and, crucially, so ordinary
+    /// SwiftUI invalidations (streaming, reasoning, busy state) arrive with
+    /// an UNCHANGED revision and can never rewrite the editor or move the
+    /// cursor mid-typing.
+    @State private var composerRevision: UInt64 = 0
     @State private var loadedDraftKey: ComposerDraftKey?
     @State private var photoImportContext: AsyncAttachmentContext?
     @State private var photoImportGeneration: UInt64 = 0
     @State private var documentImportContext: AsyncAttachmentContext?
     @State private var attachmentGeneration: UInt64 = 0
     @State private var suppressNextTextChangeSuggestions = false
+    /// Round 6: non-nil presents the Repair Connection wizard seeded from
+    /// the failed connection.
+    @State private var repairContext: ConnectionRepairContext?
+    /// Local, device-only input preference. Defaults to off so existing
+    /// users keep Return inserting a newline after updating.
+    @AppStorage(ComposerReturnKey.preferenceKey) private var returnKeySends = false
     @Namespace private var glassNamespace
 
     struct AsyncAttachmentContext: Equatable {
@@ -140,6 +155,17 @@ struct ComposerBar: View {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// The only sanctioned way to replace composer content programmatically.
+    /// Advances the editor's programmatic revision alongside the text so the
+    /// change is applied to the UIKit editor exactly once, and so the bridge
+    /// can keep these replacements from ever surfacing as user input — the
+    /// user-edit ownership signal lives in that bridge's
+    /// `textViewDidChange`, guarded by the same machinery.
+    private func replaceComposerText(_ newValue: String) {
+        text = newValue
+        composerRevision &+= 1
+    }
+
     /// Returns the slash prefix being typed, or nil if the cursor has moved
     /// beyond the command name. Leading whitespace is accepted on purpose.
     private var slashPrefix: String? {
@@ -216,6 +242,7 @@ struct ComposerBar: View {
     }
 
     var body: some View {
+        let _ = TranscriptPerf.note(.composerBarBody)
         Group {
             if #available(iOS 26.0, *) {
                 GlassEffectContainer(spacing: 16) {
@@ -244,7 +271,7 @@ struct ComposerBar: View {
             }
         }
         .onChange(of: appState.composerPrefillToken) { _, _ in
-            text = appState.composerPrefillText
+            replaceComposerText(appState.composerPrefillText)
             isFocused = !text.isEmpty
             isShowingSlashSuggestions = slashPrefix != nil
         }
@@ -286,6 +313,10 @@ struct ComposerBar: View {
                 stateNotice
             }
 
+            if appState.isCompressingActiveSession {
+                compressingNotice
+            }
+
             if let composerErrorMessage, !composerErrorMessage.isEmpty {
                 pasteErrorNotice(composerErrorMessage)
             }
@@ -300,7 +331,7 @@ struct ComposerBar: View {
                 SlashSuggestionsOverlay(
                     commands: filteredSlashCommands,
                     onSelected: { cmd in
-                        text = "/\(cmd.name) "
+                        replaceComposerText("/\(cmd.name) ")
                         isShowingSlashSuggestions = false
                     }
                 )
@@ -332,7 +363,15 @@ struct ComposerBar: View {
                         onPastedImageError: { message in
                             handlePastedImageError(message, editorIdentity: currentEditorIdentity)
                         },
-                        editorIdentity: editorIdentity
+                        editorIdentity: editorIdentity,
+                        programmaticRevision: composerRevision,
+                        returnKeySends: returnKeySends,
+                        // May lag one render behind fast typing; the safe
+                        // failure mode is newline insertion, and
+                        // submitFromReturnKey() re-checks the live gate.
+                        canSubmitFromReturn: ComposerReturnKey.canSubmit(action: action),
+                        onSubmitFromReturn: { submitFromReturnKey() },
+                        onUserEdit: { appState.noteComposerUserEdit() }
                     )
                     .id(editorIdentity)
                     .padding(.horizontal, 5)
@@ -358,6 +397,9 @@ struct ComposerBar: View {
         .opacity(appState.turnState == .unsupportedGateway ? 0.7 : 1)
         .animation(ConduitMotion.transition, value: action)
         .preferredColorScheme(appState.themePreference.colorScheme)
+        .sheet(item: $repairContext) { context in
+            ConnectionRepairSetupSheet(context: context)
+        }
     }
 
     @ViewBuilder
@@ -372,8 +414,8 @@ struct ComposerBar: View {
                     .foregroundStyle(.orange)
             }
             Text(appState.turnState == .unsupportedGateway
-                 ? "Update this Hermes gateway to recover active turns safely."
-                 : "Synchronizing with Hermes before enabling chat controls")
+                 ? AppLocalization.string("Update this Hermes gateway to recover active turns safely.")
+                 : AppLocalization.string("Synchronizing with Hermes before enabling chat controls"))
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
@@ -385,6 +427,51 @@ struct ComposerBar: View {
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            // Round 6: Repair Connection appears only once the connection is
+            // actually down AND a failed attempt has surfaced — through the
+            // typed classified failure or the visible error banner — never
+            // during normal automatic recovery, and never uninvited.
+            // Entering repair hands recovery authority to the user; the
+            // automatic retry loop stays stopped until the repair reconnects
+            // or the user retries manually.
+            if appState.connection != nil,
+               !appState.isConnected,
+               (appState.lastConnectionFailure != nil
+                   || !(appState.errorMessage ?? "").isEmpty) {
+                Button {
+                    Haptics.light()
+                    repairContext = appState.beginConnectionRepair()
+                } label: {
+                    Label("Repair Connection", systemImage: "wrench.and.screwdriver")
+                        .font(.footnote.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 34)
+                }
+                .buttonStyle(.bordered)
+                .tint(.conduitAccent)
+                .accessibilityIdentifier("composer.repair-connection")
+                .accessibilityLabel("Repair Connection")
+                .accessibilityHint("Test and fix the failed connection, then reconnect")
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+    }
+
+    /// Small in-flight affordance for the dedicated `session.compress` RPC
+    /// (manual compression is LLM-bound and can take minutes). Upstream
+    /// exposes no incremental compression progress, so this is deliberately
+    /// just a spinner and a label.
+    private var compressingNotice: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text(AppLocalization.string("Compressing…"))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 14)
         .padding(.top, 10)
@@ -524,7 +611,7 @@ struct ComposerBar: View {
                             options: .repeating,
                             isActive: appState.turnState == .running && !reduceMotion
                         )
-                    Text(appState.runtime.model.isEmpty ? "Model" : appState.runtime.model)
+                    Text(appState.runtime.model.isEmpty ? AppLocalization.string("Model") : appState.runtime.model)
                         .lineLimit(1)
                     if !appState.runtime.reasoningEffort.isEmpty {
                         Text("/")
@@ -573,12 +660,26 @@ struct ComposerBar: View {
                         .frame(minWidth: 36, minHeight: 36)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Delegate agents, \(appState.activeAgents) active")
+                .accessibilityLabel(AppLocalization.string("Delegate agents, \(String(appState.activeAgents)) active"))
             }
         }
         .padding(.horizontal, 14)
         .padding(.top, 7)
         .padding(.bottom, 1)
+    }
+
+    /// Return-shortcut entry point. Invokes the exact same submission path
+    /// as the composer action button, but only for typed-message actions
+    /// (send/steer/interrupt): Return never acts as the stop-only control.
+    /// The gate is re-checked here so the existing composer action state —
+    /// not the text view — stays authoritative. Reports whether the message
+    /// actually went out, so a declined shortcut press falls back to the
+    /// text view's default newline behavior instead of being swallowed.
+    @discardableResult
+    private func submitFromReturnKey() -> Bool {
+        guard ComposerReturnKey.canSubmit(action: action) else { return false }
+        submit()
+        return true
     }
 
     private func submit() {
@@ -620,7 +721,7 @@ struct ComposerBar: View {
             draftStore.removeDraft(for: submittedDraftBucket)
             guard loadedDraftKey == submittedDraftKey else { return }
             if appState.composerPrefillToken != prefillToken {
-                text = appState.composerPrefillText
+                replaceComposerText(appState.composerPrefillText)
                 isFocused = !text.isEmpty
             }
             isShowingSlashSuggestions = slashPrefix != nil
@@ -652,7 +753,7 @@ struct ComposerBar: View {
             interactive: appState.canStartVoiceConversation
         )
         .accessibilityLabel("Start voice conversation")
-        .accessibilityHint(appState.voiceUnavailableReason ?? "Opens voice controls over this conversation")
+        .accessibilityHint(appState.voiceUnavailableReason ?? AppLocalization.string("Opens voice controls over this conversation"))
     }
 
     /// Collapse the draft in the same transaction that dismisses the keyboard.
@@ -661,7 +762,7 @@ struct ComposerBar: View {
     private func collapseSubmittedDraft() {
         dismissComposer()
         let updates = {
-            text = ""
+            replaceComposerText("")
             attachments = []
             composerTextHeight = ComposerPasteTextView.minimumHeight
         }
@@ -700,7 +801,7 @@ struct ComposerBar: View {
         // Do not overwrite a new draft if the user already returned to the
         // composer while the failed request was in flight.
         guard text.isEmpty, attachments.isEmpty else { return }
-        text = submittedText
+        replaceComposerText(submittedText)
         attachments = submittedAttachments
     }
 
@@ -757,7 +858,7 @@ struct ComposerBar: View {
         if text != draft.text {
             suppressNextTextChangeSuggestions = true
         }
-        text = draft.text
+        replaceComposerText(draft.text)
         attachments = draft.attachments
         loadedDraftKey = key
         composerTextHeight = ComposerPasteTextView.minimumHeight
@@ -885,15 +986,15 @@ struct ComposerBar: View {
             attachments.append(Attachment(id: UUID().uuidString, name: name, uri: url.absoluteString, mimeType: mimeType, kind: kind))
             Haptics.light()
         } catch {
-            appState.errorMessage = "Could not prepare \(name) for upload."
+            appState.errorMessage = AppLocalization.string("Could not prepare \(name) for upload.")
             Haptics.error()
         }
     }
 
     private func formatEffort(_ value: String) -> String {
         let lower = value.lowercased()
-        if lower == "none" || lower == "off" { return "Off" }
-        if lower == "xhigh" { return "Extra High" }
+        if lower == "none" || lower == "off" { return AppLocalization.string("Off") }
+        if lower == "xhigh" { return AppLocalization.string("Extra High") }
         return lower.capitalized
             .replacingOccurrences(of: "-", with: " ")
             .replacingOccurrences(of: "_", with: " ")
@@ -901,21 +1002,21 @@ struct ComposerBar: View {
 
     private var accessibilityLabel: String {
         switch action {
-        case .stop: return "Stop response"
-        case .steer: return "Steer with message"
-        case .interrupt: return "Interrupt and correct response"
-        case .send: return "Send message"
-        case .unavailable: return "Composer unavailable"
+        case .stop: return AppLocalization.string("Stop response")
+        case .steer: return AppLocalization.string("Steer with message")
+        case .interrupt: return AppLocalization.string("Interrupt and correct response")
+        case .send: return AppLocalization.string("Send message")
+        case .unavailable: return AppLocalization.string("Composer unavailable")
         }
     }
 
     private var modelAccessibilityLabel: String {
-        let model = appState.runtime.model.isEmpty ? "Model" : appState.runtime.model
+        let model = appState.runtime.model.isEmpty ? AppLocalization.string("Model") : appState.runtime.model
         let reasoning = appState.runtime.reasoningEffort.isEmpty
-            ? "reasoning not set"
-            : "reasoning \(formatEffort(appState.runtime.reasoningEffort))"
-        let approvals = appState.runtime.yolo ? ", auto-approve enabled" : ""
-        let activity = appState.turnState == .running ? ", agent working" : ""
+            ? AppLocalization.string("reasoning not set")
+            : AppLocalization.string("reasoning \(formatEffort(appState.runtime.reasoningEffort))")
+        let approvals = appState.runtime.yolo ? AppLocalization.string(", auto-approve enabled") : ""
+        let activity = appState.turnState == .running ? AppLocalization.string(", agent working") : ""
         return "\(model), \(reasoning)\(approvals)\(activity)"
     }
 }
@@ -933,7 +1034,7 @@ struct ContextRingView: View {
                 .trim(from: 0, to: min(percent / 100, 1))
                 .stroke(Color.conduitAccent, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                 .rotationEffect(.degrees(-90))
-            Text("\(Int(percent.rounded()))%")
+            Text("\(String(Int(percent.rounded())))%")
                 .font(.system(size: 9, weight: .semibold).monospacedDigit())
         }
     }
