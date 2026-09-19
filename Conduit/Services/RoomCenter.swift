@@ -39,7 +39,7 @@ import Foundation
 /// duplicate the semantic effect server-side. Execution-targeted ops need
 /// `executionID`; `acknowledge` additionally needs `attentionKind`; `start`
 /// needs `trigger` + `projectSlug` instead of an execution.
-struct RoomControlIntent: Equatable, Identifiable {
+struct RoomControlIntent: Codable, Equatable, Identifiable {
     let id: UUID
     let dashboardID: UUID
     let roomID: String
@@ -48,6 +48,8 @@ struct RoomControlIntent: Equatable, Identifiable {
     let attentionKind: AttentionKind?
     let trigger: String?
     let projectSlug: String?
+    /// I1 correlation spine passthrough into the Hub control ledger.
+    let correlationID: String?
     let idempotencyKey: String
 }
 
@@ -160,6 +162,7 @@ final class RoomCenter: ObservableObject {
     private let credentialStore: RoomHubCredentialStore
     private let transport: RoomTransport
     private var replayStore: RoomReplayStore
+    private var controlJournal: RoomControlJournal
     private let authenticate: (String) async -> Bool
     private let clock: () -> Date
     private let idempotencyKeyMint: () -> String
@@ -176,6 +179,7 @@ final class RoomCenter: ObservableObject {
         credentialStore: RoomHubCredentialStore = .system,
         transport: RoomTransport = .urlSession(),
         replayStore: RoomReplayStore = RoomReplayStore(),
+        controlJournal: RoomControlJournal = RoomControlJournal(),
         authenticate: @escaping (String) async -> Bool = BiometricAuth.authenticate,
         clock: @escaping () -> Date = Date.init,
         idempotencyKeyMint: (() -> String)? = nil,
@@ -185,6 +189,7 @@ final class RoomCenter: ObservableObject {
         self.credentialStore = credentialStore
         self.transport = transport
         self.replayStore = replayStore
+        self.controlJournal = controlJournal
         self.authenticate = authenticate
         self.clock = clock
         self.idempotencyKeyMint = idempotencyKeyMint ?? { UUID().uuidString }
@@ -256,9 +261,10 @@ final class RoomCenter: ObservableObject {
         action: RoomControlAction,
         attentionKind: AttentionKind? = nil,
         trigger: String? = nil,
-        projectSlug: String? = nil
+        projectSlug: String? = nil,
+        correlationID: String? = nil
     ) -> RoomControlIntent {
-        RoomControlIntent(
+        let candidate = RoomControlIntent(
             id: UUID(),
             dashboardID: dashboardID,
             roomID: roomID,
@@ -267,11 +273,14 @@ final class RoomCenter: ObservableObject {
             attentionKind: attentionKind,
             trigger: trigger,
             projectSlug: projectSlug,
+            correlationID: correlationID,
             // Hub V1 caps idempotencyKey at 64 characters. A UUID plus
-            // this short producer prefix is globally collision-resistant
-            // without embedding the 36-character dashboard UUID as well.
+            // this short producer prefix is globally collision-resistant.
             idempotencyKey: "conduit:\(idempotencyKeyMint())"
         )
+        // Persist before the first possible POST. If the prior process died
+        // with the same semantic intent unresolved, recover its exact key.
+        return controlJournal.recoverOrInsert(candidate, at: clock())
     }
 
     /// The one mutable flow. Order is the contract: biometric step-up FIRST
@@ -290,46 +299,106 @@ final class RoomCenter: ObservableObject {
 
             let reason = AppLocalization.string("Authorize \(intent.action.rawValue) on this Room")
             guard await authenticate(reason) else {
+                // No network I/O occurred, so this user gesture is safely
+                // abandoned rather than recovered after restart.
+                controlJournal.remove(intentID: intent.id)
                 outcome = Self.outcome(intent, kind: .biometricRejected, at: clock())
                 return record(outcome)
             }
             guard !Task.isCancelled else { throw CancellationError() }
 
-            let record = try await dispatch(intent, client: client)
-            if record.isReplay {
-                outcome = Self.outcome(
-                    intent,
-                    kind: .duplicateRejected,
-                    subject: record.subject,
-                    detail: record.operationId,
+            // Cold-restart recovery: if a prior process already obtained a
+            // durable operation id, resume from the read projection. Never
+            // POST the mutation again just to rediscover its status.
+            if let journalEntry = controlJournal.entry(intentID: intent.id),
+               let operationID = journalEntry.operationID {
+                let latest = try await client.getOperation(operationID: operationID)
+                controlJournal.recordOperation(
+                    intentID: intent.id,
+                    operationID: latest.operationId,
+                    status: latest.status,
                     at: clock()
                 )
-            } else if record.isRecorded {
-                // 202: authorized and queued with the execution authority.
-                // Poll the op record for the recorded→applied transition.
-                let applied = await pollToApplied(
-                    operationID: record.operationId,
+                if latest.status == .applied {
+                    await resyncAndResolveJournal(intent)
+                    outcome = Self.outcome(
+                        intent,
+                        kind: .applied,
+                        subject: latest.subject,
+                        detail: latest.operationId,
+                        at: clock()
+                    )
+                } else if let applied = await pollToApplied(
+                    intentID: intent.id,
+                    operationID: latest.operationId,
                     client: client
-                )
-                outcome = Self.outcome(
-                    intent,
-                    kind: applied ? .applied : .recorded,
-                    subject: record.subject,
-                    detail: record.operationId,
-                    at: clock()
-                )
+                ) {
+                    await resyncAndResolveJournal(intent)
+                    outcome = Self.outcome(
+                        intent,
+                        kind: .applied,
+                        subject: applied.subject ?? latest.subject,
+                        detail: applied.operationId,
+                        at: clock()
+                    )
+                } else {
+                    outcome = Self.outcome(
+                        intent,
+                        kind: .recorded,
+                        subject: latest.subject,
+                        detail: latest.operationId,
+                        at: clock()
+                    )
+                }
+                return record(outcome)
+            }
+
+            let serverRecord = try await dispatch(intent, client: client)
+            // Persist the durable Hub identity before polling/resync. A crash
+            // after this point resumes with GET /operations/{id}.
+            controlJournal.recordOperation(
+                intentID: intent.id,
+                operationID: serverRecord.operationId,
+                status: serverRecord.status,
+                at: clock()
+            )
+
+            if serverRecord.isRecorded {
+                if let applied = await pollToApplied(
+                    intentID: intent.id,
+                    operationID: serverRecord.operationId,
+                    client: client
+                ) {
+                    await resyncAndResolveJournal(intent)
+                    outcome = Self.outcome(
+                        intent,
+                        kind: .applied,
+                        subject: applied.subject ?? serverRecord.subject,
+                        detail: applied.operationId,
+                        at: clock()
+                    )
+                } else {
+                    outcome = Self.outcome(
+                        intent,
+                        kind: .recorded,
+                        subject: serverRecord.subject,
+                        detail: serverRecord.operationId,
+                        at: clock()
+                    )
+                }
             } else {
+                // Applied replay is still the already-recorded effect, not a
+                // fresh mutation. Keep the UI distinction while finishing
+                // the same authority resync boundary.
+                await resyncAndResolveJournal(intent)
                 outcome = Self.outcome(
                     intent,
-                    kind: .applied,
-                    subject: record.subject,
-                    detail: record.operationId,
+                    kind: serverRecord.isReplay ? .duplicateRejected : .applied,
+                    subject: serverRecord.subject,
+                    detail: serverRecord.operationId,
                     at: clock()
                 )
             }
-            // Authority re-read: the Room timeline, not the op record, is
-            // the record of what the action did.
-            await syncRoom(dashboardID: intent.dashboardID, roomID: intent.roomID)
         } catch let error as RoomControlError {
             outcome = Self.outcome(
                 intent,
@@ -337,12 +406,19 @@ final class RoomCenter: ObservableObject {
                 detail: Self.detail(for: error),
                 at: clock()
             )
-            // A precondition failure means the timeline moved under us —
-            // resync so the controls re-render against real state.
+            // Client-malformed intent cannot have reached the server.
+            if case .undecodable(let status, _) = error, status == 0 {
+                controlJournal.remove(intentID: intent.id)
+            }
+            // A precondition failure means the timeline moved under us.
+            // Re-read it, but keep the same durable key until a later
+            // equivalent gesture either succeeds or is explicitly replaced.
             if case .preconditionFailed = error {
                 await syncRoom(dashboardID: intent.dashboardID, roomID: intent.roomID)
             }
         } catch {
+            // Ambiguous transport/process failures deliberately leave the
+            // journal entry intact so a later retry reuses the exact key.
             outcome = Self.outcome(
                 intent,
                 kind: .failed,
@@ -379,6 +455,7 @@ final class RoomCenter: ObservableObject {
     /// state — scoped exactly like the credential record.
     func clearDashboard(_ dashboardID: UUID) {
         replayStore.clearDashboard(dashboardID)
+        controlJournal.clearDashboard(dashboardID)
         readClients[dashboardID] = nil
         controlClients[dashboardID] = nil
         coordinators[dashboardID] = nil
@@ -401,17 +478,29 @@ final class RoomCenter: ObservableObject {
             guard let executionID = intent.executionID, !executionID.isEmpty else {
                 throw RoomControlError.undecodable(status: 0, detail: "cancel requires an executionID")
             }
-            return try await client.cancelExecution(executionID: executionID, idempotencyKey: key)
+            return try await client.cancelExecution(
+                executionID: executionID,
+                idempotencyKey: key,
+                correlationID: intent.correlationID
+            )
         case .retry:
             guard let executionID = intent.executionID, !executionID.isEmpty else {
                 throw RoomControlError.undecodable(status: 0, detail: "retry requires an executionID")
             }
-            return try await client.retryExecution(executionID: executionID, idempotencyKey: key)
+            return try await client.retryExecution(
+                executionID: executionID,
+                idempotencyKey: key,
+                correlationID: intent.correlationID
+            )
         case .resume:
             guard let executionID = intent.executionID, !executionID.isEmpty else {
                 throw RoomControlError.undecodable(status: 0, detail: "resume requires an executionID")
             }
-            return try await client.resumeExecution(executionID: executionID, idempotencyKey: key)
+            return try await client.resumeExecution(
+                executionID: executionID,
+                idempotencyKey: key,
+                correlationID: intent.correlationID
+            )
         case .acknowledge:
             guard let executionID = intent.executionID, !executionID.isEmpty,
                   let kind = intent.attentionKind else {
@@ -420,7 +509,8 @@ final class RoomCenter: ObservableObject {
             return try await client.acknowledgeAttention(
                 executionID: executionID,
                 attentionKind: kind,
-                idempotencyKey: key
+                idempotencyKey: key,
+                correlationID: intent.correlationID
             )
         case .start:
             guard let trigger = intent.trigger, !trigger.isEmpty,
@@ -430,30 +520,50 @@ final class RoomCenter: ObservableObject {
             return try await client.startApprovedExecution(
                 trigger: trigger,
                 projectSlug: projectSlug,
-                idempotencyKey: key
+                idempotencyKey: key,
+                correlationID: intent.correlationID
             )
         default:
             throw RoomControlError.undecodable(status: 0, detail: "unknown action \(intent.action.rawValue)")
         }
     }
 
-    /// Bounded poll of GET /operations/{id} until the record turns `applied`.
-    /// Returns true on applied, false when attempts exhaust or the read
-    /// fails — the caller then surfaces `.recorded` with the operation id.
+    /// Bounded poll of GET /operations/{id}. Every observed status is
+    /// durably journaled before the next step so a crash never regresses from
+    /// an operation id back to mutation replay.
     private func pollToApplied(
+        intentID: UUID,
         operationID: String,
         client: RoomControlClient
-    ) async -> Bool {
+    ) async -> ControlOperationRecord? {
         for _ in 0..<operationPollMaxAttempts {
             if operationPollInterval > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(operationPollInterval * 1_000_000_000))
             }
             guard let record = try? await client.getOperation(operationID: operationID) else {
-                return false
+                return nil
             }
-            if record.status == .applied { return true }
+            controlJournal.recordOperation(
+                intentID: intentID,
+                operationID: record.operationId,
+                status: record.status,
+                at: clock()
+            )
+            if record.status == .applied { return record }
         }
-        return false
+        return nil
+    }
+
+    /// Applied does not become locally complete until the authority Room
+    /// projection is live again. If resync fails, the journal intentionally
+    /// remains so the next launch resolves the same op instead of minting a
+    /// new mutation key.
+    private func resyncAndResolveJournal(_ intent: RoomControlIntent) async {
+        await syncRoom(dashboardID: intent.dashboardID, roomID: intent.roomID)
+        let key = scopeKey(dashboardID: intent.dashboardID, roomID: intent.roomID)
+        if case .live = projections[key]?.freshness {
+            controlJournal.remove(intentID: intent.id)
+        }
     }
 
     private func scopeKey(dashboardID: UUID, roomID: String) -> String {
