@@ -519,6 +519,29 @@ final class RoomCenterTests: XCTestCase {
         }
     }
 
+    func testIdempotencyConflictRetiresPoisonedJournalKey() async {
+        hub.postHandler = { _ in
+            (409, Self.problemBody(status: 409, code: "idempotency_key_conflict"))
+        }
+        let center = await makeCenter()
+        let first = await center.makeIntent(
+            dashboardID: dashboardID, roomID: Self.roomID,
+            executionID: Self.executionID, action: .cancel
+        )
+
+        let outcome = await center.perform(first)
+        XCTAssertEqual(outcome.kind, .idempotencyConflict)
+
+        // The server has proven this key belongs to a different op/target,
+        // so a later NEW gesture must not recover the poisoned local intent.
+        let replacement = await center.makeIntent(
+            dashboardID: dashboardID, roomID: Self.roomID,
+            executionID: Self.executionID, action: .cancel
+        )
+        XCTAssertNotEqual(replacement.id, first.id)
+        XCTAssertNotEqual(replacement.idempotencyKey, first.idempotencyKey)
+    }
+
     func testPreconditionFailedTriggersResync() async {
         hub.postHandler = { _ in
             (409, Self.problemBody(status: 409, code: "control_precondition_failed"))
