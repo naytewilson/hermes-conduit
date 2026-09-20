@@ -20,6 +20,7 @@ struct SavedDashboardsSettingsDetail: View {
     @State private var rows: [SavedDashboardRowModel] = []
     @State private var isSwitchingTo: UUID?
     @State private var pendingRemoval: SavedDashboardRowModel?
+    @State private var roomHubDashboard: SavedDashboardRowModel?
 
     struct SavedDashboardRowModel: Identifiable {
         let dashboard: SavedDashboard
@@ -78,6 +79,9 @@ struct SavedDashboardsSettingsDetail: View {
         } message: {
             Text("This dashboard's saved sign-in and cookies will be deleted from this device. Other dashboards are not affected.")
         }
+        .sheet(item: $roomHubDashboard) { row in
+            RoomHubCredentialSheet(dashboardID: row.dashboard.id)
+        }
     }
 
     // MARK: - Rows
@@ -124,6 +128,12 @@ struct SavedDashboardsSettingsDetail: View {
         .disabled(row.isActive)
         .accessibilityIdentifier("settings.dashboard.row")
         .contextMenu {
+            Button {
+                Haptics.selection()
+                roomHubDashboard = row
+            } label: {
+                Label(AppLocalization.string("Room Hub…"), systemImage: "key")
+            }
             Button {
                 Haptics.selection()
                 signOut(row)
@@ -209,6 +219,11 @@ struct SavedDashboardsSettingsDetail: View {
 
     private func removeDashboard(_ row: SavedDashboardRowModel) {
         let wasActive = row.isActive
+        // Room seam cleanup rides dashboard removal: the Hub credential
+        // record and the dashboard's replay state are scoped to this UUID
+        // and must not outlive it.
+        RoomHubCredentialStore.system.clear(dashboardID: row.dashboard.id)
+        RoomCenter.shared.clearDashboard(row.dashboard.id)
         appState.removeDashboard(row.dashboard.id)
         rebuildRows()
         if wasActive { close() }
