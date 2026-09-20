@@ -410,6 +410,14 @@ final class RoomCenter: ObservableObject {
             if case .undecodable(let status, _) = error, status == 0 {
                 controlJournal.remove(intentID: intent.id)
             }
+            // A server-proven idempotency conflict means this key is already
+            // bound to a DIFFERENT op/target. Retaining it would poison every
+            // future equivalent gesture with the same permanent 409. Retire
+            // only this losing local intent; the server record remains source
+            // truth and this request still fails closed.
+            if case .idempotencyConflict = error {
+                controlJournal.remove(intentID: intent.id)
+            }
             // A precondition failure means the timeline moved under us.
             // Re-read it, but keep the same durable key until a later
             // equivalent gesture either succeeds or is explicitly replaced.
