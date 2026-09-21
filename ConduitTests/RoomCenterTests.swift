@@ -125,6 +125,7 @@ final class RoomCenterTests: XCTestCase {
     private var credentialStore: RoomHubCredentialStore!
     private var defaults: UserDefaults!
     private var suiteName: String!
+    private var journalDir: URL!
     private let dashboardID = UUID()
     private var biometricResults: [Bool] = []
     private var biometricReasons: [String] = []
@@ -134,6 +135,9 @@ final class RoomCenterTests: XCTestCase {
         super.setUp()
         suiteName = "RoomCenterTests.\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: suiteName)
+        journalDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RoomCenterTests.journal.\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: journalDir, withIntermediateDirectories: true)
         backend = InMemoryRoomHubBackend()
         credentialStore = RoomHubCredentialStore(backend: backend)
         hub = CombinedHub(
@@ -152,6 +156,7 @@ final class RoomCenterTests: XCTestCase {
 
     override func tearDown() {
         defaults.removePersistentDomain(forName: suiteName)
+        try? FileManager.default.removeItem(at: journalDir)
         super.tearDown()
     }
 
@@ -163,7 +168,7 @@ final class RoomCenterTests: XCTestCase {
             credentialStore: credentialStore,
             transport: hub.transport,
             replayStore: RoomReplayStore(defaults: defaults, storageKey: "test.roomReplay"),
-            controlJournal: RoomControlJournal(defaults: defaults, storageKey: "test.roomControls"),
+            controlJournal: RoomControlJournal(storageDirectory: journalDir),
             authenticate: { [weak self] reason in
                 self?.biometricReasons.append(reason)
                 return self?.biometricResults.isEmpty == false
@@ -182,7 +187,7 @@ final class RoomCenterTests: XCTestCase {
 
     // MARK: - Read surface
 
-    func testRefreshRoomsLoadsAndCachesPerDashboard() async {
+    func testRefreshRoomsLoadsAndCachesPerDashboard() async throws {
         let center = await makeCenter()
         await center.refreshRooms(dashboardID: dashboardID)
 
@@ -193,7 +198,7 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertEqual(hub.requests.map(\.path), ["/api/v1/rooms"])
     }
 
-    func testRefreshRoomsWithoutCredentialIsUnconfigured() async {
+    func testRefreshRoomsWithoutCredentialIsUnconfigured() async throws {
         let other = UUID()
         let center = await makeCenter()
         await center.refreshRooms(dashboardID: other)
@@ -203,7 +208,7 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertTrue(hub.requests.isEmpty)
     }
 
-    func testSyncRoomAppliesEventsIntoProjection() async {
+    func testSyncRoomAppliesEventsIntoProjection() async throws {
         hub.eventPage = Self.transitionPageBody
         let center = await makeCenter()
         await center.syncRoom(dashboardID: dashboardID, roomID: Self.roomID)
@@ -218,7 +223,7 @@ final class RoomCenterTests: XCTestCase {
     // MARK: - Control flow
 
     @MainActor
-    func testProductionShapeIdempotencyKeyFitsFrozenContractLimit() async {
+    func testProductionShapeIdempotencyKeyFitsFrozenContractLimit() async throws {
         let productionUUID = "12345678-1234-1234-1234-123456789abc"
         let center = RoomCenter(
             credentialStore: credentialStore,
@@ -227,17 +232,14 @@ final class RoomCenterTests: XCTestCase {
                 defaults: defaults,
                 storageKey: "test.productionShape.roomReplay"
             ),
-            controlJournal: RoomControlJournal(
-                defaults: defaults,
-                storageKey: "test.productionShape.roomControls"
-            ),
+            controlJournal: RoomControlJournal(storageDirectory: journalDir),
             authenticate: { _ in true },
             clock: { Date(timeIntervalSince1970: 1_789_813_200) },
             idempotencyKeyMint: { productionUUID },
             operationPollMaxAttempts: 1,
             operationPollInterval: 0
         )
-        let intent = await center.makeIntent(
+        let intent = try await center.makeIntent(
             dashboardID: dashboardID,
             roomID: Self.roomID,
             executionID: Self.executionID,
@@ -249,7 +251,7 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertFalse(intent.idempotencyKey.contains(dashboardID.uuidString.lowercased()))
     }
 
-    func testAmbiguousFailureReusesSameIntentAndKeyAfterRestart() async {
+    func testAmbiguousFailureReusesSameIntentAndKeyAfterRestart() async throws {
         var posts = 0
         hub.postHandler = { path in
             guard path.hasSuffix("/resume") else { return nil }
@@ -260,7 +262,7 @@ final class RoomCenterTests: XCTestCase {
         }
 
         let firstCenter = await makeCenter()
-        let first = await firstCenter.makeIntent(
+        let first = try await firstCenter.makeIntent(
             dashboardID: dashboardID,
             roomID: Self.roomID,
             executionID: Self.executionID,
@@ -273,7 +275,7 @@ final class RoomCenterTests: XCTestCase {
 
         hub.requests = []
         let secondCenter = await makeCenter()
-        let recovered = await secondCenter.makeIntent(
+        let recovered = try await secondCenter.makeIntent(
             dashboardID: dashboardID,
             roomID: Self.roomID,
             executionID: Self.executionID,
@@ -300,14 +302,14 @@ final class RoomCenterTests: XCTestCase {
         )
     }
 
-    func testRecordedOperationResumesByGETAfterRestartWithoutSecondPOST() async {
+    func testRecordedOperationResumesByGETAfterRestartWithoutSecondPOST() async throws {
         hub.postHandler = { path in
             guard path.hasSuffix("/retry") else { return nil }
             return (202, Self.opRecordBody(op: "retry", status: "recorded"))
         }
 
         let firstCenter = await makeCenter(pollAttempts: 0)
-        let first = await firstCenter.makeIntent(
+        let first = try await firstCenter.makeIntent(
             dashboardID: dashboardID,
             roomID: Self.roomID,
             executionID: Self.executionID,
@@ -323,7 +325,7 @@ final class RoomCenterTests: XCTestCase {
             (200, Self.opRecordBody(op: "retry", status: "applied"))
         ]
         let secondCenter = await makeCenter(pollAttempts: 0)
-        let recovered = await secondCenter.makeIntent(
+        let recovered = try await secondCenter.makeIntent(
             dashboardID: dashboardID,
             roomID: Self.roomID,
             executionID: Self.executionID,
@@ -342,7 +344,7 @@ final class RoomCenterTests: XCTestCase {
         )
 
         let thirdCenter = await makeCenter(pollAttempts: 0)
-        let fresh = await thirdCenter.makeIntent(
+        let fresh = try await thirdCenter.makeIntent(
             dashboardID: dashboardID,
             roomID: Self.roomID,
             executionID: Self.executionID,
@@ -353,10 +355,10 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertNotEqual(fresh.idempotencyKey, first.idempotencyKey)
     }
 
-    func testBiometricRejectionPerformsZeroNetworkIO() async {
+    func testBiometricRejectionPerformsZeroNetworkIO() async throws {
         biometricResults = [false]
         let center = await makeCenter()
-        let intent = await center.makeIntent(
+        let intent = try await center.makeIntent(
             dashboardID: dashboardID, roomID: Self.roomID,
             executionID: Self.executionID, action: .resume
         )
@@ -369,7 +371,7 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertEqual(biometricReasons.count, 1)
     }
 
-    func testSuccessfulActionPostsOpThenResyncs() async {
+    func testSuccessfulActionPostsOpThenResyncs() async throws {
         hub.postHandler = { path in
             if path.hasSuffix("/cancel") {
                 return (200, Self.opRecordBody(op: "cancel", status: "applied"))
@@ -377,7 +379,7 @@ final class RoomCenterTests: XCTestCase {
             return nil
         }
         let center = await makeCenter()
-        let intent = await center.makeIntent(
+        let intent = try await center.makeIntent(
             dashboardID: dashboardID,
             roomID: Self.roomID,
             executionID: Self.executionID,
@@ -405,7 +407,7 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertEqual(hub.requests[0].body?["correlationId"]?.stringValue, "corr-control")
     }
 
-    func testRetriedIntentReusesIdempotencyKey() async {
+    func testRetriedIntentReusesIdempotencyKey() async throws {
         var actionCalls = 0
         hub.postHandler = { path in
             if path.hasSuffix("/resume") {
@@ -420,7 +422,7 @@ final class RoomCenterTests: XCTestCase {
             return nil
         }
         let center = await makeCenter()
-        let intent = await center.makeIntent(
+        let intent = try await center.makeIntent(
             dashboardID: dashboardID, roomID: Self.roomID,
             executionID: Self.executionID, action: .resume
         )
@@ -437,7 +439,7 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertEqual(finalOutcome?.kind, .duplicateRejected)
     }
 
-    func testRecordedOpIsPolledToApplied() async {
+    func testRecordedOpIsPolledToApplied() async throws {
         // 202 `recorded`: the op is queued with the execution authority.
         // The center polls GET /operations/{id} until it turns applied.
         hub.postHandler = { path in
@@ -451,7 +453,7 @@ final class RoomCenterTests: XCTestCase {
             (200, Self.opRecordBody(op: "retry", status: "applied")),
         ]
         let center = await makeCenter(pollAttempts: 5)
-        let intent = await center.makeIntent(
+        let intent = try await center.makeIntent(
             dashboardID: dashboardID, roomID: Self.roomID,
             executionID: Self.executionID, action: .retry
         )
@@ -465,7 +467,7 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertEqual(polls.count, 2)
     }
 
-    func testRecordedOpThatNeverAppliesSurfacesRecorded() async {
+    func testRecordedOpThatNeverAppliesSurfacesRecorded() async throws {
         // The op stays `recorded` through every poll attempt: the outcome
         // is `.recorded` with the operation id — never presented as applied.
         hub.postHandler = { path in
@@ -479,7 +481,7 @@ final class RoomCenterTests: XCTestCase {
             (200, Self.opRecordBody(op: "retry", status: "recorded")),
         ]
         let center = await makeCenter(pollAttempts: 2)
-        let intent = await center.makeIntent(
+        let intent = try await center.makeIntent(
             dashboardID: dashboardID, roomID: Self.roomID,
             executionID: Self.executionID, action: .retry
         )
@@ -494,7 +496,7 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertEqual(polls.count, 2)
     }
 
-    func testForbiddenCodesSurfaceSeparately() async {
+    func testForbiddenCodesSurfaceSeparately() async throws {
         // 403 `control_capability_denied` (the bound subject's grant check
         // failed) and `insufficient_scope` (the Bearer lacks the API scope)
         // are different failures — never collapsed.
@@ -507,7 +509,7 @@ final class RoomCenterTests: XCTestCase {
                 (403, Self.problemBody(status: 403, code: code))
             }
             let center = await makeCenter()
-            let intent = await center.makeIntent(
+            let intent = try await center.makeIntent(
                 dashboardID: dashboardID, roomID: Self.roomID,
                 executionID: Self.executionID, action: .cancel
             )
@@ -519,12 +521,12 @@ final class RoomCenterTests: XCTestCase {
         }
     }
 
-    func testIdempotencyConflictRetiresPoisonedJournalKey() async {
+    func testIdempotencyConflictRetiresPoisonedJournalKey() async throws {
         hub.postHandler = { _ in
             (409, Self.problemBody(status: 409, code: "idempotency_key_conflict"))
         }
         let center = await makeCenter()
-        let first = await center.makeIntent(
+        let first = try await center.makeIntent(
             dashboardID: dashboardID, roomID: Self.roomID,
             executionID: Self.executionID, action: .cancel
         )
@@ -534,7 +536,7 @@ final class RoomCenterTests: XCTestCase {
 
         // The server has proven this key belongs to a different op/target,
         // so a later NEW gesture must not recover the poisoned local intent.
-        let replacement = await center.makeIntent(
+        let replacement = try await center.makeIntent(
             dashboardID: dashboardID, roomID: Self.roomID,
             executionID: Self.executionID, action: .cancel
         )
@@ -542,12 +544,12 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertNotEqual(replacement.idempotencyKey, first.idempotencyKey)
     }
 
-    func testPreconditionFailedTriggersResync() async {
+    func testPreconditionFailedTriggersResync() async throws {
         hub.postHandler = { _ in
             (409, Self.problemBody(status: 409, code: "control_precondition_failed"))
         }
         let center = await makeCenter()
-        let intent = await center.makeIntent(
+        let intent = try await center.makeIntent(
             dashboardID: dashboardID, roomID: Self.roomID,
             executionID: Self.executionID, action: .resume
         )
@@ -558,10 +560,10 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertTrue(hub.requests.contains { $0.method == "GET" })
     }
 
-    func testMissingCredentialFailsClosed() async {
+    func testMissingCredentialFailsClosed() async throws {
         let other = UUID()
         let center = await makeCenter()
-        let intent = await center.makeIntent(
+        let intent = try await center.makeIntent(
             dashboardID: other, roomID: Self.roomID,
             executionID: Self.executionID, action: .cancel
         )
@@ -575,7 +577,7 @@ final class RoomCenterTests: XCTestCase {
 
     // MARK: - Wake-only
 
-    func testWakeResyncsAndNeverMutates() async {
+    func testWakeResyncsAndNeverMutates() async throws {
         let center = await makeCenter()
         await center.handleWake(
             RoomWakeTarget(roomID: Self.roomID, dashboardID: dashboardID),
@@ -599,7 +601,7 @@ final class RoomCenterTests: XCTestCase {
 
     // MARK: - Dashboard scoping
 
-    func testDashboardStateIsScopedPerDashboard() async {
+    func testDashboardStateIsScopedPerDashboard() async throws {
         let other = UUID()
         credentialStore.save(
             RoomHubCredential(hubBaseURL: "https://hub.test", token: "other-token"),
@@ -686,5 +688,123 @@ final class RoomCenterTests: XCTestCase {
          "title":"\#(code)","status":\#(status),"detail":"detail for \#(code)",
          "code":"\#(code)","requestId":"req-\#(status)"}
         """#.utf8)
+    }
+
+    // MARK: - Journal hardening (P1-1 / P1-2)
+
+    func testClearDashboardPreservesUnresolvedIntentAndRecoversKey() async throws {
+        // Dashboard deletion retires only resolved entries: the pending
+        // intent must outlive removal and recover the same identity.
+        let center = await makeCenter()
+        let intent = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .cancel
+        )
+        await center.clearDashboard(dashboardID)
+        let recovered = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .cancel
+        )
+        XCTAssertEqual(recovered.id, intent.id)
+        XCTAssertEqual(recovered.idempotencyKey, intent.idempotencyKey)
+    }
+
+    func testPerformAfterDashboardDeletionReusesUnresolvedEntry() async throws {
+        // The in-flight race closed by construction: a dashboard deleted
+        // between makeIntent and perform cannot yank the entry out from
+        // under the returning recordOperation — one POST, same key.
+        let center = await makeCenter()
+        let intent = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .cancel
+        )
+        await center.clearDashboard(dashboardID)
+        hub.postHandler = { path in
+            guard path.hasSuffix("/cancel") else { return nil }
+            return (200, Self.opRecordBody(op: "cancel", status: "applied"))
+        }
+        let outcome = await center.perform(intent)
+        XCTAssertEqual(outcome.kind, .applied)
+        XCTAssertEqual(hub.postCount, 1)
+        XCTAssertEqual(
+            hub.requests.first?.body?["idempotencyKey"]?.stringValue,
+            intent.idempotencyKey
+        )
+    }
+
+    func testPoisonedJournalBlocksMutableControlsUntilExplicitReset() async throws {
+        // Corrupt the journal file: mutable controls must fail closed with
+        // zero network I/O until an explicit operator reset.
+        let garbage = Data("not-json".utf8)
+        try garbage.write(
+            to: journalDir.appendingPathComponent(RoomControlJournal.defaultFileName),
+            options: .atomic
+        )
+        let center = await makeCenter()
+        let loadState = await center.journalLoadState
+        XCTAssertEqual(loadState, .unreadable)
+        do {
+            _ = try await center.makeIntent(
+                dashboardID: dashboardID,
+                roomID: Self.roomID,
+                executionID: Self.executionID,
+                action: .cancel
+            )
+            XCTFail("makeIntent must throw on a poisoned journal")
+        } catch let error as RoomControlJournal.JournalError {
+            XCTAssertEqual(error, .poisoned)
+        }
+        let intent = RoomControlIntent(
+            id: UUID(),
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .cancel,
+            attentionKind: nil,
+            trigger: nil,
+            projectSlug: nil,
+            correlationID: nil,
+            idempotencyKey: "conduit:test:probe"
+        )
+        let outcome = await center.perform(intent)
+        XCTAssertEqual(outcome.kind, .failed)
+        XCTAssertEqual(hub.postCount, 0)
+        // The explicit operator reset restores mutability and returns the
+        // preserved raw evidence.
+        let evidence = try await center.resetPoisonedControlJournal(preservingEvidence: true)
+        XCTAssertEqual(evidence, garbage)
+        let fresh = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .cancel
+        )
+        XCTAssertFalse(fresh.idempotencyKey.isEmpty)
+    }
+
+    func testExplicitAbandonmentDestroysUnresolvedIntents() async throws {
+        // The destructive API is explicit and separate from deletion:
+        // after abandonment, the same gesture mints a NEW intent.
+        let center = await makeCenter()
+        let intent = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .cancel
+        )
+        try await center.abandonUnresolvedIntents(dashboardID: dashboardID)
+        let replacement = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .cancel
+        )
+        XCTAssertNotEqual(replacement.id, intent.id)
     }
 }

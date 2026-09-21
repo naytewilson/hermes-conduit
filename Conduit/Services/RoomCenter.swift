@@ -254,6 +254,11 @@ final class RoomCenter: ObservableObject {
 
     /// Mints the intent for one user-confirmed action — the idempotency key
     /// is born here and reused by every retry of this intent.
+    ///
+    /// THROWS when the control journal is poisoned (mutable controls are
+    /// blocked for that scope until an explicit operator reset) or when the
+    /// crash-durable commit fails — in both cases the mutation path is
+    /// unreachable and no POST may happen.
     func makeIntent(
         dashboardID: UUID,
         roomID: String,
@@ -263,7 +268,7 @@ final class RoomCenter: ObservableObject {
         trigger: String? = nil,
         projectSlug: String? = nil,
         correlationID: String? = nil
-    ) -> RoomControlIntent {
+    ) throws -> RoomControlIntent {
         let candidate = RoomControlIntent(
             id: UUID(),
             dashboardID: dashboardID,
@@ -280,7 +285,7 @@ final class RoomCenter: ObservableObject {
         )
         // Persist before the first possible POST. If the prior process died
         // with the same semantic intent unresolved, recover its exact key.
-        return controlJournal.recoverOrInsert(candidate, at: clock())
+        return try controlJournal.recoverOrInsert(candidate, at: clock())
     }
 
     /// The one mutable flow. Order is the contract: biometric step-up FIRST
@@ -293,6 +298,17 @@ final class RoomCenter: ObservableObject {
         inFlightControls.insert(intent.id)
         defer { inFlightControls.remove(intent.id) }
 
+        // A poisoned journal blocks mutable controls for this scope — fail
+        // closed before any network I/O, with the raw evidence retained.
+        guard !controlJournal.isPoisoned else {
+            return record(Self.outcome(
+                intent,
+                kind: .failed,
+                detail: "Control journal is poisoned (unreadable or incompatible payload); mutable controls are blocked until an explicit operator reset.",
+                at: clock()
+            ))
+        }
+
         let outcome: RoomControlOutcome
         do {
             let client = try controlClient(for: intent.dashboardID)
@@ -300,8 +316,10 @@ final class RoomCenter: ObservableObject {
             let reason = AppLocalization.string("Authorize \(intent.action.rawValue) on this Room")
             guard await authenticate(reason) else {
                 // No network I/O occurred, so this user gesture is safely
-                // abandoned rather than recovered after restart.
-                controlJournal.remove(intentID: intent.id)
+                // abandoned rather than recovered after restart. If the
+                // removal fails the entry simply lingers and a later
+                // equivalent gesture recovers it — harmless.
+                try? controlJournal.remove(intentID: intent.id)
                 outcome = Self.outcome(intent, kind: .biometricRejected, at: clock())
                 return record(outcome)
             }
@@ -313,7 +331,9 @@ final class RoomCenter: ObservableObject {
             if let journalEntry = controlJournal.entry(intentID: intent.id),
                let operationID = journalEntry.operationID {
                 let latest = try await client.getOperation(operationID: operationID)
-                controlJournal.recordOperation(
+                // A failed commit throws into the catch below: the poll
+                // never starts from an unrecorded op.
+                try controlJournal.recordOperation(
                     intentID: intent.id,
                     operationID: latest.operationId,
                     status: latest.status,
@@ -328,7 +348,7 @@ final class RoomCenter: ObservableObject {
                         detail: latest.operationId,
                         at: clock()
                     )
-                } else if let applied = await pollToApplied(
+                } else if let applied = try await pollToApplied(
                     intentID: intent.id,
                     operationID: latest.operationId,
                     client: client
@@ -355,8 +375,10 @@ final class RoomCenter: ObservableObject {
 
             let serverRecord = try await dispatch(intent, client: client)
             // Persist the durable Hub identity before polling/resync. A crash
-            // after this point resumes with GET /operations/{id}.
-            controlJournal.recordOperation(
+            // after this point resumes with GET /operations/{id}. A failed
+            // commit throws into the catch below — the mutation is never
+            // treated as recoverable when its identity is not durable.
+            try controlJournal.recordOperation(
                 intentID: intent.id,
                 operationID: serverRecord.operationId,
                 status: serverRecord.status,
@@ -364,7 +386,7 @@ final class RoomCenter: ObservableObject {
             )
 
             if serverRecord.isRecorded {
-                if let applied = await pollToApplied(
+                if let applied = try await pollToApplied(
                     intentID: intent.id,
                     operationID: serverRecord.operationId,
                     client: client
@@ -408,7 +430,7 @@ final class RoomCenter: ObservableObject {
             )
             // Client-malformed intent cannot have reached the server.
             if case .undecodable(let status, _) = error, status == 0 {
-                controlJournal.remove(intentID: intent.id)
+                try? controlJournal.remove(intentID: intent.id)
             }
             // A server-proven idempotency conflict means this key is already
             // bound to a DIFFERENT op/target. Retaining it would poison every
@@ -416,7 +438,7 @@ final class RoomCenter: ObservableObject {
             // only this losing local intent; the server record remains source
             // truth and this request still fails closed.
             if case .idempotencyConflict = error {
-                controlJournal.remove(intentID: intent.id)
+                try? controlJournal.remove(intentID: intent.id)
             }
             // A precondition failure means the timeline moved under us.
             // Re-read it, but keep the same durable key until a later
@@ -461,15 +483,45 @@ final class RoomCenter: ObservableObject {
     /// Drops everything this center holds for a removed dashboard: replay
     /// records (durable) plus cached clients/coordinators and published
     /// state — scoped exactly like the credential record.
+    ///
+    /// The control journal is safety state, not cache: `clearDashboard`
+    /// retires only RESOLVED entries. Pending/recorded intents OUTLIVE
+    /// dashboard removal — this can never yank an entry from under an
+    /// in-flight `perform` (the returning `recordOperation` always finds its
+    /// entry), and re-adding the dashboard recovers the same idempotency
+    /// identity. Use `abandonUnresolvedIntents` for deliberate abandonment.
     func clearDashboard(_ dashboardID: UUID) {
         replayStore.clearDashboard(dashboardID)
-        controlJournal.clearDashboard(dashboardID)
+        try? controlJournal.clearDashboard(dashboardID)
         readClients[dashboardID] = nil
         controlClients[dashboardID] = nil
         coordinators[dashboardID] = nil
         dashboardStates[dashboardID] = nil
         let prefix = "\(dashboardID.uuidString)/"
         projections = projections.filter { !$0.key.hasPrefix(prefix) }
+    }
+
+    /// Explicit, destructive abandonment of a dashboard's unresolved control
+    /// intents. NEVER a side effect of dashboard removal.
+    ///
+    /// Consequence, stated plainly: abandoned intents lose replay protection.
+    /// A later equivalent gesture mints a NEW idempotency key, and an
+    /// ambiguous in-flight mutation may then apply twice. Call only as a
+    /// deliberate operator choice.
+    func abandonUnresolvedIntents(dashboardID: UUID) throws {
+        try controlJournal.abandonUnresolvedIntents(dashboardID: dashboardID)
+    }
+
+    /// Journal health for the view layer. While poisoned, `makeIntent` throws
+    /// and `perform` refuses — mutable controls are blocked for the scope
+    /// until an explicit operator reset.
+    var journalLoadState: RoomControlJournal.LoadState { controlJournal.loadState }
+
+    /// Explicit operator reset of a poisoned control journal. Returns the raw
+    /// evidence bytes when `preservingEvidence` is true.
+    @discardableResult
+    func resetPoisonedControlJournal(preservingEvidence: Bool) throws -> Data? {
+        try controlJournal.resetPoisonedJournal(preservingEvidence: preservingEvidence)
     }
 
     // MARK: - Private
@@ -538,12 +590,14 @@ final class RoomCenter: ObservableObject {
 
     /// Bounded poll of GET /operations/{id}. Every observed status is
     /// durably journaled before the next step so a crash never regresses from
-    /// an operation id back to mutation replay.
+    /// an operation id back to mutation replay. A failed journal commit
+    /// throws: the caller fails closed rather than polling an op whose
+    /// identity is not durably recorded.
     private func pollToApplied(
         intentID: UUID,
         operationID: String,
         client: RoomControlClient
-    ) async -> ControlOperationRecord? {
+    ) async throws -> ControlOperationRecord? {
         for _ in 0..<operationPollMaxAttempts {
             if operationPollInterval > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(operationPollInterval * 1_000_000_000))
@@ -551,7 +605,7 @@ final class RoomCenter: ObservableObject {
             guard let record = try? await client.getOperation(operationID: operationID) else {
                 return nil
             }
-            controlJournal.recordOperation(
+            try controlJournal.recordOperation(
                 intentID: intentID,
                 operationID: record.operationId,
                 status: record.status,
@@ -570,7 +624,9 @@ final class RoomCenter: ObservableObject {
         await syncRoom(dashboardID: intent.dashboardID, roomID: intent.roomID)
         let key = scopeKey(dashboardID: intent.dashboardID, roomID: intent.roomID)
         if let freshness = projections[key]?.freshness, freshness == .live {
-            controlJournal.remove(intentID: intent.id)
+            // Best-effort retirement: if the commit fails the entry simply
+            // lingers and the next equivalent gesture recovers the same key.
+            try? controlJournal.remove(intentID: intent.id)
         }
     }
 
