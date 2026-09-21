@@ -378,6 +378,9 @@ struct RoomDetailSheet: View {
         ) {
             if let outcome = lastOutcome {
                 outcomeBanner(outcome)
+                    .task(id: outcome.id) {
+                        await watchRecordedOperation(outcome)
+                    }
             }
 
             if !controlsEnabled {
@@ -692,6 +695,51 @@ struct RoomDetailSheet: View {
         }
         Task {
             lastOutcome = await center.perform(intent)
+        }
+    }
+
+    // MARK: - D12: recorded-operation watch
+
+    /// Poll interval / bound for watching a `.recorded` outcome to `.applied`.
+    /// Bounded so a never-resolving op cannot spin the UI forever; expiry
+    /// leaves the recorded banner untouched (still truthful) and the next
+    /// sync/projection surfaces the applied state.
+    private static let recordedWatchInterval: Duration = .seconds(2)
+    private static let recordedWatchMaxAttempts = 45
+
+    /// Closes the operator loop for `.recorded` outcomes: after `perform`
+    /// returns `.recorded`, the Hub owns the effect downstream, so the UI
+    /// re-reads the op record via `refreshOperation` until its status flips
+    /// to `.applied`, then resyncs and promotes the banner. Bounded and
+    /// cancellable: a new outcome or a disappearing view ends the watch via
+    /// the `.task(id:)` owner, and `Task.isCancelled` is honored each step.
+    /// A failed read is transient -- it consumes one attempt, never the watch.
+    private func watchRecordedOperation(_ outcome: RoomControlOutcome) async {
+        guard outcome.kind == .recorded,
+              let dashboardID,
+              let operationID = outcome.detail, !operationID.isEmpty
+        else { return }
+        let roomID = room.roomID
+        for _ in 0..<Self.recordedWatchMaxAttempts {
+            try? await Task.sleep(for: Self.recordedWatchInterval)
+            if Task.isCancelled { return }
+            guard let record = await center.refreshOperation(
+                dashboardID: dashboardID,
+                operationID: operationID
+            ) else { continue }
+            if Task.isCancelled { return }
+            guard record.status == .applied else { continue }
+            await center.syncRoom(dashboardID: dashboardID, roomID: roomID)
+            if Task.isCancelled { return }
+            lastOutcome = RoomControlOutcome(
+                intentID: outcome.intentID,
+                action: outcome.action,
+                kind: .applied,
+                subject: record.subject,
+                detail: record.operationId,
+                at: Date()
+            )
+            return
         }
     }
 
