@@ -39,6 +39,10 @@ import Foundation
 struct RoomControlJournal {
     static let schemaVersion = 1
     static let defaultFileName = "roomControlJournal.v1.json"
+    /// I4 shipped this UserDefaults key before the crash-durable file journal.
+    /// Upgrade must migrate it before an empty file-backed journal can exist,
+    /// otherwise an ambiguous pre-upgrade mutation could mint a second key.
+    static let legacyStorageKey = "conduit.roomControlJournal.v1"
 
     enum Phase: String, Codable, Equatable {
         case pending
@@ -61,6 +65,10 @@ struct RoomControlJournal {
         case healthy
         case unreadable
         case incompatible(foundVersion: Int)
+        /// A valid legacy payload exists, but committing its crash-durable
+        /// file migration failed. Mutations remain blocked and the legacy
+        /// bytes stay in UserDefaults so the next launch can retry safely.
+        case migrationFailed
     }
 
     enum JournalError: Error, Equatable {
@@ -82,6 +90,8 @@ struct RoomControlJournal {
 
     private let directoryURL: URL
     private let fileURL: URL
+    private let legacyDefaults: UserDefaults
+    private let legacyStorageKey: String
     private var payload: Payload
     private(set) var loadState: LoadState
     /// Raw evidence retained while the journal is poisoned. Never discarded
@@ -93,7 +103,7 @@ struct RoomControlJournal {
     /// Every mutating API throws `.poisoned` while this holds.
     var isPoisoned: Bool {
         switch loadState {
-        case .unreadable, .incompatible: return true
+        case .unreadable, .incompatible, .migrationFailed: return true
         case .absent, .healthy: return false
         }
     }
@@ -103,34 +113,71 @@ struct RoomControlJournal {
         return base.appendingPathComponent("Conduit", isDirectory: true)
     }
 
-    init(storageDirectory: URL? = nil, fileName: String = Self.defaultFileName) {
+    init(
+        storageDirectory: URL? = nil,
+        fileName: String = Self.defaultFileName,
+        legacyDefaults: UserDefaults = .standard,
+        legacyStorageKey: String = Self.legacyStorageKey
+    ) {
         let directory = storageDirectory ?? Self.defaultStorageDirectory()
         self.directoryURL = directory
         self.fileURL = directory.appendingPathComponent(fileName)
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            self.payload = Payload(version: Self.schemaVersion, entries: [:], order: [])
-            self.loadState = .absent
+        self.legacyDefaults = legacyDefaults
+        self.legacyStorageKey = legacyStorageKey
+        self.payload = Payload(version: Self.schemaVersion, entries: [:], order: [])
+        self.loadState = .absent
+        self.poisonEvidence = nil
+
+        // The file-backed journal is authoritative once present.
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            guard let data = try? Data(contentsOf: fileURL) else {
+                self.loadState = .unreadable
+                return
+            }
+            guard let stored = try? JSONDecoder().decode(Payload.self, from: data) else {
+                self.loadState = .unreadable
+                self.poisonEvidence = data
+                return
+            }
+            guard stored.version == Self.schemaVersion else {
+                self.loadState = .incompatible(foundVersion: stored.version)
+                self.poisonEvidence = data
+                return
+            }
+            self.payload = stored
+            self.loadState = .healthy
             return
         }
-        guard let data = try? Data(contentsOf: fileURL) else {
-            self.payload = Payload(version: Self.schemaVersion, entries: [:], order: [])
-            self.loadState = .unreadable
+
+        // Upgrade migration from the original UserDefaults journal. A valid
+        // legacy payload MUST be committed to the crash-durable file before
+        // the legacy key is retired or mutable controls become reachable.
+        guard let legacyData = legacyDefaults.data(forKey: legacyStorageKey) else {
             return
         }
-        guard let stored = try? JSONDecoder().decode(Payload.self, from: data) else {
-            self.payload = Payload(version: Self.schemaVersion, entries: [:], order: [])
+        guard let stored = try? JSONDecoder().decode(Payload.self, from: legacyData) else {
             self.loadState = .unreadable
-            self.poisonEvidence = data
+            self.poisonEvidence = legacyData
             return
         }
         guard stored.version == Self.schemaVersion else {
-            self.payload = Payload(version: Self.schemaVersion, entries: [:], order: [])
             self.loadState = .incompatible(foundVersion: stored.version)
-            self.poisonEvidence = data
+            self.poisonEvidence = legacyData
             return
         }
+
         self.payload = stored
-        self.loadState = .healthy
+        do {
+            try persist(stored)
+            self.loadState = .healthy
+            legacyDefaults.removeObject(forKey: legacyStorageKey)
+        } catch {
+            // Fail closed. Keep the exact legacy payload both in
+            // UserDefaults (for automatic retry next launch) and as operator
+            // evidence in this session.
+            self.loadState = .migrationFailed
+            self.poisonEvidence = legacyData
+        }
     }
 
     func entry(intentID: UUID) -> Entry? {
@@ -259,6 +306,7 @@ struct RoomControlJournal {
         try persist(next)
         payload = next
         loadState = .healthy
+        legacyDefaults.removeObject(forKey: legacyStorageKey)
         // The evidence is handed to the caller via the return value, never
         // retained internally: after reset the journal is healthy and empty.
         poisonEvidence = nil
