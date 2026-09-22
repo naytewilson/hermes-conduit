@@ -1217,6 +1217,46 @@
         }
       }
     },
+    "ANVIL Fabric" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANVIL Fabric"
+          }
+        }
+      }
+    },
+    "Hermes Dashboard" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hermes 控制台"
+          }
+        }
+      }
+    },
+    "Open ANVIL Fabric" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开 ANVIL Fabric"
+          }
+        }
+      }
+    },
+    "Rooms and verified controls without a Hermes login" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无需登录 Hermes 即可使用 Rooms 和经过验证的控制功能"
+          }
+        }
+      }
+    },
     "Archived" : {
       "localizations" : {
         "zh-Hans" : {
