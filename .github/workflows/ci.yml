@@ -53,10 +53,10 @@ env:
   # 'simctl list' enumeration on the happy path. macos-26 images ship the
   # iPhone 17 family; override here if an image refresh renames devices.
   SIMULATOR_NAME: "iPhone 17 Pro"
-  # Workspace-anchored DerivedData: GITHUB_WORKSPACE is byte-identical across
-  # GitHub-hosted runners for this repo (/Users/runner/work/<repo>/<repo>),
-  # so absolute paths inside the .xctestrun stay valid after the artifact
-  # round-trip - no path rewriting involved.
+  # Workspace-anchored DerivedData. Job-scoped Apple JIT runners intentionally
+  # use distinct absolute workspace roots. The build artifact therefore carries
+  # its exact origin workspace; each test shard rebases only origin-bound plist
+  # strings to its own workspace and then re-runs the portability audit.
   DERIVED_DATA_PATH: "${{ github.workspace }}/ci-derived-data"
 
 jobs:
@@ -188,6 +188,12 @@ jobs:
           python3 scripts/plan-tests.py audit-xctestrun \
             --xctestrun "$XCRUN_FILE" --workspace-root "$GITHUB_WORKSPACE"
 
+      - name: Record build workspace origin
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GITHUB_WORKSPACE" > \
+            "$DERIVED_DATA_PATH/Build/Products/ci-build-workspace-root.txt"
+
       - name: Prune intermediates from the products tree
         run: |
           set -euo pipefail
@@ -196,9 +202,9 @@ jobs:
                  "$DERIVED_DATA_PATH/Logs"
 
       - name: Upload build products (consumed by every lane)
-        # Relative path (mirrors the working metadata upload); the artifact
-        # keeps the Build/... structure, and lanes restore it under
-        # $DERIVED_DATA_PATH/Build so the .xctestrun's absolute paths hold.
+        # Relative path keeps the Build/... structure. The artifact also carries
+        # ci-build-workspace-root.txt so job-scoped JIT shards can mechanically
+        # rebase workspace-bound .xctestrun metadata before test-without-building.
         uses: actions/upload-artifact@v4
         with:
           name: build-products
@@ -240,11 +246,16 @@ jobs:
           name: build-products
           path: "${{ env.DERIVED_DATA_PATH }}/Build"
 
-      - name: Verify restored .xctestrun paths
+      - name: Rebase and verify restored .xctestrun paths
         run: |
           set -euo pipefail
           XCRUN_FILE=$(ls -t "$DERIVED_DATA_PATH"/Build/Products/*.xctestrun | head -n 1)
+          ORIGIN_WORKSPACE=$(cat "$DERIVED_DATA_PATH/Build/Products/ci-build-workspace-root.txt")
           echo "XCRUN_FILE=$XCRUN_FILE" >> "$GITHUB_ENV"
+          python3 scripts/plan-tests.py rebase-xctestrun \
+            --xctestrun "$XCRUN_FILE" \
+            --from-workspace-root "$ORIGIN_WORKSPACE" \
+            --to-workspace-root "$GITHUB_WORKSPACE"
           python3 scripts/plan-tests.py audit-xctestrun \
             --xctestrun "$XCRUN_FILE" --workspace-root "$GITHUB_WORKSPACE"
 
@@ -320,11 +331,16 @@ jobs:
           name: build-products
           path: "${{ env.DERIVED_DATA_PATH }}/Build"
 
-      - name: Verify restored .xctestrun paths
+      - name: Rebase and verify restored .xctestrun paths
         run: |
           set -euo pipefail
           XCRUN_FILE=$(ls -t "$DERIVED_DATA_PATH"/Build/Products/*.xctestrun | head -n 1)
+          ORIGIN_WORKSPACE=$(cat "$DERIVED_DATA_PATH/Build/Products/ci-build-workspace-root.txt")
           echo "XCRUN_FILE=$XCRUN_FILE" >> "$GITHUB_ENV"
+          python3 scripts/plan-tests.py rebase-xctestrun \
+            --xctestrun "$XCRUN_FILE" \
+            --from-workspace-root "$ORIGIN_WORKSPACE" \
+            --to-workspace-root "$GITHUB_WORKSPACE"
           python3 scripts/plan-tests.py audit-xctestrun \
             --xctestrun "$XCRUN_FILE" --workspace-root "$GITHUB_WORKSPACE"
 
