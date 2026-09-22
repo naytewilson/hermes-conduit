@@ -355,6 +355,104 @@ final class RoomCenterTests: XCTestCase {
         XCTAssertNotEqual(fresh.idempotencyKey, first.idempotencyKey)
     }
 
+    func testWatcherObservedAppliedRetiresRecordedJournalIdentity() async throws {
+        hub.postHandler = { path in
+            guard path.hasSuffix("/retry") else { return nil }
+            return (202, Self.opRecordBody(op: "retry", status: "recorded"))
+        }
+
+        let center = await makeCenter(pollAttempts: 0)
+        let first = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .retry,
+            correlationID: "corr-watch"
+        )
+        let recorded = await center.perform(first)
+        XCTAssertEqual(recorded.kind, .recorded)
+        XCTAssertEqual(recorded.detail, Self.operationID)
+
+        let resolved = await center.resolveObservedAppliedOperation(
+            intentID: first.id,
+            operationID: Self.operationID
+        )
+        XCTAssertTrue(resolved)
+
+        let fresh = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .retry,
+            correlationID: "corr-watch-later"
+        )
+        XCTAssertNotEqual(fresh.id, first.id)
+        XCTAssertNotEqual(fresh.idempotencyKey, first.idempotencyKey)
+    }
+
+    func testWatcherCannotResolveDifferentOperationID() async throws {
+        hub.postHandler = { path in
+            guard path.hasSuffix("/retry") else { return nil }
+            return (202, Self.opRecordBody(op: "retry", status: "recorded"))
+        }
+
+        let center = await makeCenter(pollAttempts: 0)
+        let first = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .retry
+        )
+        _ = await center.perform(first)
+
+        let resolved = await center.resolveObservedAppliedOperation(
+            intentID: first.id,
+            operationID: "different-operation"
+        )
+        XCTAssertFalse(resolved)
+
+        let recovered = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .retry
+        )
+        XCTAssertEqual(recovered.id, first.id)
+        XCTAssertEqual(recovered.idempotencyKey, first.idempotencyKey)
+    }
+
+    func testPoisonedJournalRecoveryIsExposedAndRestoresIntentCreation() async throws {
+        let journalURL = journalDir.appendingPathComponent(RoomControlJournal.defaultFileName)
+        try Data("corrupt-control-journal".utf8).write(to: journalURL)
+
+        let center = await makeCenter()
+        XCTAssertTrue(await center.controlJournalNeedsRecovery)
+
+        do {
+            _ = try await center.makeIntent(
+                dashboardID: dashboardID,
+                roomID: Self.roomID,
+                executionID: Self.executionID,
+                action: .cancel
+            )
+            XCTFail("poisoned journal must block intent creation")
+        } catch let error as RoomControlJournal.JournalError {
+            XCTAssertEqual(error, .poisoned)
+        }
+
+        _ = try await center.resetPoisonedControlJournal(preservingEvidence: false)
+        XCTAssertFalse(await center.controlJournalNeedsRecovery)
+        XCTAssertEqual(await center.journalLoadState, .healthy)
+
+        let intent = try await center.makeIntent(
+            dashboardID: dashboardID,
+            roomID: Self.roomID,
+            executionID: Self.executionID,
+            action: .cancel
+        )
+        XCTAssertEqual(intent.action, .cancel)
+    }
+
     func testBiometricRejectionPerformsZeroNetworkIO() async throws {
         biometricResults = [false]
         let center = await makeCenter()
