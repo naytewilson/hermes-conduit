@@ -21,6 +21,9 @@ import SwiftUI
 
 struct RoomListView: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
+    /// Standalone Fabric supplies its own device-local scope. Ordinary
+    /// Conduit keeps using the selected Hermes dashboard UUID.
+    var dashboardIDOverride: UUID? = nil
     @EnvironmentObject private var appState: AppState
     @ObservedObject private var center = RoomCenter.shared
     @ObservedObject private var notifications = PushNotificationService.shared
@@ -28,7 +31,7 @@ struct RoomListView: View {
     @State private var selectedRoom: ProjectedRoom?
     @State private var showCredentialSheet = false
 
-    private var dashboardID: UUID? { appState.activeDashboardID }
+    private var dashboardID: UUID? { dashboardIDOverride ?? appState.activeDashboardID }
 
     private var state: RoomCenter.DashboardRoomsState {
         dashboardID.map { center.roomsState(for: $0) } ?? RoomCenter.DashboardRoomsState()
@@ -51,7 +54,7 @@ struct RoomListView: View {
             await center.refreshRooms(dashboardID: dashboardID)
         }
         .sheet(item: $selectedRoom) { room in
-            RoomDetailSheet(room: room)
+            RoomDetailSheet(room: room, dashboardIDOverride: dashboardID)
         }
         .sheet(isPresented: $showCredentialSheet) {
             if let dashboardID {
@@ -217,6 +220,10 @@ struct RoomDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     let room: ProjectedRoom
+    /// The resolved Room scope captured by the list that opened this sheet.
+    /// Standalone Fabric passes its workspace UUID; ordinary Conduit may
+    /// leave this nil and inherit AppState's active dashboard.
+    var dashboardIDOverride: UUID? = nil
 
     @State private var pendingAction: PendingControl?
     @State private var acknowledgeExecutionID: String?
@@ -234,7 +241,7 @@ struct RoomDetailSheet: View {
         let correlationID: String?
     }
 
-    private var dashboardID: UUID? { appState.activeDashboardID }
+    private var dashboardID: UUID? { dashboardIDOverride ?? appState.activeDashboardID }
 
     private var projection: RoomReplayCoordinator.Projection {
         dashboardID.map { center.projection(dashboardID: $0, roomID: room.roomID) }
