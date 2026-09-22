@@ -917,6 +917,88 @@ def audit_xctestrun(xctestrun_path: str, workspace_root: str) -> tuple:
     return sorted(violations), checked
 
 
+def rebase_xctestrun(xctestrun_path: str, from_workspace_root: str,
+                     to_workspace_root: str) -> tuple:
+    """Atomically relocate workspace-bound strings in an .xctestrun.
+
+    The source plist must first audit clean against *from_workspace_root*.
+    That fail-closed precondition prevents this helper from laundering an
+    unrelated absolute path into the destination workspace. System paths are
+    left untouched. The rewritten plist must then audit clean against
+    *to_workspace_root* before it replaces the original file.
+
+    Return (strings_changed, absolute_paths_checked_before_rebase).
+    """
+    import posixpath
+    import tempfile
+
+    src = posixpath.normpath(from_workspace_root).rstrip("/") or "/"
+    dst = posixpath.normpath(to_workspace_root).rstrip("/") or "/"
+    if not src.startswith("/") or not dst.startswith("/"):
+        raise ValueError("workspace roots must be absolute POSIX paths")
+    if src == "/" or dst == "/":
+        raise ValueError("refusing to rebase from or to filesystem root")
+
+    violations, checked = audit_xctestrun(xctestrun_path, src)
+    if violations:
+        raise ValueError(
+            "refusing to rebase .xctestrun with paths outside its declared "
+            "origin workspace: " + ", ".join(violations)
+        )
+    if src == dst:
+        return 0, checked
+
+    try:
+        with open(xctestrun_path, "rb") as fh:
+            plist = plistlib.load(fh)
+    except (OSError, plistlib.InvalidFileException) as exc:
+        raise ValueError(f"unreadable .xctestrun ({exc})")
+
+    changed = 0
+    src_prefix = src + "/"
+    dst_prefix = dst + "/"
+
+    def relocate(obj):
+        nonlocal changed
+        if isinstance(obj, str):
+            new = dst if obj == src else obj.replace(src_prefix, dst_prefix)
+            if new != obj:
+                changed += 1
+            return new
+        if isinstance(obj, dict):
+            return {k: relocate(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [relocate(v) for v in obj]
+        return obj
+
+    rewritten = relocate(plist)
+    directory = os.path.dirname(os.path.abspath(xctestrun_path)) or "."
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="wb", dir=directory, prefix=".xctestrun-rebase-",
+                suffix=".tmp", delete=False) as fh:
+            tmp_path = fh.name
+            plistlib.dump(rewritten, fh, fmt=plistlib.FMT_XML, sort_keys=False)
+        os.chmod(tmp_path, os.stat(xctestrun_path).st_mode & 0o777)
+        post_violations, _post_checked = audit_xctestrun(tmp_path, dst)
+        if post_violations:
+            raise ValueError(
+                "rebased .xctestrun still contains non-portable absolute paths: "
+                + ", ".join(post_violations)
+            )
+        os.replace(tmp_path, xctestrun_path)
+        tmp_path = ""
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+    return changed, checked
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1033,7 +1115,24 @@ def main(argv=None) -> int:
     p.add_argument("--xctestrun", required=True)
     p.add_argument("--workspace-root", required=True)
 
+    p = sub.add_parser("rebase-xctestrun")
+    p.add_argument("--xctestrun", required=True)
+    p.add_argument("--from-workspace-root", required=True)
+    p.add_argument("--to-workspace-root", required=True)
+
     a = parser.parse_args(argv)
+
+    if a.cmd == "rebase-xctestrun":
+        try:
+            changed, checked = rebase_xctestrun(
+                a.xctestrun, a.from_workspace_root, a.to_workspace_root)
+        except ValueError as exc:
+            print(f"::error::{exc}")
+            return 1
+        print(
+            f"xctestrun rebase: {changed} string entries updated; "
+            f"{checked} absolute-path entries checked before rebase")
+        return 0
 
     if a.cmd == "audit-xctestrun":
         violations, checked = audit_xctestrun(a.xctestrun, a.workspace_root)

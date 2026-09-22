@@ -872,5 +872,41 @@ class XctestrunAuditTests(unittest.TestCase):
                 path, "/Users/runner/work/hermes-conduit/hermes-conduit")
             self.assertEqual(violations, ["/Users/someone/else/private/b.xctest"])
 
+    def test_rebase_moves_only_origin_bound_strings(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            old = "/Users/nayte/actions-runner-apple-jit/jobs/build/_work/hermes-conduit/hermes-conduit"
+            new = "/Users/nayte/actions-runner-apple-jit/jobs/shard/_work/hermes-conduit/hermes-conduit"
+            path = self._plist(tmp, [
+                old + "/Conduit/Conduit.app",
+                "/Applications/Xcode.app/Contents/Developer/usr/bin/xctest",
+            ])
+            changed, checked = planner.rebase_xctestrun(path, old, new)
+            self.assertEqual(changed, 1)
+            self.assertEqual(checked, 2)
+            violations, _ = planner.audit_xctestrun(path, new)
+            self.assertEqual(violations, [])
+            with open(path, "rb") as fh:
+                plist = plistlib.load(fh)
+            self.assertEqual(
+                plist["ConduitTests"]["TestHostPath"],
+                new + "/Conduit/Conduit.app")
+            self.assertEqual(
+                plist["ConduitTests"]["TestBundlePath"],
+                "/Applications/Xcode.app/Contents/Developer/usr/bin/xctest")
+
+    def test_rebase_rejects_foreign_path_without_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = "/Users/nayte/actions-runner-apple-jit/jobs/build/_work/hermes-conduit/hermes-conduit"
+            new = "/Users/nayte/actions-runner-apple-jit/jobs/shard/_work/hermes-conduit/hermes-conduit"
+            path = self._plist(tmp, [
+                old + "/Conduit/Conduit.app",
+                "/Users/other/private/b.xctest",
+            ])
+            before = Path(path).read_bytes()
+            with self.assertRaises(ValueError):
+                planner.rebase_xctestrun(path, old, new)
+            self.assertEqual(Path(path).read_bytes(), before)
+
 if __name__ == "__main__":
     unittest.main()
