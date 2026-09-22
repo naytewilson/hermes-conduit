@@ -45,7 +45,7 @@ struct RootView: View {
             // Only the primary window drives the process-wide lifecycle: a
             // transient duplicate window's .background must never suspend a
             // conversation the primary window still presents.
-            if isPrimaryWindow {
+            if isPrimaryWindow && !fabricModeActive {
                 appState.handleScenePhase(newPhase)
             }
         }
