@@ -11,11 +11,19 @@ struct RootView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage(ANVILFabricModeStore.enabledKey) private var fabricModeEnabled = false
     @State private var isPrimaryWindow = false
+
+    private var fabricModeActive: Bool {
+        fabricModeEnabled || ANVILFabricModeStore.uiTestForceEnabled
+    }
 
     var body: some View {
         ZStack {
-            if appState.showLogin || appState.connection == nil {
+            if fabricModeActive {
+                ANVILFabricRootView()
+                    .transition(.opacity)
+            } else if appState.showLogin || appState.connection == nil {
                 LoginView()
                     .transition(.opacity)
             } else {
@@ -23,7 +31,7 @@ struct RootView: View {
                     .transition(.opacity)
             }
 
-            if let bridge = appState.dashboardTicketBridge {
+            if !fabricModeActive, let bridge = appState.dashboardTicketBridge {
                 DashboardTicketBridgeView(bridge: bridge)
                     .frame(width: 1, height: 1)
                     .opacity(0.01)
@@ -32,6 +40,7 @@ struct RootView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: appState.showLogin)
+        .animation(.easeInOut(duration: 0.2), value: fabricModeActive)
         .onChange(of: scenePhase) { _, newPhase in
             // Only the primary window drives the process-wide lifecycle: a
             // transient duplicate window's .background must never suspend a
