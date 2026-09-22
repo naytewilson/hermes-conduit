@@ -29,6 +29,9 @@ plan             Validate + write plan.json / unit-matrix.json / summary md.
 validate         Same validation, human report, no files written (cheap Linux guard).
 audit-xctestrun  Fail unless all absolute paths inside a built .xctestrun live
                  under the workspace root (build-once artifact portability gate).
+disable-xctestrun-diagnostics
+                 Set every DiagnosticCollectionPolicy entry in a restored
+                 .xctestrun to Never (0), atomically and fail-closed.
 
 Determinism: identical inputs produce byte-identical outputs (no timestamps).
 Timing input precedence: --history (Actions-cache timing history) > --baseline
@@ -999,6 +1002,96 @@ def rebase_xctestrun(xctestrun_path: str, from_workspace_root: str,
     return changed, checked
 
 
+
+def disable_xctestrun_diagnostics(xctestrun_path: str) -> tuple:
+    """Atomically set every DiagnosticCollectionPolicy entry to 0 (Never).
+
+    This is intentionally separate from path rebasing: portability and
+    diagnostic policy are different contracts. The operation fails closed if
+    the plist has no DiagnosticCollectionPolicy entries or if Xcode emits an
+    unknown policy value. It is idempotent.
+
+    Return (entries_changed, entries_seen).
+    """
+    import tempfile
+
+    try:
+        with open(xctestrun_path, "rb") as fh:
+            plist = plistlib.load(fh)
+    except (OSError, plistlib.InvalidFileException) as exc:
+        raise ValueError(f"unreadable .xctestrun ({exc})")
+
+    seen = 0
+    changed = 0
+
+    def rewrite(obj):
+        nonlocal seen, changed
+        if isinstance(obj, dict):
+            out = {}
+            for key, value in obj.items():
+                if key == "DiagnosticCollectionPolicy":
+                    seen += 1
+                    if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+                        raise ValueError(
+                            "unsupported DiagnosticCollectionPolicy value "
+                            f"{value!r}; refusing to mutate .xctestrun"
+                        )
+                    if value != 0:
+                        changed += 1
+                    out[key] = 0
+                else:
+                    out[key] = rewrite(value)
+            return out
+        if isinstance(obj, list):
+            return [rewrite(value) for value in obj]
+        return obj
+
+    rewritten = rewrite(plist)
+    if seen == 0:
+        raise ValueError(
+            "no DiagnosticCollectionPolicy entries found; refusing to claim diagnostics are disabled"
+        )
+
+    directory = os.path.dirname(os.path.abspath(xctestrun_path)) or "."
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="wb", dir=directory, prefix=".xctestrun-diagnostics-",
+                suffix=".tmp", delete=False) as fh:
+            tmp_path = fh.name
+            plistlib.dump(rewritten, fh, fmt=plistlib.FMT_XML, sort_keys=False)
+        os.chmod(tmp_path, os.stat(xctestrun_path).st_mode & 0o777)
+
+        with open(tmp_path, "rb") as fh:
+            verify = plistlib.load(fh)
+        values = []
+
+        def collect(obj):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if key == "DiagnosticCollectionPolicy":
+                        values.append(value)
+                    collect(value)
+            elif isinstance(obj, list):
+                for value in obj:
+                    collect(value)
+
+        collect(verify)
+        if len(values) != seen or any(value != 0 for value in values):
+            raise ValueError("failed to verify disabled DiagnosticCollectionPolicy entries")
+
+        os.replace(tmp_path, xctestrun_path)
+        tmp_path = ""
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+    return changed, seen
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1120,6 +1213,9 @@ def main(argv=None) -> int:
     p.add_argument("--from-workspace-root", required=True)
     p.add_argument("--to-workspace-root", required=True)
 
+    p = sub.add_parser("disable-xctestrun-diagnostics")
+    p.add_argument("--xctestrun", required=True)
+
     a = parser.parse_args(argv)
 
     if a.cmd == "rebase-xctestrun":
@@ -1132,6 +1228,17 @@ def main(argv=None) -> int:
         print(
             f"xctestrun rebase: {changed} string entries updated; "
             f"{checked} absolute-path entries checked before rebase")
+        return 0
+
+    if a.cmd == "disable-xctestrun-diagnostics":
+        try:
+            changed, seen = disable_xctestrun_diagnostics(a.xctestrun)
+        except ValueError as exc:
+            print(f"::error::{exc}")
+            return 1
+        print(
+            f"xctestrun diagnostics: {changed} of {seen} "
+            "DiagnosticCollectionPolicy entries changed to Never (0)")
         return 0
 
     if a.cmd == "audit-xctestrun":
