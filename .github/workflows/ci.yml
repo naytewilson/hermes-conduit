@@ -159,10 +159,6 @@ jobs:
   build:
     name: Build test products
     needs: plan
-    # Fail closed while no trusted local macOS runner is admitted. Because
-    # CI Gate requires build/unit success, this becomes an explicit failed
-    # gate rather than an indefinite queue or a hosted-runner fallback.
-    if: ${{ vars.HERMES_MACOS_CI_ENABLED == 'true' }}
     runs-on: [self-hosted, macOS, ARM64, nayte-macos]
     timeout-minutes: 30
     steps:
