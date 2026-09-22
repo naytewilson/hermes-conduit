@@ -655,11 +655,11 @@ else
   bad "an exit-0 batch with an unrecorded class must not pass silently"
 fi
 
-# --- unit case 10: finished session survives its budget via finalize grace -----
-# Run #500 regression: xcodebuild printed its terminal result and was only
-# finalizing the xcresult when the watchdog expired. The deadline must be
-# extended ONCE (bounded grace) so the finished session can exit with its
-# real status; success still comes from the exit status, never the marker.
+# --- unit case 10: finished session enters finalize grace immediately ----------
+# Run #500 regression plus Apple-JIT diagnostics: once XCTest's top-level suite
+# summary says execution ended, the runner switches immediately to the bounded
+# finalize phase. The process may still exit successfully inside that grace;
+# success still comes from the exit status, never the marker.
 end_case
 begin_case "finalize grace lets a finished batch pass" "$WORK/b10"
 : > "$INVOCATION_LOG"
@@ -672,7 +672,7 @@ for a in "$@"; do
 done
 echo "running tests (stub)"
 sleep 4
-echo "** TEST EXECUTE SUCCEEDED **"
+echo "Test Suite 'Selected tests' passed at 2026-09-22 16:02:28.661."
 echo "finalizing xcresult (stub)"
 sleep 4
 exit 0
@@ -690,9 +690,9 @@ else
   bad "finalize grace must be reported when it fires"
 fi
 
-# --- unit case 11: grace is bounded - a wedged finalize is still a timeout -----
+# --- unit case 11: grace starts at session end and remains bounded --------------
 end_case
-begin_case "finalize grace expiry kills, retry stalls, lane fails" "$WORK/b11"
+begin_case "finalize grace starts immediately and kills a wedged finalize" "$WORK/b11"
 : > "$INVOCATION_LOG"
 cat > "$STUBS/xcodebuild" <<'EOF'
 #!/bin/bash
@@ -701,14 +701,16 @@ for a in "$@"; do
   case "$prev" in -resultBundlePath) echo "$(basename "$a" .xcresult)" >> "$INVOCATION_LOG" ;; esac
   prev="$a"
 done
-echo "** TEST EXECUTE SUCCEEDED **"
+echo "Test Suite 'Selected tests' passed at 2026-09-22 16:02:28.661."
 echo "wedged finalization (stub)"
 sleep 300
 exit 0
 EOF
 chmod +x "$STUBS/xcodebuild"
 export XCODEBUILD_FINALIZE_GRACE_S=3
-run_lane "AlphaTests" 3 1
+finalize_case_started=$(date +%s)
+run_lane "AlphaTests" 30 1
+finalize_case_elapsed=$(( $(date +%s) - finalize_case_started ))
 assert_eq "exit code" "$(cat "$WORKCASE/exit-code")" "1"
 assert_eq "verdict" "$(lane_field "['status']")" "timeout"
 assert_eq "attempt chain" "$(attempts_statuses)" "['timeout', 'timeout']"
@@ -717,6 +719,11 @@ if grep -q "finalize grace" "$WORKCASE/stdout.log"; then
   ok "grace was granted before the kill"
 else
   bad "grace must be attempted before killing a finalized session"
+fi
+if [ "$finalize_case_elapsed" -lt 20 ]; then
+  ok "finalize deadline started at test-session completion"
+else
+  bad "finalize grace waited for the 30s test budget (elapsed "${finalize_case_elapsed}"s)"
 fi
 
 echo ""
