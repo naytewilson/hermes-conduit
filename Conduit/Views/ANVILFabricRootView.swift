@@ -12,11 +12,10 @@ import SwiftUI
 
 struct ANVILFabricRootView: View {
     @EnvironmentObject private var appState: AppState
-    @AppStorage(ANVILFabricModeStore.enabledKey) private var fabricModeEnabled = false
 
     private let workspaceID: UUID
 
-    init(workspaceID: UUID = ANVILFabricModeStore.workspaceID()) {
+    init(workspaceID: UUID = ANVILFabricModeStore.activeWorkspaceID()) {
         self.workspaceID = workspaceID
     }
 
@@ -34,8 +33,7 @@ struct ANVILFabricRootView: View {
                         // Switching presentation modes is not logout and does
                         // not destroy Fabric credentials. Hermes restoration
                         // runs only after the operator explicitly asks for it.
-                        fabricModeEnabled = false
-                        appState.loadSavedConnection()
+                        appState.leaveANVILFabricMode()
                     } label: {
                         Label(
                             AppLocalization.string("Hermes Dashboard"),
