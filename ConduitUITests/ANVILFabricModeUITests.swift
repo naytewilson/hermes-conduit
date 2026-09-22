@@ -1,7 +1,8 @@
 import XCTest
 
-/// Proves the ANVIL Fabric operator surface is reachable in a clean app
-/// process without manufacturing or restoring a Hermes dashboard connection.
+/// Proves the ANVIL Fabric operator surface is independently reachable and
+/// that an already-connected Hermes shell can cross the mode boundary without
+/// signing out or requiring a real server.
 final class ANVILFabricModeUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -21,6 +22,8 @@ final class ANVILFabricModeUITests: XCTestCase {
             app.textFields["login.server-url"].exists,
             "Fabric must not require the Hermes login surface"
         )
+    }
+
     func testConnectedShellCanEnterFabricAndReturnWithoutSignOut() {
         let app = XCUIApplication()
         app.launchArguments += [
@@ -57,7 +60,5 @@ final class ANVILFabricModeUITests: XCTestCase {
             app.buttons["Open sessions"].waitForExistence(timeout: 10),
             "Returning from Fabric did not restore the inert Hermes shell. Tree:\n\(app.debugDescription)"
         )
-    }
-
     }
 }
