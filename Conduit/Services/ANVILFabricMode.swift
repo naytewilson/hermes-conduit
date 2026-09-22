@@ -42,6 +42,19 @@ enum ANVILFabricModeStore {
         return created
     }
 
+    /// Resolves the workspace used by the mounted Fabric root.
+    ///
+    /// UI tests get a fixed in-memory identity so the force-enable argument
+    /// proves routing without writing the production workspace key.
+    static func activeWorkspaceID(defaults: UserDefaults = .standard) -> UUID {
+#if DEBUG
+        if uiTestForceEnabled {
+            return UUID(uuidString: "FABC0000-0000-4000-8000-000000000001")!
+        }
+#endif
+        return workspaceID(defaults: defaults)
+    }
+
 #if DEBUG
     /// UI-test-only routing seam. It bypasses Hermes login without mutating
     /// persisted user state, proving the Fabric root is independently
