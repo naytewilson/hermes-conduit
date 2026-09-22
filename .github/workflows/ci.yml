@@ -159,6 +159,9 @@ jobs:
   build:
     name: Build test products
     needs: plan
+    # Operator capability gate: keep macOS execution fail-closed if the
+    # admitted local Neo runner is intentionally withdrawn.
+    if: ${{ vars.HERMES_MACOS_CI_ENABLED == 'true' }}
     runs-on: [self-hosted, macOS, ARM64, nayte-macos]
     timeout-minutes: 30
     steps:
