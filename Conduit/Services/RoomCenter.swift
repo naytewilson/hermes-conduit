@@ -158,6 +158,10 @@ final class RoomCenter: ObservableObject {
     /// Latest outcome per control intent id (bounded — see perform cap).
     @Published private(set) var controlOutcomes: [UUID: RoomControlOutcome] = [:]
     @Published private(set) var inFlightControls: Set<UUID> = []
+    /// Operator-visible health of the durable control safety journal.
+    /// Poisoned/migration-failed states keep mutations disabled until the
+    /// explicit recovery flow succeeds.
+    @Published private(set) var journalLoadState: RoomControlJournal.LoadState
 
     private let credentialStore: RoomHubCredentialStore
     private let transport: RoomTransport
@@ -190,6 +194,7 @@ final class RoomCenter: ObservableObject {
         self.transport = transport
         self.replayStore = replayStore
         self.controlJournal = controlJournal
+        self.journalLoadState = controlJournal.loadState
         self.authenticate = authenticate
         self.clock = clock
         self.idempotencyKeyMint = idempotencyKeyMint ?? { UUID().uuidString }
@@ -471,6 +476,36 @@ final class RoomCenter: ObservableObject {
         return try? await client.getOperation(operationID: operationID)
     }
 
+    /// Commits a UI-observed `.applied` operation into the same durable
+    /// journal state machine used by `perform`. The watch path must not
+    /// merely repaint the banner: it advances the journal to applied, then
+    /// resyncs authority and retires the intent only after that projection is
+    /// live. A failed durable write leaves the recorded entry intact.
+    func resolveObservedAppliedOperation(
+        intentID: UUID,
+        operationID: String
+    ) async -> Bool {
+        guard let entry = controlJournal.entry(intentID: intentID) else {
+            // Another path may already have completed and retired this exact
+            // intent. With no unresolved journal state left, the applied Hub
+            // observation is safe to present.
+            return true
+        }
+        guard entry.operationID == operationID else { return false }
+        do {
+            try controlJournal.recordOperation(
+                intentID: intentID,
+                operationID: operationID,
+                status: .applied,
+                at: clock()
+            )
+        } catch {
+            return false
+        }
+        await resyncAndResolveJournal(entry.intent)
+        return true
+    }
+
     /// APNs wake-only handler: a room push can cause a resync of fresh
     /// authority — and nothing else. It cannot mutate and cannot be trusted
     /// for content beyond "this room moved".
@@ -512,16 +547,26 @@ final class RoomCenter: ObservableObject {
         try controlJournal.abandonUnresolvedIntents(dashboardID: dashboardID)
     }
 
-    /// Journal health for the view layer. While poisoned, `makeIntent` throws
-    /// and `perform` refuses — mutable controls are blocked for the scope
-    /// until an explicit operator reset.
-    var journalLoadState: RoomControlJournal.LoadState { controlJournal.loadState }
+    /// True when file corruption, schema incompatibility, or a failed legacy
+    /// migration has poisoned the safety journal. Views use this to disable
+    /// controls and expose the explicit recovery flow.
+    var controlJournalNeedsRecovery: Bool {
+        switch journalLoadState {
+        case .unreadable, .incompatible, .migrationFailed: return true
+        case .absent, .healthy: return false
+        }
+    }
 
     /// Explicit operator reset of a poisoned control journal. Returns the raw
-    /// evidence bytes when `preservingEvidence` is true.
+    /// evidence bytes when `preservingEvidence` is true and publishes the
+    /// new health state only after the crash-durable reset succeeds.
     @discardableResult
     func resetPoisonedControlJournal(preservingEvidence: Bool) throws -> Data? {
-        try controlJournal.resetPoisonedJournal(preservingEvidence: preservingEvidence)
+        let evidence = try controlJournal.resetPoisonedJournal(
+            preservingEvidence: preservingEvidence
+        )
+        journalLoadState = controlJournal.loadState
+        return evidence
     }
 
     // MARK: - Private
