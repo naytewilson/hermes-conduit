@@ -33,6 +33,12 @@ struct RoomListView: View {
 
     private var dashboardID: UUID? { dashboardIDOverride ?? appState.activeDashboardID }
 
+    private var unconfiguredMessage: String {
+        dashboardIDOverride == nil
+            ? AppLocalization.string("Room hub is not configured for this dashboard.")
+            : AppLocalization.string("Room Hub is not configured for this Fabric workspace.")
+    }
+
     private var state: RoomCenter.DashboardRoomsState {
         dashboardID.map { center.roomsState(for: $0) } ?? RoomCenter.DashboardRoomsState()
     }
@@ -71,7 +77,7 @@ struct RoomListView: View {
                 Section {
                     VStack(alignment: .leading, spacing: 10) {
                         Label(
-                            AppLocalization.string("Room hub is not configured for this dashboard."),
+                            unconfiguredMessage,
                             systemImage: "key"
                         )
                         .font(.footnote)
@@ -969,7 +975,7 @@ struct RoomHubCredentialSheet: View {
                             symbol: "key.fill",
                             tint: .conduitAccent
                         ) {
-                            Text(AppLocalization.string("Hub address and bearer token for this dashboard's ANVIL Room seam. Stored per dashboard in the Keychain."))
+                            Text(AppLocalization.string("Hub address and bearer token for the ANVIL Room seam. Stored securely for this workspace."))
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
 
