@@ -51,7 +51,6 @@ struct LoginView: View {
     /// sign-in intent (not render time), so a store is only created when the
     /// user actually begins a browser sign-in.
     @State private var signInWebKitStoreID: UUID?
-    @AppStorage(ANVILFabricModeStore.enabledKey) private var fabricModeEnabled = false
     @FocusState private var focusedField: LoginField?
 
     var body: some View {
@@ -222,7 +221,7 @@ struct LoginView: View {
 
             Button {
                 focusedField = nil
-                fabricModeEnabled = true
+                appState.enterANVILFabricMode()
             } label: {
                 HStack(spacing: 12) {
                     Image(systemName: "rectangle.stack.badge.person.crop")
