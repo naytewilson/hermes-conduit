@@ -426,7 +426,8 @@ final class RoomCenterTests: XCTestCase {
         try Data("corrupt-control-journal".utf8).write(to: journalURL)
 
         let center = await makeCenter()
-        XCTAssertTrue(await center.controlJournalNeedsRecovery)
+        let needsRecoveryBefore = await center.controlJournalNeedsRecovery
+        XCTAssertTrue(needsRecoveryBefore)
 
         do {
             _ = try await center.makeIntent(
@@ -441,8 +442,10 @@ final class RoomCenterTests: XCTestCase {
         }
 
         _ = try await center.resetPoisonedControlJournal(preservingEvidence: false)
-        XCTAssertFalse(await center.controlJournalNeedsRecovery)
-        XCTAssertEqual(await center.journalLoadState, .healthy)
+        let needsRecoveryAfter = await center.controlJournalNeedsRecovery
+        let recoveredLoadState = await center.journalLoadState
+        XCTAssertFalse(needsRecoveryAfter)
+        XCTAssertEqual(recoveredLoadState, .healthy)
 
         let intent = try await center.makeIntent(
             dashboardID: dashboardID,
