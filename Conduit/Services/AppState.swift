@@ -1650,7 +1650,9 @@ final class AppState: ObservableObject {
         )
         restoreActiveSessionState(for: activeProfile)
         restorePinnedSessions(for: activeProfile)
-        if shouldLoadSavedConnection && !ANVILFabricModeStore.isEnabled(defaults: defaults) {
+        if shouldLoadSavedConnection
+            && !ANVILFabricModeStore.isEnabled(defaults: defaults)
+            && !ANVILFabricModeStore.uiTestForceEnabled {
             // Persisted Fabric mode is an independent startup surface. Do not
             // silently revive a Hermes dashboard connection behind it.
             loadSavedConnection()
