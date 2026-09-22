@@ -222,6 +222,8 @@ struct RoomDetailSheet: View {
     @State private var acknowledgeExecutionID: String?
     @State private var lastOutcome: RoomControlOutcome?
     @State private var showCredentialSheet = false
+    @State private var showJournalResetConfirmation = false
+    @State private var journalResetError: String?
 
     private struct PendingControl: Equatable {
         let action: RoomControlAction
@@ -244,7 +246,7 @@ struct RoomDetailSheet: View {
     }
 
     private var controlsEnabled: Bool {
-        projection.freshness == .live
+        projection.freshness == .live && !center.controlJournalNeedsRecovery
     }
 
     var body: some View {
@@ -320,6 +322,25 @@ struct RoomDetailSheet: View {
         } message: {
             Text(AppLocalization.string("The Hub records which attention state you are acknowledging."))
         }
+        .confirmationDialog(
+            AppLocalization.string("Reset control safety journal?"),
+            isPresented: $showJournalResetConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(AppLocalization.string("Reset control safety journal"), role: .destructive) {
+                do {
+                    _ = try center.resetPoisonedControlJournal(preservingEvidence: false)
+                    journalResetError = nil
+                } catch {
+                    journalResetError = error.localizedDescription
+                }
+            }
+            Button(AppLocalization.string("Cancel"), role: .cancel) {}
+        } message: {
+            Text(AppLocalization.string(
+                "Resetting discards unresolved replay protection and may allow an ambiguous control to be sent again."
+            ))
+        }
     }
 
     // MARK: Overview
@@ -376,6 +397,36 @@ struct RoomDetailSheet: View {
             symbol: "switch.2",
             tint: .conduitAura
         ) {
+            if center.controlJournalNeedsRecovery {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(
+                        AppLocalization.string(
+                            "Control safety journal needs recovery before controls can be used."
+                        ),
+                        systemImage: "exclamationmark.shield.fill"
+                    )
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.red)
+
+                    if let journalResetError {
+                        Text(verbatim: journalResetError)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                    }
+
+                    Button(role: .destructive) {
+                        Haptics.selection()
+                        showJournalResetConfirmation = true
+                    } label: {
+                        Text(AppLocalization.string("Reset control safety journal"))
+                            .font(.subheadline.weight(.semibold))
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+
             if let outcome = lastOutcome {
                 outcomeBanner(outcome)
                     .task(id: outcome.id) {
@@ -719,7 +770,6 @@ struct RoomDetailSheet: View {
               let dashboardID,
               let operationID = outcome.detail, !operationID.isEmpty
         else { return }
-        let roomID = room.roomID
         for _ in 0..<Self.recordedWatchMaxAttempts {
             try? await Task.sleep(for: Self.recordedWatchInterval)
             if Task.isCancelled { return }
@@ -729,7 +779,14 @@ struct RoomDetailSheet: View {
             ) else { continue }
             if Task.isCancelled { return }
             guard record.status == .applied else { continue }
-            await center.syncRoom(dashboardID: dashboardID, roomID: roomID)
+            guard await center.resolveObservedAppliedOperation(
+                intentID: outcome.intentID,
+                operationID: operationID
+            ) else {
+                // Do not visually promote to applied if the durable journal
+                // could not advance. The recorded banner remains truthful.
+                continue
+            }
             if Task.isCancelled { return }
             lastOutcome = RoomControlOutcome(
                 intentID: outcome.intentID,
