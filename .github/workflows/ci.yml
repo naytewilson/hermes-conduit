@@ -39,11 +39,10 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -63,7 +62,7 @@ env:
 jobs:
   plan:
     name: Plan & validate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, nayte-linux]
     timeout-minutes: 10
     outputs:
       matrix: "${{ steps.plan.outputs.matrix }}"
@@ -142,7 +141,7 @@ jobs:
     # No `needs`: the meta-suites test the CI tooling itself, not this run's
     # plan, so they start immediately and run CONCURRENTLY with the macOS
     # build instead of serially delaying it.
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, nayte-linux]
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@v7
@@ -160,7 +159,10 @@ jobs:
   build:
     name: Build test products
     needs: plan
-    runs-on: macos-26
+    # Operator capability gate: keep macOS execution fail-closed if the
+    # admitted local Neo runner is intentionally withdrawn.
+    if: ${{ vars.HERMES_MACOS_CI_ENABLED == 'true' }}
+    runs-on: [self-hosted, macOS, ARM64, nayte-macos]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -216,7 +218,7 @@ jobs:
   unit:
     name: "Unit - ${{ matrix.lane }}"
     needs: [plan, build]
-    runs-on: macos-26
+    runs-on: [self-hosted, macOS, ARM64, nayte-macos]
     # Outer emergency ceiling only: every batch burning its budget twice
     # (attempt 1 plus its single batch-level retry) plus per-batch bounded
     # recovery and extraction bounds all fit underneath it (see
@@ -298,7 +300,7 @@ jobs:
     name: "UI - ${{ matrix.lane }}"
     needs: [plan, build]
     if: needs.plan.outputs.ui-classes != ''
-    runs-on: macos-26
+    runs-on: [self-hosted, macOS, ARM64, nayte-macos]
     # Outer emergency ceiling only: every class's targeted retry plus bounded
     # resets and setup slack all fit underneath it (see plan-tests.py); the
     # per-class watchdogs inside ci-test-lane.sh are the real enforcement.
@@ -377,7 +379,7 @@ jobs:
     name: Report
     needs: [plan, build, unit, ui]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, nayte-linux]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -427,7 +429,7 @@ jobs:
     name: CI Gate
     needs: [plan, build, unit, ui, self-test]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, nayte-linux]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -451,7 +453,7 @@ jobs:
       needs.plan.result == 'success' &&
       needs.unit.result == 'success' &&
       (needs.ui.result == 'success' || needs.ui.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, nayte-linux]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
