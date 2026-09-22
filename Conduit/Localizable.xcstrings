@@ -15761,6 +15761,26 @@
         }
       }
     },
+    "Hub address and bearer token for the ANVIL Room seam. Stored securely for this workspace." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANVIL Room 接口的 Hub 地址和承载令牌。凭据会为此工作区安全存储。"
+          }
+        }
+      }
+    },
+    "Room Hub is not configured for this Fabric workspace." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 Fabric 工作区尚未配置 Room Hub。"
+          }
+        }
+      }
+    },
     "Room hub is not configured for this dashboard." : {
       "localizations" : {
         "zh-Hans" : {
