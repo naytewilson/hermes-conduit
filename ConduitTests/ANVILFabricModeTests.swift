@@ -84,6 +84,46 @@ final class ANVILFabricModeTests: XCTestCase {
         XCTAssertNil(KeychainHelper.loadConnection())
     }
 
+    func testEnteringFabricRetiresLiveHermesButPreservesSavedAuth() throws {
+        let dashboardID = UUID()
+        let saved = HermesConnection(
+            baseUrl: "https://hermes.example.test",
+            ticket: "saved-ticket"
+        )
+        KeychainHelper.saveConnection(saved, dashboardID: dashboardID)
+        let registry = SavedDashboardRegistry(
+            activeDashboardID: dashboardID,
+            dashboards: [
+                SavedDashboard(
+                    id: dashboardID,
+                    label: "Hermes",
+                    normalizedURL: saved.baseUrl
+                )
+            ]
+        )
+        let state = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            dashboardRegistry: registry
+        )
+        state.connection = saved
+        state.isConnected = true
+        state.isConnecting = false
+        state.showLogin = false
+
+        state.enterANVILFabricMode()
+
+        XCTAssertTrue(ANVILFabricModeStore.isEnabled(defaults: defaults))
+        XCTAssertNil(state.connection)
+        XCTAssertFalse(state.isConnected)
+        XCTAssertFalse(state.isConnecting)
+
+        let preserved = try XCTUnwrap(KeychainHelper.loadConnection(dashboardID: dashboardID))
+        XCTAssertEqual(preserved.baseUrl, saved.baseUrl)
+        XCTAssertEqual(preserved.ticket, saved.ticket)
+        XCTAssertEqual(state.activeDashboardID, dashboardID)
+    }
+
     func testPersistedFabricModeSuppressesSavedHermesAutoRestore() {
         let dashboardID = UUID()
         let saved = HermesConnection(
