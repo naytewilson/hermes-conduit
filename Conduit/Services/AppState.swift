@@ -3315,6 +3315,43 @@ final class AppState: ObservableObject {
     /// switch.
     private var dashboardSwitchGeneration: UInt64 = 0
 
+    /// Enters standalone ANVIL Fabric without signing out of Hermes.
+    ///
+    /// Saved dashboard identity, credentials, cookies, and tickets remain
+    /// durable, but every live Hermes transport/reconnect/voice owner is
+    /// retired before the Fabric surface becomes authoritative. The next
+    /// launch also suppresses Hermes autorestore while this mode bit is set.
+    func enterANVILFabricMode() {
+        ANVILFabricModeStore.setEnabled(true, defaults: defaults)
+
+        cancelExplicitSessionOpen()
+        cancelOwnedAutomaticOperations()
+        activeAutomaticChatResumeWork = nil
+        recoverySequence.cancel()
+        chatResumeRestorationRequest = nil
+        invalidateReconciliation()
+        invalidateServerCompactionState()
+        retireConnectionRuntimePreservingAuth()
+
+        // Fabric owns no Hermes speech runtime. Preserve preferences and
+        // durable auth, but stop any operation already holding audio/session
+        // resources from the outgoing dashboard.
+        voiceConversationController.stop()
+        messageReadAloudController.stop()
+        suspendedVoiceConversation = nil
+        voiceSheetShouldAutoListen = false
+        voiceControllerSessionProfile = nil
+        showVoiceSheet = false
+        turnState = .idle
+    }
+
+    /// Leaves standalone Fabric and re-enters the existing Hermes restore
+    /// path. Fabric Room credentials and workspace identity are untouched.
+    func leaveANVILFabricMode() {
+        ANVILFabricModeStore.setEnabled(false, defaults: defaults)
+        loadSavedConnection()
+    }
+
     /// Switch to a saved dashboard. Switching is NOT disconnecting: the
     /// outgoing dashboard stays saved with its auth intact, but its runtime
     /// ownership (client, sessions, speech) is retired IMMEDIATELY through
@@ -3334,7 +3371,7 @@ final class AppState: ObservableObject {
         selectDashboardTarget(id)
         rememberDashboardURL(dashboard.normalizedURL)
         _ = prepareChatResumeForConnection(to: dashboard.normalizedURL, dashboardID: id)
-        retireConnectionRuntimeForDashboardSwitch()
+        retireConnectionRuntimePreservingAuth()
         if let credentials = KeychainHelper.loadCredentials(dashboardID: id) {
             await restoreSavedCredentials(credentials, dashboardID: id, switchGeneration: generation)
             return
@@ -3355,13 +3392,11 @@ final class AppState: ObservableObject {
         showLogin = true
     }
 
-    /// Runtime-only teardown of the live connection when switching
-    /// dashboards. `prepareChatResumeForConnection` (called just before) owns
-    /// the server-replacement state retirement; this retires the transport
-    /// and connection-scoped surfaces it does not touch. Deliberately NOT
-    /// disconnect(): no saved auth, cookie mirror, or registry state is
-    /// cleared — the outgoing dashboard stays signed in while saved.
-    private func retireConnectionRuntimeForDashboardSwitch() {
+    /// Runtime-only teardown of a live Hermes connection while preserving
+    /// every saved auth/cookie/registry record. Dashboard switching and
+    /// standalone Fabric entry share this boundary so neither path needs
+    /// `disconnect()`, which is a destructive sign-out.
+    private func retireConnectionRuntimePreservingAuth() {
         cancelChatResumeTransportRecovery()
         cancelScenePhaseAttempt()
         cancelScheduledReconnect()
