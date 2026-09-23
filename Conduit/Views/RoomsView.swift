@@ -949,20 +949,25 @@ private struct RoomEventRow: View {
 // MARK: - Hub credential sheet
 
 /// Per-dashboard Room Hub credential editor — the ONLY place the Hub URL +
-/// bearer token are entered. Saved through RoomHubCredentialStore into the
-/// dashboard-scoped Keychain record; deleting the dashboard clears it.
+/// bearer token are entered. Saved through RoomHubCredentialStore.admit into
+/// the dashboard-scoped Keychain record; deleting the dashboard clears it.
+/// The credential is persisted ONLY after the Hub proves both contract
+/// surfaces (typed Room projection + control plane) — a bare reachable
+/// server or a 200 with an off-contract payload admits nothing.
 struct RoomHubCredentialSheet: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     @Environment(\.dismiss) private var dismiss
 
     let dashboardID: UUID
     var credentialStore: RoomHubCredentialStore = .system
+    var admissionValidator: RoomHubAdmissionValidator = RoomHubAdmissionValidator()
     var onSaved: (() -> Void)? = nil
 
     @State private var hubURL = ""
     @State private var token = ""
     @State private var hasSavedCredential = false
     @State private var validationError: String?
+    @State private var isValidating = false
 
     var body: some View {
         NavigationStack {
@@ -1007,7 +1012,13 @@ struct RoomHubCredentialSheet: View {
                             Button {
                                 save()
                             } label: {
-                                Text(AppLocalization.string("Save"))
+                                HStack(spacing: 8) {
+                                    if isValidating {
+                                        ProgressView()
+                                            .tint(Color.conduitBackgroundColor)
+                                    }
+                                    Text(AppLocalization.string("Save"))
+                                }
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(Color.conduitBackgroundColor)
                                     .frame(maxWidth: .infinity)
@@ -1015,6 +1026,12 @@ struct RoomHubCredentialSheet: View {
                                     .background(Color.conduitAccent, in: RoundedRectangle(cornerRadius: 14))
                             }
                             .buttonStyle(.plain)
+                            .disabled(isValidating)
+                            .accessibilityIdentifier("room-hub.save")
+
+                            Text(AppLocalization.string("The credential is saved only after the hub proves its Room and control surfaces."))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
 
                             if hasSavedCredential {
                                 Button(role: .destructive) {
@@ -1063,12 +1080,28 @@ struct RoomHubCredentialSheet: View {
             return
         }
         let credential = RoomHubCredential(hubBaseURL: trimmedURL, token: trimmedToken)
-        guard credentialStore.save(credential, dashboardID: dashboardID) else {
-            validationError = AppLocalization.string("Could not save to the Keychain.")
-            return
+        validationError = nil
+        isValidating = true
+        // Admission is the gate: the typed projection AND control probes
+        // must both succeed before the credential is allowed into the
+        // Keychain. A rejection leaves the store untouched — the session
+        // was never admitted.
+        Task { @MainActor in
+            do {
+                _ = try await credentialStore.admit(
+                    credential,
+                    dashboardID: dashboardID,
+                    validator: admissionValidator
+                )
+            } catch {
+                isValidating = false
+                validationError = error.localizedDescription
+                return
+            }
+            isValidating = false
+            hasSavedCredential = true
+            onSaved?()
+            dismiss()
         }
-        hasSavedCredential = true
-        onSaved?()
-        dismiss()
     }
 }

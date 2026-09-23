@@ -15531,6 +15531,56 @@
         }
       }
     },
+    "The credential is saved only after the hub proves its Room and control surfaces." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只有在 Hub 证明其 Room 与控制平面可用后，凭证才会被保存。"
+          }
+        }
+      }
+    },
+    "The credential lacks the required %@ scope. The session was not admitted." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "凭证缺少所需的 %@ 作用域。会话未被接纳。"
+          }
+        }
+      }
+    },
+    "The hub's bound ANVIL subject lacks the durable grant required for admission. The session was not admitted." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 绑定的 ANVIL 主体缺少准入所需的持久授权。会话未被接纳。"
+          }
+        }
+      }
+    },
+    "The Room hub answered HTTP %@ during admission. The session was not admitted." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "准入期间 Room Hub 返回了 HTTP %@。会话未被接纳。"
+          }
+        }
+      }
+    },
+    "The Room hub answered HTTP %@ with an unreadable payload during admission: %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "准入期间 Room Hub 返回了 HTTP %@ 且负载无法解析：%@"
+          }
+        }
+      }
+    },
     "Credential rejected" : {
       "localizations" : {
         "zh-Hans" : {
