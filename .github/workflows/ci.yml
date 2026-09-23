@@ -246,7 +246,7 @@ jobs:
           name: build-products
           path: "${{ env.DERIVED_DATA_PATH }}/Build"
 
-      - name: Rebase and verify restored .xctestrun paths
+      - name: Rebase, harden, and verify restored .xctestrun
         run: |
           set -euo pipefail
           XCRUN_FILE=$(ls -t "$DERIVED_DATA_PATH"/Build/Products/*.xctestrun | head -n 1)
@@ -258,6 +258,12 @@ jobs:
             --to-workspace-root "$GITHUB_WORKSPACE"
           python3 scripts/plan-tests.py audit-xctestrun \
             --xctestrun "$XCRUN_FILE" --workspace-root "$GITHUB_WORKSPACE"
+          # Xcode 26.x can spend minutes collecting simulator diagnostics
+          # after XCTest already emitted a terminal suite result. Disable that
+          # policy in this downloaded, job-local shard copy only; the
+          # canonical build artifact remains unchanged.
+          python3 scripts/plan-tests.py disable-xctestrun-diagnostics \
+            --xctestrun "$XCRUN_FILE"
 
       - name: Run unit lane
         # Matrix values enter through the environment, never through bash
@@ -345,8 +351,8 @@ jobs:
             --xctestrun "$XCRUN_FILE" --workspace-root "$GITHUB_WORKSPACE"
           # Xcode 26.x can spend minutes collecting simulator diagnostics
           # after XCTest already emitted a terminal suite result. Disable that
-          # policy only in this restored UI-shard artifact copy; unit shards
-          # and the canonical build artifact retain their original policy.
+          # policy in this downloaded, job-local shard copy only; the
+          # canonical build artifact remains unchanged.
           python3 scripts/plan-tests.py disable-xctestrun-diagnostics \
             --xctestrun "$XCRUN_FILE"
 
