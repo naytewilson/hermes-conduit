@@ -1217,6 +1217,46 @@
         }
       }
     },
+    "ANVIL Fabric" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANVIL Fabric"
+          }
+        }
+      }
+    },
+    "Hermes Dashboard" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hermes 控制台"
+          }
+        }
+      }
+    },
+    "Open ANVIL Fabric" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开 ANVIL Fabric"
+          }
+        }
+      }
+    },
+    "Rooms and verified controls without a Hermes login" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无需登录 Hermes 即可使用 Rooms 和经过验证的控制功能"
+          }
+        }
+      }
+    },
     "Archived" : {
       "localizations" : {
         "zh-Hans" : {
@@ -10157,6 +10197,46 @@
         }
       }
     },
+    "Control safety journal needs recovery before controls can be used." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要恢复控制安全日志后才能使用控制功能。"
+          }
+        }
+      }
+    },
+    "Reset control safety journal" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重置控制安全日志"
+          }
+        }
+      }
+    },
+    "Reset control safety journal?" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "要重置控制安全日志吗？"
+          }
+        }
+      }
+    },
+    "Resetting discards unresolved replay protection and may allow an ambiguous control to be sent again." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重置会丢弃未解决操作的重放保护，并可能导致状态不明的控制操作再次发送。"
+          }
+        }
+      }
+    },
     "Reset Filters" : {
       "localizations" : {
         "zh-Hans" : {
@@ -15451,6 +15531,56 @@
         }
       }
     },
+    "The credential is saved only after the hub proves its Room and control surfaces." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只有在 Hub 证明其 Room 与控制平面可用后，凭证才会被保存。"
+          }
+        }
+      }
+    },
+    "The credential lacks the required %@ scope. The session was not admitted." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "凭证缺少所需的 %@ 作用域。会话未被接纳。"
+          }
+        }
+      }
+    },
+    "The hub's bound ANVIL subject lacks the durable grant required for admission. The session was not admitted." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hub 绑定的 ANVIL 主体缺少准入所需的持久授权。会话未被接纳。"
+          }
+        }
+      }
+    },
+    "The Room hub answered HTTP %@ during admission. The session was not admitted." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "准入期间 Room Hub 返回了 HTTP %@。会话未被接纳。"
+          }
+        }
+      }
+    },
+    "The Room hub answered HTTP %@ with an unreadable payload during admission: %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "准入期间 Room Hub 返回了 HTTP %@ 且负载无法解析：%@"
+          }
+        }
+      }
+    },
     "Credential rejected" : {
       "localizations" : {
         "zh-Hans" : {
@@ -15677,6 +15807,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "未配置 Room hub"
+          }
+        }
+      }
+    },
+    "Hub address and bearer token for the ANVIL Room seam. Stored securely for this workspace." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANVIL Room 接口的 Hub 地址和承载令牌。凭据会为此工作区安全存储。"
+          }
+        }
+      }
+    },
+    "Room Hub is not configured for this Fabric workspace." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 Fabric 工作区尚未配置 Room Hub。"
           }
         }
       }
