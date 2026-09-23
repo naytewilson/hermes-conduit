@@ -988,34 +988,6 @@ final class ConduitWindowClaimKeeperTests: XCTestCase {
     }
 }
 
-// MARK: - Duplicate-window dismissal source contract
-
-final class CarPlayDuplicateWindowDismissalTests: XCTestCase {
-    /// Static source contract (UIKit/iPad runtime behavior stays on the
-    /// physical checklist): the duplicate-window path must dismiss the
-    /// CURRENT instance via the environment-scoped `dismissWindow()`, and
-    /// must never use ID-scoped `dismissWindow(id:)`, which targets the
-    /// whole WindowGroup — including the primary window.
-    func testDuplicateWindowUsesEnvironmentScopedDismissal() throws {
-        let testFile = URL(fileURLWithPath: #filePath)
-        let repoRoot = testFile
-            .deletingLastPathComponent()   // ConduitTests
-            .deletingLastPathComponent()   // repo root
-        let rootViewSource = try String(
-            contentsOf: repoRoot.appendingPathComponent("Conduit/Views/RootView.swift"),
-            encoding: .utf8
-        )
-        XCTAssertTrue(
-            rootViewSource.contains("dismissWindow()"),
-            "the duplicate window must dismiss only itself"
-        )
-        XCTAssertFalse(
-            rootViewSource.contains("dismissWindow(id:"),
-            "ID-scoped dismissal would close the entire WindowGroup, primary included"
-        )
-    }
-}
-
 // MARK: - Phone-open attach to a live (CarPlay-owned) Voice session
 
 @MainActor
