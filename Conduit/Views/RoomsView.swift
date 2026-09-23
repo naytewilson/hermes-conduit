@@ -21,6 +21,9 @@ import SwiftUI
 
 struct RoomListView: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
+    /// Standalone Fabric supplies its own device-local scope. Ordinary
+    /// Conduit keeps using the selected Hermes dashboard UUID.
+    var dashboardIDOverride: UUID? = nil
     @EnvironmentObject private var appState: AppState
     @ObservedObject private var center = RoomCenter.shared
     @ObservedObject private var notifications = PushNotificationService.shared
@@ -28,7 +31,13 @@ struct RoomListView: View {
     @State private var selectedRoom: ProjectedRoom?
     @State private var showCredentialSheet = false
 
-    private var dashboardID: UUID? { appState.activeDashboardID }
+    private var dashboardID: UUID? { dashboardIDOverride ?? appState.activeDashboardID }
+
+    private var unconfiguredMessage: String {
+        dashboardIDOverride == nil
+            ? AppLocalization.string("Room hub is not configured for this dashboard.")
+            : AppLocalization.string("Room Hub is not configured for this Fabric workspace.")
+    }
 
     private var state: RoomCenter.DashboardRoomsState {
         dashboardID.map { center.roomsState(for: $0) } ?? RoomCenter.DashboardRoomsState()
@@ -51,7 +60,7 @@ struct RoomListView: View {
             await center.refreshRooms(dashboardID: dashboardID)
         }
         .sheet(item: $selectedRoom) { room in
-            RoomDetailSheet(room: room)
+            RoomDetailSheet(room: room, dashboardIDOverride: dashboardID)
         }
         .sheet(isPresented: $showCredentialSheet) {
             if let dashboardID {
@@ -68,7 +77,7 @@ struct RoomListView: View {
                 Section {
                     VStack(alignment: .leading, spacing: 10) {
                         Label(
-                            AppLocalization.string("Room hub is not configured for this dashboard."),
+                            unconfiguredMessage,
                             systemImage: "key"
                         )
                         .font(.footnote)
@@ -217,11 +226,17 @@ struct RoomDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     let room: ProjectedRoom
+    /// The resolved Room scope captured by the list that opened this sheet.
+    /// Standalone Fabric passes its workspace UUID; ordinary Conduit may
+    /// leave this nil and inherit AppState's active dashboard.
+    var dashboardIDOverride: UUID? = nil
 
     @State private var pendingAction: PendingControl?
     @State private var acknowledgeExecutionID: String?
     @State private var lastOutcome: RoomControlOutcome?
     @State private var showCredentialSheet = false
+    @State private var showJournalResetConfirmation = false
+    @State private var journalResetError: String?
 
     private struct PendingControl: Equatable {
         let action: RoomControlAction
@@ -232,7 +247,7 @@ struct RoomDetailSheet: View {
         let correlationID: String?
     }
 
-    private var dashboardID: UUID? { appState.activeDashboardID }
+    private var dashboardID: UUID? { dashboardIDOverride ?? appState.activeDashboardID }
 
     private var projection: RoomReplayCoordinator.Projection {
         dashboardID.map { center.projection(dashboardID: $0, roomID: room.roomID) }
@@ -244,7 +259,7 @@ struct RoomDetailSheet: View {
     }
 
     private var controlsEnabled: Bool {
-        projection.freshness == .live
+        projection.freshness == .live && !center.controlJournalNeedsRecovery
     }
 
     var body: some View {
@@ -320,6 +335,25 @@ struct RoomDetailSheet: View {
         } message: {
             Text(AppLocalization.string("The Hub records which attention state you are acknowledging."))
         }
+        .confirmationDialog(
+            AppLocalization.string("Reset control safety journal?"),
+            isPresented: $showJournalResetConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(AppLocalization.string("Reset control safety journal"), role: .destructive) {
+                do {
+                    _ = try center.resetPoisonedControlJournal(preservingEvidence: false)
+                    journalResetError = nil
+                } catch {
+                    journalResetError = error.localizedDescription
+                }
+            }
+            Button(AppLocalization.string("Cancel"), role: .cancel) {}
+        } message: {
+            Text(AppLocalization.string(
+                "Resetting discards unresolved replay protection and may allow an ambiguous control to be sent again."
+            ))
+        }
     }
 
     // MARK: Overview
@@ -376,8 +410,41 @@ struct RoomDetailSheet: View {
             symbol: "switch.2",
             tint: .conduitAura
         ) {
+            if center.controlJournalNeedsRecovery {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(
+                        AppLocalization.string(
+                            "Control safety journal needs recovery before controls can be used."
+                        ),
+                        systemImage: "exclamationmark.shield.fill"
+                    )
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.red)
+
+                    if let journalResetError {
+                        Text(verbatim: journalResetError)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                    }
+
+                    Button(role: .destructive) {
+                        Haptics.selection()
+                        showJournalResetConfirmation = true
+                    } label: {
+                        Text(AppLocalization.string("Reset control safety journal"))
+                            .font(.subheadline.weight(.semibold))
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+
             if let outcome = lastOutcome {
                 outcomeBanner(outcome)
+                    .task(id: outcome.id) {
+                        await watchRecordedOperation(outcome)
+                    }
             }
 
             if !controlsEnabled {
@@ -667,16 +734,82 @@ struct RoomDetailSheet: View {
     private func run(_ pending: PendingControl) {
         pendingAction = nil
         guard let dashboardID else { return }
-        let intent = center.makeIntent(
-            dashboardID: dashboardID,
-            roomID: room.roomID,
-            executionID: pending.executionID,
-            action: pending.action,
-            attentionKind: pending.attentionKind,
-            correlationID: pending.correlationID
-        )
+        let intent: RoomControlIntent
+        do {
+            intent = try center.makeIntent(
+                dashboardID: dashboardID,
+                roomID: room.roomID,
+                executionID: pending.executionID,
+                action: pending.action,
+                attentionKind: pending.attentionKind,
+                correlationID: pending.correlationID
+            )
+        } catch {
+            // Fail closed before any network I/O: a poisoned journal or a
+            // failed durable commit means this gesture cannot safely mutate.
+            lastOutcome = RoomControlOutcome(
+                intentID: UUID(),
+                action: pending.action,
+                kind: .failed,
+                subject: nil,
+                detail: error.localizedDescription,
+                at: Date()
+            )
+            return
+        }
         Task {
             lastOutcome = await center.perform(intent)
+        }
+    }
+
+    // MARK: - D12: recorded-operation watch
+
+    /// Poll interval / bound for watching a `.recorded` outcome to `.applied`.
+    /// Bounded so a never-resolving op cannot spin the UI forever; expiry
+    /// leaves the recorded banner untouched (still truthful) and the next
+    /// sync/projection surfaces the applied state.
+    private static let recordedWatchInterval: Duration = .seconds(2)
+    private static let recordedWatchMaxAttempts = 45
+
+    /// Closes the operator loop for `.recorded` outcomes: after `perform`
+    /// returns `.recorded`, the Hub owns the effect downstream, so the UI
+    /// re-reads the op record via `refreshOperation` until its status flips
+    /// to `.applied`, then resyncs and promotes the banner. Bounded and
+    /// cancellable: a new outcome or a disappearing view ends the watch via
+    /// the `.task(id:)` owner, and `Task.isCancelled` is honored each step.
+    /// A failed read is transient -- it consumes one attempt, never the watch.
+    private func watchRecordedOperation(_ outcome: RoomControlOutcome) async {
+        guard outcome.kind == .recorded,
+              let dashboardID,
+              let operationID = outcome.detail, !operationID.isEmpty
+        else { return }
+        for _ in 0..<Self.recordedWatchMaxAttempts {
+            try? await Task.sleep(for: Self.recordedWatchInterval)
+            if Task.isCancelled { return }
+            guard let record = await center.refreshOperation(
+                dashboardID: dashboardID,
+                operationID: operationID
+            ) else { continue }
+            if Task.isCancelled { return }
+            guard record.status == .applied else { continue }
+            guard await center.resolveObservedAppliedOperation(
+                intentID: outcome.intentID,
+                operationID: operationID
+            ) else {
+                // Do not visually promote to applied if the durable journal
+                // could not advance. The recorded banner remains truthful.
+                continue
+            }
+            if Task.isCancelled { return }
+            lastOutcome = RoomControlOutcome(
+                intentID: outcome.intentID,
+                action: outcome.action,
+                kind: .applied,
+                subject: record.subject,
+                detail: record.operationId,
+                at: Date()
+            )
+            return
         }
     }
 
@@ -842,7 +975,7 @@ struct RoomHubCredentialSheet: View {
                             symbol: "key.fill",
                             tint: .conduitAccent
                         ) {
-                            Text(AppLocalization.string("Hub address and bearer token for this dashboard's ANVIL Room seam. Stored per dashboard in the Keychain."))
+                            Text(AppLocalization.string("Hub address and bearer token for the ANVIL Room seam. Stored securely for this workspace."))
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
 
