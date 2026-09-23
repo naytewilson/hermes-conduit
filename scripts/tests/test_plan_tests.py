@@ -908,5 +908,63 @@ class XctestrunAuditTests(unittest.TestCase):
                 planner.rebase_xctestrun(path, old, new)
             self.assertEqual(Path(path).read_bytes(), before)
 
+    def test_disable_diagnostics_is_atomic_and_idempotent(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.xctestrun"
+            original = {
+                "ConduitUITests": {
+                    "DiagnosticCollectionPolicy": 1,
+                    "SystemAttachmentLifetime": "deleteOnSuccess",
+                },
+                "ConduitTests": {
+                    "DiagnosticCollectionPolicy": 1,
+                    "Other": {"DiagnosticCollectionPolicy": 0},
+                },
+            }
+            with open(path, "wb") as fh:
+                plistlib.dump(original, fh)
+
+            changed, seen = planner.disable_xctestrun_diagnostics(str(path))
+            self.assertEqual((changed, seen), (2, 3))
+            with open(path, "rb") as fh:
+                rewritten = plistlib.load(fh)
+            self.assertEqual(
+                rewritten["ConduitUITests"]["SystemAttachmentLifetime"],
+                "deleteOnSuccess",
+            )
+            self.assertEqual(
+                rewritten["ConduitUITests"]["DiagnosticCollectionPolicy"], 0)
+            self.assertEqual(
+                rewritten["ConduitTests"]["DiagnosticCollectionPolicy"], 0)
+            self.assertEqual(
+                rewritten["ConduitTests"]["Other"]["DiagnosticCollectionPolicy"], 0)
+
+            changed, seen = planner.disable_xctestrun_diagnostics(str(path))
+            self.assertEqual((changed, seen), (0, 3))
+
+    def test_disable_diagnostics_rejects_missing_policy_without_mutation(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.xctestrun"
+            with open(path, "wb") as fh:
+                plistlib.dump({"ConduitUITests": {"TestBundlePath": "/tmp/a"}}, fh)
+            before = path.read_bytes()
+            with self.assertRaises(ValueError):
+                planner.disable_xctestrun_diagnostics(str(path))
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_disable_diagnostics_rejects_unknown_policy_without_mutation(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.xctestrun"
+            with open(path, "wb") as fh:
+                plistlib.dump(
+                    {"ConduitUITests": {"DiagnosticCollectionPolicy": 7}}, fh)
+            before = path.read_bytes()
+            with self.assertRaises(ValueError):
+                planner.disable_xctestrun_diagnostics(str(path))
+            self.assertEqual(path.read_bytes(), before)
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,10 +9,10 @@
 #   run_with_deadline          - xcodebuild under a wall-clock watchdog; kills
 #                                the whole process group (xcodebuild + xctest +
 #                                simulator agents) on expiry. Returns 124. If
-#                                the log already carries xcodebuild's terminal
-#                                result marker when the budget expires, one
-#                                bounded finalize-grace extension lets the
-#                                finished session write its xcresult and exit.
+#                                XCTest reports that the test session ended,
+#                                a separate bounded finalize deadline starts
+#                                immediately so wedged diagnostics cannot spend
+#                                the remainder of the test budget.
 #   bounded_run                - any short command under a deadline so a wedged
 #                                CoreSimulatorService costs a bounded warning,
 #                                not the job. Output lands in BOUNDED_OUTPUT.
@@ -20,12 +20,14 @@
 #   reset_and_boot_simulator   - bounded shutdown/erase/boot recovery.
 #   now_iso                    - UTC timestamp for lane result documents.
 
-# Terminal xcodebuild result markers (test and test-without-building forms).
-# Presence means the test session itself ENDED and xcodebuild is only
-# finalizing; the result verdict still comes exclusively from the process
-# exit status.
+# Terminal test-session markers. XCTest prints its top-level suite summary
+# before xcodebuild may spend minutes collecting simulator diagnostics; the
+# xcodebuild "** TEST ... **" marker arrives later when finalization behaves.
+# Either marker proves test execution itself ended. The verdict still comes
+# exclusively from xcodebuild's real process status; this marker never fakes
+# success or failure.
 log_has_terminal_result_marker() {
-  grep -q -E '\*\* TEST (EXECUTE )?(SUCCEEDED|FAILED) \*\*' "$1" 2>/dev/null
+  grep -q -E "\*\* TEST (EXECUTE )?(SUCCEEDED|FAILED) \*\*|^Test Suite '(Selected tests|All tests)' (passed|failed) at " "$1" 2>/dev/null
 }
 
 # Stream log lines not yet printed. $1 = log path, $2 = NAME of the caller's
@@ -51,15 +53,14 @@ stream_new_lines() {
 # log; returns the command's exit status, or 124 when the deadline killed it.
 # The caller owns retry policy - this function never retries.
 #
-# Finalize grace: when the budget expires but the log already contains
-# xcodebuild's terminal result marker, the TEST SESSION is finished and the
-# process is only writing out its xcresult. Killing there converts a
-# completed run into a timeout (and can truncate the result bundle), so the
-# deadline is extended ONCE by XCODEBUILD_FINALIZE_GRACE_S (default 180s) and
-# the process is allowed to exit on its own. Success is still only ever
-# returned from the process's real exit status - the marker never fakes a
-# result - and a process that outlives the grace window is killed and
-# classified as a timeout exactly as before.
+# Finalize grace is a separate phase, not extra time added after the test
+# watchdog. As soon as XCTest reports its top-level terminal suite summary (or
+# xcodebuild prints its own final marker), test execution is over and the
+# deadline becomes NOW + XCODEBUILD_FINALIZE_GRACE_S (default 180s). This can
+# shorten a large class watchdog or extend a nearly-expired one. A wedged
+# simctl diagnostic therefore cannot consume the remainder of the test budget
+# before finalization is bounded. Success still comes only from xcodebuild's
+# real exit status; a marker never fakes the result.
 run_with_deadline() {
   local budget="$1"
   local log="$2"
@@ -94,17 +95,15 @@ run_with_deadline() {
   grace_granted=0
   while kill -0 "$runner" 2>/dev/null; do
     now=$(date +%s)
+    if [ "$grace_granted" -eq 0 ] && log_has_terminal_result_marker "$log"; then
+      grace_granted=1
+      deadline=$(( now + finalize_grace ))
+      echo "::warning::xcodebuild test session ended but the process is still alive - allowing "${finalize_grace}"s finalize grace for xcresult/diagnostic completion"
+    fi
     remaining=$(( deadline - now ))
     if [ "$remaining" -le 0 ]; then
-      if [ "$grace_granted" -eq 0 ] && log_has_terminal_result_marker "$log"; then
-        grace_granted=1
-        deadline=$(( now + finalize_grace ))
-        remaining=$finalize_grace
-        echo "::warning::xcodebuild reached its "${budget}"s budget after printing its final result - allowing "${finalize_grace}"s finalize grace so the xcresult is written completely"
-      else
-        timed_out=1
-        break
-      fi
+      timed_out=1
+      break
     fi
     stream_new_lines "$log" printed
     heartbeat=$(( heartbeat + 1 ))
@@ -120,7 +119,11 @@ run_with_deadline() {
   stream_new_lines "$log" printed
 
   if [ "$timed_out" -eq 1 ]; then
-    echo "::error::xcodebuild exceeded its "${budget}"s budget - killing the process group (pid $runner)"
+    if [ "$grace_granted" -eq 1 ]; then
+      echo "::error::xcodebuild did not exit within its "${finalize_grace}"s finalize grace after the test session ended - killing the process group (pid $runner)"
+    else
+      echo "::error::xcodebuild exceeded its "${budget}"s test budget - killing the process group (pid $runner)"
+    fi
     # TERM the whole group so nothing is orphaned, grace window, then KILL.
     kill -TERM -- "-$runner" 2>/dev/null || kill -TERM "$runner" 2>/dev/null || true
     grace=10

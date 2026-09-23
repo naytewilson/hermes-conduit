@@ -7,7 +7,7 @@ sets it: the state-machine suite is minutes-long, so it runs in the
 dedicated self-test job instead of delaying planning and the macOS build).
 
 Measured cost: ~3.5-4 minutes wall on macOS with the harness's 1s
-xcodebuild poll cadence (124 assertions over 25 lane states, including
+xcodebuild poll cadence (174 assertions over 25 lane states, including
 watchdog kills of synthetic hangs at 2-6s budgets); expect similar or a
 little slower on hosted ubuntu. The subprocess cap below must stay larger
 than that measured runtime but SMALLER than the self-test job's own GitHub
