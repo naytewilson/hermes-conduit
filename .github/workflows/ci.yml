@@ -38,9 +38,7 @@ name: CI
 
 on:
   push:
-    # Temporary branch admission for the PR #14 live Apple-JIT acceptance run.
-    # Remove this branch entry after the acceptance run closes green.
-    branches: [main, fix/xcode-finalize-deadline-20260922]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
