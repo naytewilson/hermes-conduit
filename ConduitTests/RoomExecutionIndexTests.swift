@@ -112,14 +112,19 @@ final class RoomExecutionIndexTests: XCTestCase {
 
     func testUnknownAuthorityKindsDecodeLosslessly() throws {
         // A kind i3 adds next week must not break decode, persist, or
-        // re-encode — and contributes no fields to the fold unless it
-        // carries an execution identity.
+        // re-encode — and must contribute NO control-state fields to the
+        // fold. It still registers the execution's timeline position for
+        // diagnostics, but unknown kinds never mutate state, subject,
+        // taskRef, or advertised actions (P2-4: forward-compatible decoding,
+        // never forward-compatible authority inference).
         let wire = Data(#"""
         {"event_id":"evt-x","room_id":"\#(Self.roomID)","room_seq":9,
          "kind":"sieve.projection.future-variant","producer":"hub:i3",
-         "payload":{"execution_id":"\#(Self.executionID)","state":"running"},
+         "payload":{"execution_id":"\#(Self.executionID)","state":"running",
+          "actor":"device:hub-credential:cred-7",
+          "available_actions":["cancel"]},
          "link":{},"correlation_id":"corr-1","causation_id":null,
-         "task_ref":null,"campaign_id":null,"idempotency_key":"hub:9",
+         "task_ref":"anvil:task-9","campaign_id":null,"idempotency_key":"hub:9",
          "occurred_at":"2026-09-19T09:25:00.000Z","created_at":"2026-09-19T09:25:01.000Z"}
         """#.utf8)
         let decoded = try JSONDecoder().decode(RoomEvent.self, from: wire)
@@ -127,9 +132,15 @@ final class RoomExecutionIndexTests: XCTestCase {
         let reencoded = try JSONEncoder().encode(decoded)
         let roundTripped = try JSONDecoder().decode(RoomEvent.self, from: reencoded)
         XCTAssertEqual(roundTripped.kind.rawValue, "sieve.projection.future-variant")
-        // It still folds by execution identity.
+        // Timeline position registers; control-state fields stay empty.
         let projections = RoomExecutionIndex.projections(from: [decoded])
-        XCTAssertEqual(projections.first?.state, "running")
+        XCTAssertEqual(projections.count, 1)
+        XCTAssertEqual(projections.first?.lastSeq, 9)
+        XCTAssertNil(projections.first?.state)
+        XCTAssertNil(projections.first?.subject)
+        XCTAssertNil(projections.first?.taskRef)
+        XCTAssertNil(projections.first?.advertisedActions)
+        XCTAssertEqual(projections.first?.correlationID, "corr-1")
     }
 
     // MARK: - Presentation policy (frozen §2 preconditions)
@@ -181,7 +192,9 @@ final class RoomExecutionIndexTests: XCTestCase {
     func testServerAdvertisedActionsAreFilteredToFrozenPerExecutionOps() {
         var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 4)
         projection.state = "running"
+        projection.stateSeq = 4
         projection.advertisedActions = ["acknowledge", "start", "pause", "future_op", "cancel"]
+        projection.advertisedActionsSeq = 4
         // The projection may be stale or produced by a newer authority
         // contract. Only frozen V1 per-execution ops may become buttons.
         XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.acknowledge, .cancel])
@@ -209,5 +222,66 @@ final class RoomExecutionIndexTests: XCTestCase {
         // RawRepresentable round-trips unknown future ops for diagnostics —
         // they just never become candidate UI actions.
         XCTAssertEqual(RoomControlAction(rawValue: "pause").rawValue, "pause")
+    }
+
+    // MARK: - Authority split + provenance binding (P2-4 / P2-5)
+
+    func testAllAuthoritativeKindsFoldControlState() {
+        // The I1/I3 authority contract's four named execution kinds may
+        // write control-state fields; any other kind may not.
+        for kind in ["execution", "execution.bound", "execution.rebound", "execution.transition"] {
+            let event = event(seq: 2, kind: kind, payload: [
+                "execution_id": .string(Self.executionID),
+                "to_state": .string("running"),
+                "available_actions": .array([.string("cancel")])
+            ])
+            let projections = RoomExecutionIndex.projections(from: [event])
+            XCTAssertEqual(projections.first?.state, "running", "kind \(kind)")
+            XCTAssertEqual(projections.first?.stateSeq, 2, "kind \(kind)")
+            XCTAssertEqual(projections.first?.advertisedActions, ["cancel"], "kind \(kind)")
+            XCTAssertEqual(projections.first?.advertisedActionsSeq, 2, "kind \(kind)")
+        }
+        let unknown = event(seq: 3, kind: "sieve.execution.future", payload: [
+            "execution_id": .string(Self.executionID),
+            "to_state": .string("running"),
+            "available_actions": .array([.string("cancel")])
+        ])
+        let projections = RoomExecutionIndex.projections(from: [unknown])
+        XCTAssertNil(projections.first?.state)
+        XCTAssertNil(projections.first?.advertisedActions)
+    }
+
+    func testNewerAuthoritativeTransitionWithoutActionsClearsStaleVector() {
+        // P2-5 falsifier: seq 4 says running with available_actions=[cancel];
+        // seq 5 says failed and omits available_actions. The stale vector
+        // must NOT latch across the newer transition.
+        let running = event(seq: 4, payload: [
+            "execution_id": .string(Self.executionID),
+            "to_state": .string("running"),
+            "available_actions": .array([.string("cancel")])
+        ])
+        let failed = event(seq: 5, payload: [
+            "execution_id": .string(Self.executionID),
+            "to_state": .string("failed")
+        ])
+        let projections = RoomExecutionIndex.projections(from: [running, failed])
+        XCTAssertEqual(projections.count, 1)
+        XCTAssertEqual(projections[0].state, "failed")
+        XCTAssertEqual(projections[0].stateSeq, 5)
+        XCTAssertNil(projections[0].advertisedActions)
+        // The policy falls back to the state-derived map — retry/resume for
+        // failed — never the stale cancel from the older event.
+        XCTAssertEqual(RoomControlPolicy.candidates(for: projections[0]), [.retry, .resume])
+    }
+
+    func testAdvertisedActionsWithMismatchedProvenanceAreIgnored() {
+        // A hand-assembled projection whose action vector provably predates
+        // the current state: the policy ignores the stale vector.
+        var projection = RoomExecutionProjection(executionID: Self.executionID, lastSeq: 6)
+        projection.state = "running"
+        projection.stateSeq = 6
+        projection.advertisedActions = ["cancel"]
+        projection.advertisedActionsSeq = 4
+        XCTAssertEqual(RoomControlPolicy.candidates(for: projection), [.acknowledge, .cancel])
     }
 }

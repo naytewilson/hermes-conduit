@@ -200,6 +200,12 @@ struct RoomExecutionProjection: Equatable, Identifiable {
     /// Actions the authority advertised as valid on the latest transition,
     /// when it publishes them (`available_actions`/`allowed_actions`).
     var advertisedActions: [String]?
+    /// room_seq of the event that last set `advertisedActions` — provenance
+    /// for the P2-5 sequence binding.
+    var advertisedActionsSeq: Int?
+    /// room_seq of the event that last set `state` — provenance for the P2-5
+    /// sequence binding.
+    var stateSeq: Int?
 
     var id: String { executionID }
 
@@ -215,6 +221,16 @@ struct RoomExecutionProjection: Equatable, Identifiable {
 /// `{execution_id, from_state, to_state, substate, reason, actor}`, so
 /// extraction reads those spellings first and ignores events that carry no
 /// execution identity. Pure — no I/O — so the fold is exhaustively testable.
+///
+/// AUTHORITY SPLIT (P2-4): the event-kind taxonomy is open — unknown kinds
+/// decode, persist, and re-encode losslessly — but only the authoritative
+/// kinds below may write CONTROL-STATE fields (state, subject, taskRef,
+/// advertisedActions). Unknown kinds with an execution identity still
+/// register the execution's timeline position (lastSeq, lastTransitionAt,
+/// correlationID — descriptive, not control-relevant) and remain visible in
+/// the raw Room timeline for diagnostics, but contribute ZERO control-state
+/// fields. Forward-compatible decoding, never forward-compatible authority
+/// inference.
 enum RoomExecutionIndex {
     /// Payload keys consulted for each field, in priority order.
     private static let executionIDKeys = ["execution_id", "executionId"]
@@ -222,6 +238,12 @@ enum RoomExecutionIndex {
     /// The transition payload names the actor `actor`.
     private static let principalKeys = ["actor", "granting_principal", "principal", "requested_by", "subject"]
     private static let actionListKeys = ["available_actions", "allowed_actions", "actions"]
+
+    /// The only event kinds permitted to mutate execution control state
+    /// (the I1/I3 authority contract's named execution kinds).
+    static let controlAuthoritativeKinds: Set<RoomEventKind> = [
+        .execution, .executionBound, .executionRebound, .executionTransition
+    ]
 
     /// Folds `events` (expected ascending room_seq, but order-tolerant: the
     /// last write is the event with the HIGHEST room_seq, not the last
@@ -236,26 +258,39 @@ enum RoomExecutionIndex {
             guard event.roomSeq >= seq else { continue }
             seqs[executionID] = event.roomSeq
 
+            let authoritative = Self.controlAuthoritativeKinds.contains(event.kind)
+
             var projection = byID[executionID]
                 ?? RoomExecutionProjection(executionID: executionID, lastSeq: event.roomSeq)
             projection.lastSeq = event.roomSeq
-            if let state = firstString(in: event.payload, keys: stateKeys), !state.isEmpty {
-                projection.state = state
-            }
-            if let subject = firstString(in: event.payload, keys: principalKeys), !subject.isEmpty {
-                projection.subject = subject
+            if authoritative {
+                if let state = firstString(in: event.payload, keys: stateKeys), !state.isEmpty {
+                    projection.state = state
+                    projection.stateSeq = event.roomSeq
+                    // A newer authoritative state transition that omits
+                    // actions invalidates the older vector (P2-5): the stale
+                    // actions must not latch across the transition.
+                    if firstStringList(in: event.payload, keys: actionListKeys) == nil {
+                        projection.advertisedActions = nil
+                        projection.advertisedActionsSeq = nil
+                    }
+                }
+                if let subject = firstString(in: event.payload, keys: principalKeys), !subject.isEmpty {
+                    projection.subject = subject
+                }
+                if let taskRef = event.taskRef {
+                    projection.taskRef = taskRef
+                }
+                if let advertised = firstStringList(in: event.payload, keys: actionListKeys) {
+                    projection.advertisedActions = advertised
+                    projection.advertisedActionsSeq = event.roomSeq
+                }
             }
             if let at = event.occurredAt ?? Optional(event.createdAt) {
                 projection.lastTransitionAt = at
             }
-            if let taskRef = event.taskRef {
-                projection.taskRef = taskRef
-            }
             if !event.correlationID.isEmpty {
                 projection.correlationID = event.correlationID
-            }
-            if let advertised = firstStringList(in: event.payload, keys: actionListKeys) {
-                projection.advertisedActions = advertised
             }
             byID[executionID] = projection
         }
@@ -293,8 +328,17 @@ enum RoomExecutionIndex {
 /// manual-run pipeline with trigger/projectSlug, so it never appears here.
 enum RoomControlPolicy {
     /// Candidate actions for one execution, in display order.
+    ///
+    /// SEQUENCE BINDING (P2-5): server-advertised actions are used ONLY when
+    /// their provenance seq matches the current state's provenance seq. A
+    /// newer authoritative state transition that omits actions invalidates
+    /// the old vector — the policy then falls back to the state-derived map
+    /// rather than rendering a stale action from an older event.
     static func candidates(for execution: RoomExecutionProjection) -> [RoomControlAction] {
-        if let advertised = execution.advertisedActions {
+        if let advertised = execution.advertisedActions,
+           let actionsSeq = execution.advertisedActionsSeq,
+           let stateSeq = execution.stateSeq,
+           actionsSeq == stateSeq {
             // Room projections may outlive the Hub control contract that produced
             // them. Never let a stale/future advertised verb manufacture a
             // client control surface that frozen V1 cannot dispatch.

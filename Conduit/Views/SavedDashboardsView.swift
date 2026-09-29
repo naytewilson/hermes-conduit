@@ -219,11 +219,17 @@ struct SavedDashboardsSettingsDetail: View {
 
     private func removeDashboard(_ row: SavedDashboardRowModel) {
         let wasActive = row.isActive
-        // Room seam cleanup rides dashboard removal: the Hub credential
-        // record and the dashboard's replay state are scoped to this UUID
-        // and must not outlive it.
-        RoomHubCredentialStore.system.clear(dashboardID: row.dashboard.id)
+        // Room seam cleanup rides dashboard removal. ORDER MATTERS: the
+        // center settles FIRST, while the credential still exists, so a
+        // control that is in flight right now keeps a working client and
+        // its journal entry — deletion cannot yank a mutation out from
+        // under it. clearDashboard retires only RESOLVED journal entries;
+        // pending/recorded intents OUTLIVE deletion by design (re-adding
+        // the dashboard recovers the same idempotency identity).
+        // Deliberate destruction of those survivors is a separate explicit
+        // operator action, never a side effect of this button.
         RoomCenter.shared.clearDashboard(row.dashboard.id)
+        RoomHubCredentialStore.system.clear(dashboardID: row.dashboard.id)
         appState.removeDashboard(row.dashboard.id)
         rebuildRows()
         if wasActive { close() }

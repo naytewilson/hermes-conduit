@@ -667,14 +667,29 @@ struct RoomDetailSheet: View {
     private func run(_ pending: PendingControl) {
         pendingAction = nil
         guard let dashboardID else { return }
-        let intent = center.makeIntent(
-            dashboardID: dashboardID,
-            roomID: room.roomID,
-            executionID: pending.executionID,
-            action: pending.action,
-            attentionKind: pending.attentionKind,
-            correlationID: pending.correlationID
-        )
+        let intent: RoomControlIntent
+        do {
+            intent = try center.makeIntent(
+                dashboardID: dashboardID,
+                roomID: room.roomID,
+                executionID: pending.executionID,
+                action: pending.action,
+                attentionKind: pending.attentionKind,
+                correlationID: pending.correlationID
+            )
+        } catch {
+            // Fail closed before any network I/O: a poisoned journal or a
+            // failed durable commit means this gesture cannot safely mutate.
+            lastOutcome = RoomControlOutcome(
+                intentID: UUID(),
+                action: pending.action,
+                kind: .failed,
+                subject: nil,
+                detail: error.localizedDescription,
+                at: Date()
+            )
+            return
+        }
         Task {
             lastOutcome = await center.perform(intent)
         }
