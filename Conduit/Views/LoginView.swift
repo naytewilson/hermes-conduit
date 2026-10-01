@@ -219,6 +219,35 @@ struct LoginView: View {
 
             Spacer()
 
+            Button {
+                focusedField = nil
+                appState.enterANVILFabricMode()
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "rectangle.stack.badge.person.crop")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.conduitAccent)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(AppLocalization.string("Open ANVIL Fabric"))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Text(AppLocalization.string("Rooms and verified controls without a Hermes login"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 14)
+                .frame(maxWidth: .infinity)
+                .frame(height: 58)
+                .conduitGlassSurface(cornerRadius: 17, tint: .conduitAccent.opacity(0.10))
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("login.open-anvil-fabric")
+
             VStack(alignment: .leading, spacing: 16) {
                 Label("Connect a Hermes dashboard", systemImage: "link")
                     .font(.subheadline.weight(.semibold))

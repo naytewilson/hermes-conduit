@@ -63,6 +63,18 @@ struct SidebarView: View {
 
                             Button {
                                 Haptics.selection()
+                                appState.enterANVILFabricMode()
+                            } label: {
+                                Image(systemName: "rectangle.stack.badge.person.crop")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .frame(width: 44, height: 44)
+                            }
+                            .conduitGlassControl(cornerRadius: 18, tint: .conduitAccent.opacity(0.08))
+                            .accessibilityLabel(AppLocalization.string("Open ANVIL Fabric"))
+                            .accessibilityIdentifier("sidebar.open-anvil-fabric")
+
+                            Button {
+                                Haptics.selection()
                                 onRequestSettings()
                             } label: {
                                 Image(systemName: "gearshape")

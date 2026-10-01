@@ -142,6 +142,113 @@ final class RoomControlJournalTests: XCTestCase {
         }
     }
 
+    // MARK: - Upgrade migration from I4 UserDefaults journal
+
+    func testLegacyUserDefaultsJournalMigratesBeforeEmptyFileJournal() throws {
+        let suiteName = "RoomControlJournalTests.legacy.\(UUID().uuidString)"
+        guard let legacyDefaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("failed to create isolated UserDefaults suite")
+        }
+        legacyDefaults.removePersistentDomain(forName: suiteName)
+        defer { legacyDefaults.removePersistentDomain(forName: suiteName) }
+
+        let seedDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RoomControlJournalTests.seed.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: seedDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: seedDir) }
+
+        let dashboard = UUID()
+        let original = makeIntent(dashboardID: dashboard, action: .retry)
+        do {
+            var seed = RoomControlJournal(
+                storageDirectory: seedDir,
+                legacyDefaults: legacyDefaults,
+                legacyStorageKey: "unused.seed.\(UUID().uuidString)"
+            )
+            _ = try seed.recoverOrInsert(original, at: Date())
+            try seed.recordOperation(
+                intentID: original.id,
+                operationID: "legacy-op-1",
+                status: .recorded,
+                at: Date()
+            )
+        }
+
+        let legacyBytes = try Data(
+            contentsOf: seedDir.appendingPathComponent(RoomControlJournal.defaultFileName)
+        )
+        legacyDefaults.set(legacyBytes, forKey: RoomControlJournal.legacyStorageKey)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journalFile().path))
+
+        var migrated = RoomControlJournal(
+            storageDirectory: dir,
+            legacyDefaults: legacyDefaults
+        )
+
+        XCTAssertEqual(migrated.loadState, .healthy)
+        XCTAssertFalse(migrated.isPoisoned)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: journalFile().path))
+        XCTAssertNil(legacyDefaults.data(forKey: RoomControlJournal.legacyStorageKey))
+        XCTAssertEqual(migrated.entry(intentID: original.id)?.operationID, "legacy-op-1")
+        XCTAssertEqual(migrated.entry(intentID: original.id)?.phase, .recorded)
+
+        let replacement = makeIntent(dashboardID: dashboard, action: .retry)
+        let recovered = try migrated.recoverOrInsert(replacement, at: Date())
+        XCTAssertEqual(recovered.id, original.id)
+        XCTAssertEqual(recovered.idempotencyKey, original.idempotencyKey)
+    }
+
+    func testLegacyMigrationFailureStaysPoisonedAndPreservesSourceBytes() throws {
+        let suiteName = "RoomControlJournalTests.legacy-fail.\(UUID().uuidString)"
+        guard let legacyDefaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("failed to create isolated UserDefaults suite")
+        }
+        legacyDefaults.removePersistentDomain(forName: suiteName)
+        defer { legacyDefaults.removePersistentDomain(forName: suiteName) }
+
+        let seedDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RoomControlJournalTests.seed-fail.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: seedDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: seedDir) }
+
+        let original = makeIntent(action: .resume)
+        do {
+            var seed = RoomControlJournal(
+                storageDirectory: seedDir,
+                legacyDefaults: legacyDefaults,
+                legacyStorageKey: "unused.seed.\(UUID().uuidString)"
+            )
+            _ = try seed.recoverOrInsert(original, at: Date())
+        }
+        let legacyBytes = try Data(
+            contentsOf: seedDir.appendingPathComponent(RoomControlJournal.defaultFileName)
+        )
+        legacyDefaults.set(legacyBytes, forKey: RoomControlJournal.legacyStorageKey)
+
+        // A file where the storage directory must be makes createDirectory fail.
+        let blockedDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RoomControlJournalTests.blocked.\(UUID().uuidString)")
+        try Data("not-a-directory".utf8).write(to: blockedDirectory)
+        defer { try? FileManager.default.removeItem(at: blockedDirectory) }
+
+        var journal = RoomControlJournal(
+            storageDirectory: blockedDirectory,
+            legacyDefaults: legacyDefaults
+        )
+        XCTAssertEqual(journal.loadState, .migrationFailed)
+        XCTAssertTrue(journal.isPoisoned)
+        XCTAssertEqual(journal.poisonEvidence, legacyBytes)
+        XCTAssertEqual(
+            legacyDefaults.data(forKey: RoomControlJournal.legacyStorageKey),
+            legacyBytes,
+            "failed migration must leave the legacy source intact for retry"
+        )
+
+        XCTAssertThrowsError(try journal.recoverOrInsert(makeIntent(), at: Date())) { error in
+            XCTAssertEqual(error as? RoomControlJournal.JournalError, .poisoned)
+        }
+    }
+
     // MARK: - P1-2: dashboard deletion semantics
 
     func testClearDashboardPreservesPendingAndRecordedIntents() throws {
