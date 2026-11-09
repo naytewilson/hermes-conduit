@@ -162,7 +162,7 @@ jobs:
     # Operator capability gate: keep macOS execution fail-closed if the
     # admitted local Neo runner is intentionally withdrawn.
     if: ${{ vars.HERMES_MACOS_CI_ENABLED == 'true' }}
-    runs-on: [self-hosted, macOS, ARM64, nayte-macos]
+    runs-on: [self-hosted, nayte-macos, ARM64, nayte-macos]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -224,7 +224,7 @@ jobs:
   unit:
     name: "Unit - ${{ matrix.lane }}"
     needs: [plan, build]
-    runs-on: [self-hosted, macOS, ARM64, nayte-macos]
+    runs-on: [self-hosted, nayte-macos, ARM64, nayte-macos]
     # Outer emergency ceiling only: every batch burning its budget twice
     # (attempt 1 plus its single batch-level retry) plus per-batch bounded
     # recovery and extraction bounds all fit underneath it (see
@@ -317,7 +317,7 @@ jobs:
     name: "UI - ${{ matrix.lane }}"
     needs: [plan, build]
     if: needs.plan.outputs.ui-classes != ''
-    runs-on: [self-hosted, macOS, ARM64, nayte-macos]
+    runs-on: [self-hosted, nayte-macos, ARM64, nayte-macos]
     # Outer emergency ceiling only: every class's targeted retry plus bounded
     # resets and setup slack all fit underneath it (see plan-tests.py); the
     # per-class watchdogs inside ci-test-lane.sh are the real enforcement.
